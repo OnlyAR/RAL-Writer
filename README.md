@@ -75,6 +75,8 @@ Evaluation Pipeline Steps:
 python experiments/pred.py
 ```
 
+> In compress agent, an llmlingua server is required to run the experiment. Please refer to the [LLMLingua](https://github.com/microsoft/LLMLingua) repository for more information.
+
 2. Consistency Score Evaluation:
 
 ```shell
@@ -91,4 +93,20 @@ python experiments/quality_score.py
 
 ```shell
 python experiments/length_score.py
+```
+
+## 📚 Citation
+
+If you find this repository helpful in your research or work, please consider citing the following paper:
+
+```text
+@misc{zhang2025lostinthemiddlelongtextgenerationsynthetic,
+      title={Lost-in-the-Middle in Long-Text Generation: Synthetic Dataset, Evaluation Framework, and Mitigation}, 
+      author={Junhao Zhang and Richong Zhang and Fanshuang Kong and Ziyang Miao and Yanhan Ye and Yaowei Zheng},
+      year={2025},
+      eprint={2503.06868},
+      archivePrefix={arXiv},
+      primaryClass={cs.CL},
+      url={https://arxiv.org/abs/2503.06868}, 
+}
 ```
