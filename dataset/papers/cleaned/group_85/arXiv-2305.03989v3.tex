@@ -1,0 +1,748 @@
+\title{[Article Title]{LEO: Generative Latent Image Animator for Human Video Synthesis}
+
+
+\author[1]{\fnm{Yaohui} \sur{Wang}}
+\author[1,2]{\fnm{Xin} \sur{Ma}}
+\author[1]{\fnm{Xinyuan} \sur{Chen}}
+\author[2]{\fnm{Cunjian} \sur{Chen}}
+\author[3]{\fnm{Antitza} \sur{Dantcheva}}
+\author[1]{\fnm{Bo} \sur{Dai}}
+\author[1]{\fnm{Yu} \sur{Qiao}}
+\affil[1]{\orgname{Shanghai Artificial Intelligence Laboratory}, \city{Shanghai}, \country{China}}
+\affil[2]{\orgname{Monash University}, \city{Melbourne}, \country{Australia}}
+\affil[3]{\orgname{Inria, Université Côte d'Azur},  \city{Valbonne}, \country{France}}
+
+
+\abstract{Spatio-temporal coherency is a major challenge in synthesizing high quality videos, particularly in synthesizing human videos that contain rich global and local deformations. To resolve this challenge, previous approaches have resorted to different features in the generation process aimed at representing appearance and motion. However, in the absence of strict mechanisms to guarantee such disentanglement, a separation of motion from appearance has remained challenging, resulting in spatial distortions and temporal jittering that break the spatio-temporal coherency. Motivated by this, we here propose LEO, a novel framework for human video synthesis, placing emphasis on spatio-temporal coherency. Our key idea is to represent motion as a sequence of flow maps in the generation process, which inherently isolate motion from appearance. We implement this idea via a flow-based image animator and a Latent Motion Diffusion Model (LMDM). The former bridges a space of motion codes with the space of flow maps, and synthesizes video frames in a warp-and-inpaint manner. LMDM learns to capture motion prior in the training data by synthesizing sequences of motion codes. Extensive quantitative and qualitative analysis suggests that LEO significantly improves coherent synthesis of human videos over previous methods on the datasets TaichiHD, FaceForensics and CelebV-HQ. In addition, the effective disentanglement of appearance and motion in LEO allows for two additional tasks, namely infinite-length human video synthesis, as well as content-preserving video editing. Project page: \url{https://wyhsirius.github.io/LEO-project/}}
+
+
+
+\keywords{Video generation, diffusion models, generative modeling}
+
+
+
+\maketitle
+
+\section{Introduction}\label{intro}
+Deep generative models such as generative adversarial networks (GANs)~\cite{goodfellow2014generative} and Diffusion Models~\cite{ddpm, ddim} have fostered a breakthrough in
+video synthesis~\cite{vondrick2016generating, tulyakov2017mocogan, TGAN2020, wang2020g3an, wang2021inmodegan, digan, stylegan-v, tats, makeavideo, phenaki, imagenvideo}, elevating tasks such as text-to-video generation~\cite{makeavideo,phenaki}, video editing~\cite{bar2022text2live}, as well as 3D-aware video generation~\cite{bergman2022gnarf}. 
+While existing work has demonstrated promising results w.r.t. frame-wise visual quality, synthesizing videos of strong spatio-temporal coherency,
+tailored to human videos, containing rich global and local deformations, remains challenging.
+
+\begin{figure*}[!ht]
+\centering
+\includegraphics[width=1.0\textwidth]{cover-taichi4.pdf}
+\includegraphics[width=1.0\textwidth]{cover-face3.pdf}
+\caption{Our framework caters a set of video synthesis tasks including (i) unconditional video generation (first and second row), (ii) conditional generation based on one single image (fourth row) and (iii) video editing from the starting image (third and fifth row). Results pertain to our model being trained on the datasets TaichiHD, FaceForensics and CelebV-HQ.}
+\label{fig:cover}
+\end{figure*}
+
+Motivated by this, we here propose an effective generative framework, placing emphasis on \textit{spatio-temporal coherency} in \textit{human video synthesis}. Having this in mind, a fundamental step has to do with the \textit{disentanglement} of videos w.r.t. \textit{appearance} and \textit{motion}.
+Previous approaches have tackled such disentanglement by two jointly trained distinct networks, respectively providing appearance and motion features \cite{tulyakov2017mocogan,wang2020g3an,wang2021inmodegan,WANG_2020_WACV,digan},
+as well as by a two-phase generation pipeline that firstly aims at training an image generator, and then at training a temporal network to generate videos in the image generator's latent space \cite{mocoganhd,tats,videogpt}.
+Nevertheless, such approaches encompass limitations related to spatial artifacts (\textit{e.g.}, distortions of body structures and facial identities in the same sequence), as well as temporal artifacts (\textit{e.g.}, inter-frame semantic jittering), even in short generated videos of 16 frames. 
+We argue that such limitations stem from incomplete disentanglement of appearance and motion in the generation process.
+Specifically, without predominant mechanisms or hard constraints to guarantee disentanglement, even a minor perturbation in the high-level semantics will be amplified and will lead to significant changes in the pixel space.
+
+\begin{figure}[t!]
+\centering
+\includegraphics[width=0.47\textwidth]{inference3.pdf}
+\caption{\textbf{Inference stage.} At the inference stage, LMDM firstly accepts a starting motion code $\alpha_1$ and a sequence of noise-vectors as input, in order to generate a sequence of motion codes $\mathbf{a}$, further utilized to synthesize a sequence of flow maps $\phi_i$ by the pre-trained image animator. The output video is obtained in a warp-and-inpaint manner based on $x_1$ and $\phi_i$.}
+\label{fig:inference}
+\end{figure}
+
+Deviating from the above and towards disentangling videos w.r.t. appearance and motion,
+in this paper we propose a novel framework for human video generation, referred to as LEO, streamlined to ensure strong \textit{spatio-temporal coherency}.
+At the core of this framework is a \textit{sequence of flow maps}, representing \textit{motion semantics},
+which inherently isolate motion from appearance.
+Specifically, LEO incorporates a latent motion diffusion module (LMDM), as well as a flow-based image animator.
+In order to synthesize a video, an initial frame is either provided externally for \textit{conditional generation},
+or obtained by a generative module for \textit{unconditional generation}.
+Given such initial frame and a sequence of motion codes sampled from the LMDM, the flow-based image animator generates a sequence of flow maps, and proceeds to synthesize the corresponding sequence of frames in a \textit{warp-and-inpaint} manner.
+
+The \textit{training} of LEO is decomposed into \textit{two phases}. \textit{Firstly}, we train the flow-based image animator to encode input images into low-dimensional latent motion codes,
+and map such codes to flow maps, which are used for reconstruction via warp-and-inpaint.
+Therefore, once trained, 
+the flow-based image animator naturally provides a space of motion codes that are strictly constrained to only containing motion-related information.
+At the \textit{second stage},
+upon the space provided by the image animator,
+we train the LMDM to synthesize sequences of motion codes and capture \textit{motion prior} in the training data.
+To endow LEO with the ability to synthesize videos of arbitrary length beyond the short training videos,
+we adopt a Linear Motion Condition (LMC) mechanism
+in LMDM. As opposed to directly synthesizing sequences of motion codes,
+LMC enables LMDM to synthesize sequences of residuals w.r.t. a starting motion code,
+in order for longer videos to be easily obtained by concatenating additional sequences of residuals.
+
+To evaluate LEO,
+we conduct extensive experiments pertained to three human video datasets,
+including TaichiHD~\cite{fomm}, FaceForensics~\cite{rossler2018faceforensics}, and CelebV-HQ~\cite{zhu2022celebvhq}. 
+Compared to previous video synthesis methods,
+LEO demonstrates a significantly improved spatio-temporal coherency,
+even on synthesized videos of length of 512 frames.
+In addition,
+LEO shows great potential in two extended tasks,
+namely \textit{infinite-length video synthesis},
+as well as \textit{video editing} of a style in a synthesized video, while maintaining the content of the original video.
+
+\section{Related Works}
+\textbf{Unconditional video generation} aims to generate videos by learning the full distribution of training dataset. Most of the previous works~\cite{vondrick2016generating,saito2017temporal,tulyakov2017mocogan,wang2020g3an,wang:tel-03551913,wang2021inmodegan,clark2019adversarial, brooks2022generating} are built upon GANs~\cite{goodfellow2014generative, radford2015unsupervised, brock2018large, karras2019style, stylegan2} towards benefiting from the strong performance of the image generator. Approaches~\cite{NIPS2017_2d2ca7ee,li2018disentangled,bhagat2020disentangling,xie2020motion} based on VAEs~\cite{kingma2013auto} were also proposed while only show results on toy datasets. 
+Recently, with the progress of deep generative models (\textit{e.g.}, VQVAE~\cite{vqvae}, VQGAN~\cite{vqgan}, GPT~\cite{gpt} and Denoising Diffusion Models~\cite{ddpm, ddim, nichol2021improved}) on both image~\cite{dalle, dalle2} and language synthesis~\cite{radford2019language}, as well as the usage of large-scale pre-trained models, video generation also started to be explored with various approaches.
+
+MoCoGANHD~\cite{mocoganhd} builds the model on top of a well-trained StyleGAN2~\cite{stylegan2} by integrating an LSTM in the latent space towards disentangling content and motion. DIGAN~\cite{digan} and StyleGAN-V~\cite{stylegan-v} and MoStGAN-V~\cite{mostgan}, inspired by NeRF~\cite{feichtenhofer2019slowfast}, proposed an implicit neural representation approach to model time as a continuous signal aiming for long-term video generation. VideoGPT~\cite{videogpt} and TATS~\cite{tats} introduced to first train 3D-VQ models to learn discrete spatio-temporal codebooks, which are then be refined temporally by modified transformers~\cite{transformer}. Recently, several works{~\cite{vdm,pvdm,videofusion}} have shown promising capacity to model complex video distribution by incorporating spatio-temporal operations in Diffusion Models. While previous approaches have proposed various attempts either in training strategies~\cite{mocoganhd,videogpt,tats} or in model architectures~\cite{wang2020g3an,wang2021inmodegan,digan,stylegan-v} to disentangle appearance and motion, due to the lack of strong constrains, it is still difficult to obtain satisfying results. 
+
+\begin{figure*}[!ht]
+\centering
+\includegraphics[width=1.0\textwidth]{framework3.pdf}
+\caption{\textbf{Overview of LEO.} Our framework incorporates two main parts, (i) an image animator, aiming to generate flow maps and synthesize videos in the pixel space, and (ii) Latent Motion Diffusion Model (LMDM), focusing on modeling the motion distribution in a latent motion space. Our framework requires a two-phase training. In the first phase, we train the image animator in a self-supervised manner towards mapping latent codes to corresponding flow maps $\phi_i$. Once the image animator is well-trained, motion codes $\mathbf{a}$ are extracted from a frozen encoder and used as inputs of LMDM. In the second phase, LMDMs are trained to learn the motion distribution by providing the starting motion $\alpha_1$ as condition. Instead of directly learning the distribution of $\mathbf{a}$, we adopt a Linear Motion Condition (LMC) mechanism in LMDM towards synthesizing sequences of residuals with respect to $x_1$. At the inference stage, given a starting image $x_i$ and corresponding motion code $\alpha_i$, LMDM firstly generates a motion code sequence, which is then used by the image animator to generate flow maps to synthesize output videos in a warp-and-inpaint manner.}
+\label{fig:main-img}
+\end{figure*}
+
+In contrast to unconditional video generation, \textbf{conditional video generation} seeks to produces high-quality videos, following image-to-image generation pipeline~\cite{chu2017cyclegan,isola2017image, huang2018munit}. In this context, additional signals such as semantic maps~\cite{pan2019video, wang2018vid2vid,wang2019fewshotvid2vid}, human key-points~\cite{jang2018video, yang2018pose, walker2017pose, chan2019everybody, zakharov2019few, wang2019fewshotvid2vid, wang2021dance}, motion labels~\cite{WANG_2020_WACV}, 3DMM~\cite{Zhao_2018_ECCV, yang20223dhumangan} and optical flow~\cite{li2018flow,ohnishi2018ftgan} have been exploited to guide motion generation. In addition, text description, has been used in large-scale video diffusion models~{\cite{makeavideo,imagenvideo,videoLDM,lavie,vdm,show1,snapvideo,videocrafter2,latte,seine,svd}} for high-quality video generation. Our framework also supports for conditional video generation based on a single image. However, unlike previous approaches, our method follows the image animation pipeline~\cite{fomm,mraa,wang2022latent} which leverages the dense flow maps for motion modeling. We introduce our method in details in the following. 
+
+\section{Method}
+Fig.~\ref{fig:main-img} illustrates the training of LEO, comprising of two-phases. We firstly train an image animator towards learning high-quality latent motion codes of the datasets. In the second phase, we train the Latent Motion Diffusion Model (LMDM) to learn a motion prior over the latent motion codes. To synthesize a video, the pre-trained image animator takes the motion codes to generate corresponding flow maps, which are used to warp and inpaint starting frame. The warp-and-inpaint operation is conducted in two modules inside image animator. The warping module firstly produces flow fields based on motion codes to warp starting frame, then the inpainting module learns to fill in the holes in the warped starting frame and refine the entire image. Each video sequence is produced frame by frame.
+
+We formulate a video sequence $v = \{x_i\}^{L}_{i=1}, x_i\sim \mathcal{X}\in\mathbb{R}^{3\times H\times W}$ as $v = \{\mathcal{T}(x_1, G(\alpha_i))\}^{L}_{i=2}, \alpha_i\sim \mathcal{A}\in \mathbb{R}^{1\times N}$, where $x_i$ denotes the $i^{th}$ frame, $\alpha_i$ denotes a latent motion code at timestep $i$, $G$ represents the generator in the image animator aiming to generate a flow map $\phi_{i}$ from $\alpha_{i}$.
+
+\subsection{Learning Latent Motion Codes}
+Towards learning a frame-wise latent motion code, we adopt the state-of-the-art image animator LIA~\cite{wang2022latent} as it enables to encode input images into corresponding motion codes.  LIA consists of two modules, an encoder $E$ and a generator $G$. During training, given a source image $x_s$ and a driving image $x_d$, $E$ encodes $x_s, x_d$ into a motion code $\alpha = E(x_s, x_d)$, and $G$ generates a flow field $\phi = G(\alpha)$ from the code. LIA is trained in a self-supervised manner with the objective to reconstruct the driving image. 
+
+Training LIA in such a self-supervised manner brings two notable benefits for our framework, (i) it enables LIA to achieve high-quality perceptual results, and (ii) as a motion code is strictly equivalent to flow maps, there are guarantees that $\alpha$ is only motion-related without any appearance interference. 
+
+\begin{figure*}[t!]
+\centering
+\begin{subfigure}[t]{1.0\textwidth}
+\centering
+\includegraphics[width=1.0\textwidth]{taichi-compare.pdf}
+\caption{\footnotesize{\textbf{TaichiHD}}}
+\end{subfigure}
+\begin{subfigure}[t]{1.0\textwidth}
+\centering
+\includegraphics[width=1.0\textwidth]{face-compare.pdf}
+\caption{\footnotesize{\textbf{FaceForensics}}}
+\end{subfigure}
+\caption{\textbf{Qualitative Comparison.} We qualitatively compare LEO with DIGAN, TATS, StyleGAN-V on short video generation. The results indicate that on both (a) TaichiHD (128 and 256 resolutions) and (b) FaceForensics datasets, our proposed method achieves the best visual quality and is able to capture the human structure well. Other approaches either modify the facial structure (e.g., StyleGAN-V) or fail to generate a complete human body (e.g., TATS and DIGAN).}
+\label{fig:qualitative}
+\end{figure*} 
+
+\subsection{Leaning a Motion Prior}
+Once LIA is well-trained on a target dataset, for any given video $v=\{x_i\}^{L}_{i=1}$, we are able to obtain a motion sequence $\mathbf{a}=\{\alpha_i\}^{L}_{i=1}$ with the frozen $E$. In the second phase of our training, we propose to learn a motion prior by temporal Diffusion Models. 
+
+Unlike image synthesis, data in our second phase is a set of sequences. We firstly apply a temporal Diffusion Model for modeling the temporal correlation of $\mathbf{a}$. The general architecture of this model is a 1D U-Net adopted from~\cite{ddpm}. To train this model, we follow the standard training strategy with a simple mean-squared loss,
+\begin{align}
+    L_{\text{LMDM}} = \mathbb{E}_{\epsilon \sim \mathcal{N} (0,1), t}\left [ \left \| \epsilon - \epsilon_{\theta}(\mathbf{a}_t, t)\right \|^{2}_{2}\right],  
+\end{align}
+where $\epsilon$ denotes the unscaled noise, $t$ is the time step, $\mathbf{a}_t$ is the latent noised motion code to time $t$. During inference, a random Gaussian noise $\mathbf{a}_T$ is iteratively denoised to $\mathbf{a}_0=\{\alpha_i\}^{L}_{i=1}$, and the final video sequence is obtained through the generator. %$v^{'} = \{\mathcal{T}(x_1, G(\alpha_{i}))\}^{L}_{i=1}$.
+
+At the same time in our experiments, we found that learning motion sequences in a complete unconditional manner brings to the fore limitations, namely (i) the generated codes are not consistent enough for producing smooth videos, as well as (ii) the generated motion codes can only be used to produce fixed length videos. Hence, towards addressing those issues, we propose a \textbf{conditional Latent Motion Diffusion Model (cLMDM)} which aims for high-quality and long-term human videos.    
+
+One major characteristic of LIA has to do with the linear motion space. Any motion code $\alpha_t$ in $\mathbf{a}$ can be re-formulated as
+\begin{equation}\label{eq:2}
+    \alpha_{i} = \alpha_{1} + m_{i}, i\ge 2,
+\end{equation}
+where $\alpha_{1}$ denotes the motion code at the first timestep and $m_{i}$ denotes the motion difference between timestep $1$ and $i$, so that we can re-formulate $\mathbf{a}$ as
+\begin{equation}\label{eq:3}
+    \mathbf{a} = \alpha_{1} + \mathbf{m},
+\end{equation}
+where $\mathbf{m}=\{m_i\}^{L}_{i=2}$ denotes the motion difference sequence. Therefore, Eq.~\ref{eq:2} and \ref{eq:3} indicate that a motion sequence can be represented by $\alpha_{1}$ and $\mathbf{m}$. Based on this, we propose a \textbf{Linear Motion Condition (LMC)} mechanism in cLMDM to condition the generative process with $\alpha_1$. During training, at each time step, we only add noise onto $\mathbf{m_t}$ instead of the entire $\mathbf{a}$ and leave $\alpha_1$ intact. The objective function of cLMDM is
+\begin{equation}
+\begin{split}
+    L_{\text{cLMDM}} &= \mathbb{E}_{\epsilon \sim \mathcal{N} (0,1), t}\left [ \left \| \epsilon - \epsilon_{\theta}(\mathbf{m}_{t}, \alpha_1, t)\right \|^{2}_{2}\right], \\
+\end{split}
+\end{equation}
+where $\alpha_{1}$ denotes the condition signal and $\mathbf{m}_t$ stands for the noised $\mathbf{m}$ to time $t$. $\alpha_1$ is first added on $\mathbf{m}_t$ and then concatenated along temporal dimension. LMC will be applied at each time step until we reach $\mathbf{m}_0$. The final motion sequence is obtained as $\mathbf{a}_0 = [\alpha_1, \mathbf{m}_0]$. We find that following this, a related generated motion sequence is more stable and contains fewer artifacts, as $\alpha_1$ serves as a strong signal to constrain the generated $\mathbf{m}$ to follow the initial motion. 
+
+While the results from cLMDM outperforms previous models, the groundtruth $\alpha_1$ is necessitated during both, training and inference stage. Towards \textit{unconditional generation}, we train an additional simple DM to fit the distribution $p(\alpha_i)$ in a frame-wise manner. We refer to the cLMDM and such simple DM jointly as \textbf{Latent Motion Diffusion Model (LMDM)}. By this way, LMDM are able to work in both conditional and unconditional motion generation. 
+
+Towards generating videos of arbitrary length, we propose an autoregressive approach based on proposed LMDM. By taking the last motion code from the previous generated sequence as the $\alpha_1$ in the current sequence, with a randomly sampled noise, LMDM are able to generate an infinite-length motion sequence. By combining such sequence in pre-trained LIA with a starting image, LEO can synthesize photo-realistic and long-term videos.
+
+\begin{figure*}[t!]
+\centering
+\includegraphics[width=1.0\textwidth]{long-term.pdf}  
+\caption{\textbf{Comparison on long-term video generation.} We compare with TATS by generating 512-frame videos. Videos from TATS start crashing around 50 frames while our model is able to continue producing high-quality frames with diverse motion.}
+\label{fig:long-term}
+\end{figure*}
+
+\subsection{Learning Starting Frames}\label{sec:img-cond}
+In our framework, a starting image $x_1$ is required to synthesize a video. As image space is modeled independently, here we propose two options to obtain $x_1$.
+
+\textbf{Option 1: existing images.} The first option is to directly take the images either from a real distribution or from an image generation network. In this context, our model is a conditional video generation model, which learns to predict future motion from $x_1$. Starting motion $\alpha_1$ is obtained through $\alpha_1 = E(x_1)$.
+
+\textbf{Option 2: conditional Diffusion Models.} The second option is to learn a conditional DDPM~\cite{ddpm} (cDDPM) with $\alpha_1$ as a condition to synthesize $x_1$. By combining LEO with LMDM as well as cDDPM, we are able to conduct unconditional video synthesis.
+
+\section{Experiments}
+In this section, we firstly briefly describe our experimental setup, introducing datasets, evaluation metrics and implementation details. Secondly, we qualitatively demonstrate generated results on both, short and long video synthesis. Then we show quantitative evaluation w.r.t. video quality, comparing LEO with SoTA. Next, we conduct an ablation study to prove the effectiveness of proposed conditional mechanism LMC. Finally, we provide additional analysis of our framework, exhibiting motion and appearance disentanglement, video editing and infinite-length video generation. 
+
+\textbf{Datasets.} As we focus on human video synthesis, evaluation results are reported on three human-related datasets, TaichiHD~\cite{fomm}, FaceForensics~\cite{rossler2018faceforensics} and CelebV-HQ~\cite{zhu2022celebvhq}. We 
+use both $128\times 128$ and $256\times 256$ resolution TaichiHD datasets, and only $256\times 256$ resolution FaceForensics and CelebV-HQ datasets.
+
+\begin{itemize}
+    \item \textbf{TaichiHD}~\cite{fomm} comprises 3100 video sequences downloaded from YouTube. In train and test splits, it contains 2815 and 285 videos, respectively. We conducted all our experiments on the train split and used both $128\times 128$ and $256\times 256$ resolutions in our experiments.
+    \item \textbf{FaceForensics}~\cite{rossler2018faceforensics} includes 1000 video sequences downloaded from YouTube. Following the preprocessing of previous methods~\citep{TGAN2020, stylegan-v}, face areas are cropped based on the provided per-frame meshes. We resized all videos to $256\times 256$ resolution.
+    \item \textbf{CelebV-HQ}~\cite{zhu2022celebvhq} comprises 35666 high-quality talking head videos of 3 to 20 seconds each. In total, it represents 15653 celebrities. We resized the original videos to $256\times 256$ resolution, in order to train our models. 
+\end{itemize}
+
+\textbf{Evaluation metric.} For quantitative evaluation, we apply the commonly used metrics FVD and KVD, in order to compare with other approaches on video quality and apply Average Content Distance (ACD) towards evaluating the identity consistency of faces and bodies in the generated videos. In addition, we conduct a user study with 20 users towards comparing with objective quantitative evaluation. 
+
+\begin{itemize}
+\item \textbf{Frechet video distance (FVD) and Kernel Video Distance (KVD).} We use I3D~\citep{carreira2017quo} trained on Kinetics-400 as feature extractor to compute FVD and KVD. However, we find FVD is a very sensitive metric, which can be affected by many factors such as frame-rate, single image quality, video length and implementation, which also mentioned in~\citep{stylegan-v}. Therefore, towards making a fair comparison, on the TaichiHD dataset, we adopt the implementation from DIGAN~\citep{digan}. As for FaceForensics and CelebV-HQ, we chose to follow the implementation of StyleGAN-V~\citep{stylegan-v}. 
+\item \textbf{Average Content Distance (ACD).} ACD measures the content consistency in generated videos. To evaluate results from FaceForensics and TaichiHD, we extract features from each generated frame and proceed to extract a per-frame feature vector in a video. The ACD was then computed using the average pairwise L2 distance of the per-frame feature vectors. We follow the implementation in~\citep{mocoganhd} to compute ACD for FaceForensics. As for TaichiHD, we employ the pre-trained person-reID model~\citep{zheng2018discriminatively} to extract person identity features.
+\item \textbf{User study.} We asked 20 human raters to evaluate generated video quality, as well as video coherency. In each user study, we show paired videos and ask the raters, to rate 'which clip is more realistic / which clip is more coherent'. Each video-pair contains one generated video from our method, whereas the second video is either \textit{real} or generated from other methods.
+
+\end{itemize}
+
+\textbf{Implementation details.} Our framework requires two-phase training. In the first phase, we follow the standard protocol to train LIA~\citep{wang2022latent} to encode input images into low-dimensional latent motion codes, and map such codes to flow maps, which are used for reconstruction via warp-and-inpaint. Therefore, once trained, LIA naturally provides a space of motion codes that are strictly constrained to only containing motion-related information. In the second phase, we only train LMDM on the extracted motion codes from Encoder. We note that the LMDM is a 1D U-Net adopted from~\citep{nichol2021improved}, we set the input size as $64\times 20$, where 64 is the length of the sequence and 20 is the dimension of the motion code. We use 1000 diffusion steps and a learning rate of $1\mathrm{e}{-4}$. As the training of LMDM is conducted in the latent space of LIA, the entire training is very efficient and only requires one single GPU. 
+
+\subsection{Qualitative Evaluation}
+We qualitatively compare LEO with SoTA by visualizing the generated results. We firstly compare our method with DIGAN, TATS and StyleGAN-V on the FaceForensics and TaichiHD datasets for \textit{short video generation}. As shown in Fig.~\ref{fig:cover} and~\ref{fig:qualitative}, the visual quality of our generated results outperforms other approaches w.r.t both, appearance and motion. For both resolutions on TaichiHD datasets, our method is able to generate complete human structures, whereas both, DIGAN and TATS fail, especially for arms and legs. When compared with StyleGAN-V on FaceForensics dataset, we identify that while LEO preserves well facial structures, StyleGAN-V modifies such attributes when synthesizing large motion. 
+
+Secondly, we compare with TATS for long-term video generation. Specifically, 512 frames are produced for the resolution $128\times 128$ pertained to the TaichiHD dataset. As shown in Fig.~\ref{fig:long-term}, the subject in the videos from TATS starts crashing around 50 frames and the entire video sequence starts to fade. On the other hand, in our results, the subject continues to perform diverse actions whilst well preserving the human structure. We note that our model is only trained using a 64-frame sequence.
+
+\begin{table*}[!t]
+\begin{center}
+\setlength\arrayrulewidth{1pt}
+\scalebox{0.8}{
+\begin{tabular}{ccccccccccccc}
+\hline
+& \multicolumn{4}{c}{TaichiHD128} & \multicolumn{3}{c}{TaichiHD256} & \multicolumn{3}{c}{FaceForensics} & \multicolumn{1}{c}{CelebV-HQ} \\
+Method & $\text{FVD}_{16}$ & $\text{KVD}_{16}$ & $\text{ACD}_{16}$ && $\text{FVD}_{16}$ & $\text{KVD}_{16}$ && $\text{FVD}_{16}$ & $\text{ACD}_{16}$ && $\text{FVD}_{16}$   \\
+\cmidrule{2-4}\cmidrule{6-7}\cmidrule{9-10}\cmidrule{12-12}
+MoCoGAN-HD & $144.7\pm 6.0$ & $25.4\pm 1.9$ & - && - & - && 111.8 & 0.33 && 212.4  \\
+DIGAN & $128.1\pm 4.9$ & $20.6\pm 1.1$ & 2.17 && $156.7\pm 6.2$ & - && 62.5 & - && 72.9  \\
+TATS & ${136.5\pm1.2}^{*}$ & ${22.2\pm1.0}^{*}$ & 2.28 && - & - && - & - && -  \\
+StyleGAN-V & - & - & - && - & - && 47.4 & 0.36 && 69.1  \\
+MoStGAN-V & - & -& - && - & - && 39.7 & 0.38 && 132.1 \\
+\cmidrule{1-12}
+Ours (uncond) & $100.4\pm 3.1$ & $11.4\pm 3.2$ & 1.83 && $122.7\pm 1.1$ & $20.49\pm 0.9$ && 52.3 & 0.28 && -  \\
+Ours (cond) & $\mathbf{57.6\pm 2.0}$ & $\mathbf{4.0\pm 1.5}$ & \textbf{1.22} && $\mathbf{94.8\pm 4.2}$ & $\mathbf{13.47\pm 2.3}$ && \textbf{35.9} & \textbf{0.27} && \textbf{40.2}  \\
+\hline
+\end{tabular}}
+\end{center}
+\caption{\textbf{Evaluation for unconditional and conditional short video generation.} LEO systematically outperforms other approaches on conditional video generation, and achieves better or competitive results on unconditional generation w.r.t. FVD, KVD and ACD. (*results are reproduced based on official code and released checkpoints.)}
+\label{tab:fvd-cond-uncond-short}
+\end{table*}
+
+\begin{table}[!t]
+\begin{center}
+\setlength\arrayrulewidth{0.8pt}
+\scalebox{0.68}{
+\begin{tabular}{ccccccc}
+\hline
+& \multicolumn{4}{c}{TaichiHD128} & \multicolumn{2}{c}{FaceForensics} \\
+Method & $\text{FVD}_{128}$ & $\text{KVD}_{128}$ & $\text{ACD}_{128}$ && $\text{FVD}_{128}$ & $\text{ACD}_{128}$ \\
+\cmidrule{2-4}\cmidrule{6-7}
+DIGAN & - & - & - && 1824.7 & - \\
+TATS & $1194.58\pm 1.1$ & $462.03\pm 8.2$ & 2.85 && - & -\\
+StyleGAN-V & - & - & - && \textbf{89.34} & 0.49 \\
+\cmidrule{1-7}
+Ours & $\mathbf{155.54\pm 2.6}$ & $\mathbf{48.82\pm 5.9}$ & \textbf{2.06} && 96.28 & \textbf{0.34}\\
+\hline
+\end{tabular}}
+\end{center}
+\caption{\textbf{Evaluation for unconditional long-term video generation.} LEO outperforms other methods on long-term (128 frames) video generation w.r.t. FVD, KVD and ACD.}
+\label{tab:fvd-uncond-long}
+\end{table}
+
+\subsection{Quantitative evaluation}
+In this section, we compare our framework with five state-of-the-art for both, conditional and unconditional short video generation, as well as unconditional long-term video generation.
+
+\textbf{Unconditional short video generation.} In this context, as described in Sec.~\ref{sec:img-cond}, Option 2, the $x_1$ is randomly generated by a pre-trained cDDPM. We compare with SoTA by generating 16 frames. To compare with DIGAN on high-resolution generation, we also generate videos of $256\times 256$ resolution. Related FVDs and KVDs are reported in Tab.~\ref{tab:fvd-cond-uncond-short}. LEO systematically outperforms other methods w.r.t. video quality, obtaining lower or competitive FVD and KVD on all datasets. On high-resolution generation, our results remain better than DIGAN. 
+
+However, by comparing the results between StyleGAN-V and ours, we find FVD is not able to represent the quality of generated videos veritably. We observe that StyleGAN-V is not able to preserve facial structures, whereas LEO is able to do so, see Fig.~\ref{fig:qualitative}. We additionally compute ACD, in order to further analyze the identity consistency in 16-frame videos. Tab.~\ref{tab:fvd-cond-uncond-short} reflects on the fact that our method achieves significantly better results compared to other approaches. In addition, we conduct user study \textit{w.r.t.} video quality and coherency of generated videos among different methods. Results in Tab.~{\ref{tab:user-study}} showcase that as nearly all users rated for our generated results to be superior than other approaches. Hence, we conclude that a metric, replacing FVD is in urgent need in the context of video generation.
+
+\textbf{Unconditional long video generation} 
+We evaluate our approach for long-term video generation w.r.t. FVD and ACD. In this context, we compare LEO with StyleGAN-V on the FaceForensics dataset, and both DIGAN and TATS on the TaichiHD. We report results based on 128-frame generation in Tab.~\ref{tab:fvd-uncond-long}, which clearly shows that our method outperforms others in such context. We hypothesize that consistent and stable motion codes produced by our LMDM are key to producing high-quality long-term videos.
+
+
+\textbf{Conditional short video generation}
+As described in Sec.~\ref{sec:img-cond}, Option 1, our framework additionally caters for conditional video generation by taking an existing image to hallucinate the following motion. Specifically, we randomly select 2048 images from both, TaichiHD and FaceForensics datasets as $x_1$ and compute corresponding $\alpha_1$ as input of LMDM. As depicted in Tab.~\ref{tab:fvd-cond-uncond-short}, results conditioned on the real images achieve the lowest FVD, KVD and ACD values, suggesting that the quality of a starting image is pertinent for output video quality, which further signifies that in the setting of unconditional generation, training a better cDDPM will be instrumental for improving results.
+
+\begin{figure*}[t!]
+\centering
+\includegraphics[width=1.0\textwidth]{distanglement.pdf}  
+\caption{\textbf{Disentanglement of motion and appearance.} The first and second row share the same appearance, with different motion codes. Results display that our model is able to produce diverse motion from the same content.}%, demonstrating the ability of LEO to disentangle appearance and motion.}
+\label{fig:disentanglement}
+\end{figure*}
+
+\begin{figure*}[t!]
+\centering
+\includegraphics[width=1.0\textwidth]{video-edit-v2.pdf}  
+\caption{\textbf{Video editing.} We show video editing results by combining LEO with off-the-shelf image editing model ControlNet. We are able to edit the appearance of the entire video sequence through only editing the starting image.}
+\label{fig:semantic-edit-taichi}
+\end{figure*}
+
+\begin{table}[!t]
+\begin{minipage}[t]{0.45\textwidth}
+\centering
+\setlength{\tabcolsep}{3.5pt}
+\setlength\arrayrulewidth{1pt}
+\scalebox{0.9}{
+\begin{tabular}{cccc}
+\hline
+Method & TaichiHD (\%) & FaceForensics (\%) \\
+\cmidrule{1-3}
+Ours / TATS & \textbf{93.00} / 7.00  & - \\
+Ours / StyleGAN-V  & - & \textbf{91.33} / 8.67 \\
+\hline
+\hline
+Method & TaichiHD (\%) & FaceForensics (\%) \\
+\cmidrule{1-3}
+Ours / TATS & \textbf{98.60} / 1.40  & - \\
+Ours / StyleGAN-V  & - & \textbf{93.20} / 6.80 \\
+\hline
+\end{tabular}}
+\captionof{table}{\textbf{User study.} We conduct user studies pertaining to the datasets TaichiHD and FaceForensics \textit{w.r.t.} video quality (up) as well as coherency (down).}
+\label{tab:user-study}
+\end{minipage}
+\begin{minipage}[t]{0.05\textwidth}
+\quad
+\end{minipage}
+\begin{minipage}[t]{0.45\textwidth}
+\centering
+\setlength\arrayrulewidth{1pt}
+\scalebox{1.0}{
+\begin{tabular}{ccc}
+\hline
+ & TaichiHD & FaceForensics \\
+\cmidrule{1-3}
+w/o LMC & 118.6 & 60.03 \\
+with LMC & \textbf{100.4} & \textbf{52.32} \\
+\hline
+\end{tabular}}
+\captionof{table}{\textbf{Ablation study of proposed LMC.} Models with LMC achieved the lowest FVD on both datasets.}
+\label{tab:ablation-lmc}
+\end{minipage}
+\end{table}
+
+\section{Ablation Study}
+In this section, we place emphasis on analyzing the effectiveness of proposed Linear Motion Condition (LMC) in  LMDM. We train two models, with and without LMC on both TaichiHD and FaceForensics datasets. As shown in Tab.~\ref{tab:ablation-lmc}, using LMC significantly improves the generated video quality, which proves that our proposed LMC is an effective mechanism for involving $\alpha_1$ in LMDM.
+
+\section{Additional Analysis}
+
+\textbf{Motion and appearance disentanglement.} We proceed to combine the same $x_1$ with different $\mathbf{m}$, aiming to reveal whether $\mathbf{m}$ is only motion-related. Fig.~\ref{fig:disentanglement} illustrates that different $\mathbf{m}$ enables the same subject to perform different motion - which proves that our proposed LMDM is indeed learning a motion space, and appearance and motion are clearly disentangled. This experiment additionally indicates that our model does not overfit on the training dataset, as different noise sequences are able to produce diverse motion sequences.
+
+\textbf{Video Editing.} As appearance is modeled in $x_1$, we here explore the task of video editing by modifying the semantics in thestarting image. Compared to previous approaches, where image-to-image translation is required, our framework simply needs an edit of the semantics in an one-shot manner. Associated results are depicted in Fig.~\ref{fig:cover} and Fig.~\ref{fig:semantic-edit-taichi}. We apply the open-source approach ControlNet~\cite{controlnet} on the starting frame by entering various different prompts. Given that the motion space is fully disentangled from the appearance space, our videos maintain the original temporal consistency, uniquely altering the appearance. 
+
+\textbf{Infinite-length video generation.}  
+In addition to presented settings, our framework is able to generate infinite-length videos. To generate long-term FaceForensics, as shown in Fig.~\ref{fig:long-term-face}, we provide the last generated code from the previous sequence as the starting code of the current sequence. The entire long-term video is generated in an \textit{autoregressive} manner. Surprisingly, we find that such a simple approach is sufficient to produce more than 1000 frames. We note that for TaichiHD dataset, due to limited motion patterns, this setting yields repeated motion. Towards addressing this limitation, as shown in Fig.~\ref{fig:long-term-taichi}, we design an additional \textit{Transition Diffusion Model (Transition DM)} aimed at generating transition motion between the last code from original generated sequence and a new motion code generated from the \textit{simple DM}. Doing so, the Transition DM enforces the network to exit the original motion pattern and transit to new pattern. To evaluate the effectiveness of the proposed method, we generate long videos \textit{with} and \textit{without} Transition DM and request human raters to watch respective videos and answer the question `Does the clip contain repeated motion?'. Results are reported in Tab.~{\ref{tab:tdm}}, which shows the effectiveness of Transition DM to prevent repeated motion.
+
+\begin{table}[!h]
+\centering
+\setlength{\tabcolsep}{25pt}
+\setlength\arrayrulewidth{1pt}
+\begin{tabular}{cc}
+\hline
+ & Occurrence (\%) \\
+\cmidrule{1-2}
+w/o Transition DM & 0.45 \\
+with Transition DM & 0.02 \\
+\hline
+\end{tabular}
+\caption{\textbf{User study of repeated motion.} We show the occurrence of repeated motion with and without the usage of Transition DM.}
+\label{tab:tdm}
+\end{table}
+
+\textbf{\begin{figure*}[th!]
+    \centering
+    \includegraphics[width=0.9\textwidth]{infinite-fig-taichi.pdf}
+    \caption{Infinite-length video generation for TaichiHD.}
+    \label{fig:long-term-taichi}
+\end{figure*}}
+
+\begin{figure}[t!]
+    \centering
+    \includegraphics[width=0.47\textwidth]}
+
+\begin{document}
+
+\title[Article Title]{LEO: Generative Latent Image Animator for Human Video Synthesis}
+
+\author[1]{\fnm{Yaohui} \sur{Wang}}
+\author[1,2]{\fnm{Xin} \sur{Ma}}
+\author[1]{\fnm{Xinyuan} \sur{Chen}}
+\author[2]{\fnm{Cunjian} \sur{Chen}}
+\author[3]{\fnm{Antitza} \sur{Dantcheva}}
+\author[1]{\fnm{Bo} \sur{Dai}}
+\author[1]{\fnm{Yu} \sur{Qiao}}
+\affil[1]{\orgname{Shanghai Artificial Intelligence Laboratory}, \city{Shanghai}, \country{China}}
+\affil[2]{\orgname{Monash University}, \city{Melbourne}, \country{Australia}}
+\affil[3]{\orgname{Inria, Université Côte d'Azur},  \city{Valbonne}, \country{France}}
+
+\abstract{Spatio-temporal coherency is a major challenge in synthesizing high quality videos, particularly in synthesizing human videos that contain rich global and local deformations. To resolve this challenge, previous approaches have resorted to different features in the generation process aimed at representing appearance and motion. However, in the absence of strict mechanisms to guarantee such disentanglement, a separation of motion from appearance has remained challenging, resulting in spatial distortions and temporal jittering that break the spatio-temporal coherency. Motivated by this, we here propose LEO, a novel framework for human video synthesis, placing emphasis on spatio-temporal coherency. Our key idea is to represent motion as a sequence of flow maps in the generation process, which inherently isolate motion from appearance. We implement this idea via a flow-based image animator and a Latent Motion Diffusion Model (LMDM). The former bridges a space of motion codes with the space of flow maps, and synthesizes video frames in a warp-and-inpaint manner. LMDM learns to capture motion prior in the training data by synthesizing sequences of motion codes. Extensive quantitative and qualitative analysis suggests that LEO significantly improves coherent synthesis of human videos over previous methods on the datasets TaichiHD, FaceForensics and CelebV-HQ. In addition, the effective disentanglement of appearance and motion in LEO allows for two additional tasks, namely infinite-length human video synthesis, as well as content-preserving video editing. Project page: \url{https://wyhsirius.github.io/LEO-project/}}
+
+\keywords{Video generation, diffusion models, generative modeling}
+
+\maketitle
+
+\section{Introduction}\label{intro}
+Deep generative models such as generative adversarial networks (GANs)~\cite{goodfellow2014generative} and Diffusion Models~\cite{ddpm, ddim} have fostered a breakthrough in
+video synthesis~\cite{vondrick2016generating, tulyakov2017mocogan, TGAN2020, wang2020g3an, wang2021inmodegan, digan, stylegan-v, tats, makeavideo, phenaki, imagenvideo}, elevating tasks such as text-to-video generation~\cite{makeavideo,phenaki}, video editing~\cite{bar2022text2live}, as well as 3D-aware video generation~\cite{bergman2022gnarf}. 
+While existing work has demonstrated promising results w.r.t. frame-wise visual quality, synthesizing videos of strong spatio-temporal coherency,
+tailored to human videos, containing rich global and local deformations, remains challenging.
+
+\begin{figure*}[!ht]
+\centering
+\includegraphics[width=1.0\textwidth]{cover-taichi4.pdf}
+\includegraphics[width=1.0\textwidth]{cover-face3.pdf}
+\caption{Our framework caters a set of video synthesis tasks including (i) unconditional video generation (first and second row), (ii) conditional generation based on one single image (fourth row) and (iii) video editing from the starting image (third and fifth row). Results pertain to our model being trained on the datasets TaichiHD, FaceForensics and CelebV-HQ.}
+\label{fig:cover}
+\end{figure*}
+
+Motivated by this, we here propose an effective generative framework, placing emphasis on \textit{spatio-temporal coherency} in \textit{human video synthesis}. Having this in mind, a fundamental step has to do with the \textit{disentanglement} of videos w.r.t. \textit{appearance} and \textit{motion}.
+Previous approaches have tackled such disentanglement by two jointly trained distinct networks, respectively providing appearance and motion features \cite{tulyakov2017mocogan,wang2020g3an,wang2021inmodegan,WANG_2020_WACV,digan},
+as well as by a two-phase generation pipeline that firstly aims at training an image generator, and then at training a temporal network to generate videos in the image generator's latent space \cite{mocoganhd,tats,videogpt}.
+Nevertheless, such approaches encompass limitations related to spatial artifacts (\textit{e.g.}, distortions of body structures and facial identities in the same sequence), as well as temporal artifacts (\textit{e.g.}, inter-frame semantic jittering), even in short generated videos of 16 frames. 
+We argue that such limitations stem from incomplete disentanglement of appearance and motion in the generation process.
+Specifically, without predominant mechanisms or hard constraints to guarantee disentanglement, even a minor perturbation in the high-level semantics will be amplified and will lead to significant changes in the pixel space.
+
+\begin{figure}[t!]
+\centering
+\includegraphics[width=0.47\textwidth]{inference3.pdf}
+\caption{\textbf{Inference stage.} At the inference stage, LMDM firstly accepts a starting motion code $\alpha_1$ and a sequence of noise-vectors as input, in order to generate a sequence of motion codes $\mathbf{a}$, further utilized to synthesize a sequence of flow maps $\phi_i$ by the pre-trained image animator. The output video is obtained in a warp-and-inpaint manner based on $x_1$ and $\phi_i$.}
+\label{fig:inference}
+\end{figure}
+
+Deviating from the above and towards disentangling videos w.r.t. appearance and motion,
+in this paper we propose a novel framework for human video generation, referred to as LEO, streamlined to ensure strong \textit{spatio-temporal coherency}.
+At the core of this framework is a \textit{sequence of flow maps}, representing \textit{motion semantics},
+which inherently isolate motion from appearance.
+Specifically, LEO incorporates a latent motion diffusion module (LMDM), as well as a flow-based image animator.
+In order to synthesize a video, an initial frame is either provided externally for \textit{conditional generation},
+or obtained by a generative module for \textit{unconditional generation}.
+Given such initial frame and a sequence of motion codes sampled from the LMDM, the flow-based image animator generates a sequence of flow maps, and proceeds to synthesize the corresponding sequence of frames in a \textit{warp-and-inpaint} manner.
+
+The \textit{training} of LEO is decomposed into \textit{two phases}. \textit{Firstly}, we train the flow-based image animator to encode input images into low-dimensional latent motion codes,
+and map such codes to flow maps, which are used for reconstruction via warp-and-inpaint.
+Therefore, once trained, 
+the flow-based image animator naturally provides a space of motion codes that are strictly constrained to only containing motion-related information.
+At the \textit{second stage},
+upon the space provided by the image animator,
+we train the LMDM to synthesize sequences of motion codes and capture \textit{motion prior} in the training data.
+To endow LEO with the ability to synthesize videos of arbitrary length beyond the short training videos,
+we adopt a Linear Motion Condition (LMC) mechanism
+in LMDM. As opposed to directly synthesizing sequences of motion codes,
+LMC enables LMDM to synthesize sequences of residuals w.r.t. a starting motion code,
+in order for longer videos to be easily obtained by concatenating additional sequences of residuals.
+
+To evaluate LEO,
+we conduct extensive experiments pertained to three human video datasets,
+including TaichiHD~\cite{fomm}, FaceForensics~\cite{rossler2018faceforensics}, and CelebV-HQ~\cite{zhu2022celebvhq}. 
+Compared to previous video synthesis methods,
+LEO demonstrates a significantly improved spatio-temporal coherency,
+even on synthesized videos of length of 512 frames.
+In addition,
+LEO shows great potential in two extended tasks,
+namely \textit{infinite-length video synthesis},
+as well as \textit{video editing} of a style in a synthesized video, while maintaining the content of the original video.
+
+\section{Related Works}
+\textbf{Unconditional video generation} aims to generate videos by learning the full distribution of training dataset. Most of the previous works~\cite{vondrick2016generating,saito2017temporal,tulyakov2017mocogan,wang2020g3an,wang:tel-03551913,wang2021inmodegan,clark2019adversarial, brooks2022generating} are built upon GANs~\cite{goodfellow2014generative, radford2015unsupervised, brock2018large, karras2019style, stylegan2} towards benefiting from the strong performance of the image generator. Approaches~\cite{NIPS2017_2d2ca7ee,li2018disentangled,bhagat2020disentangling,xie2020motion} based on VAEs~\cite{kingma2013auto} were also proposed while only show results on toy datasets. 
+Recently, with the progress of deep generative models (\textit{e.g.}, VQVAE~\cite{vqvae}, VQGAN~\cite{vqgan}, GPT~\cite{gpt} and Denoising Diffusion Models~\cite{ddpm, ddim, nichol2021improved}) on both image~\cite{dalle, dalle2} and language synthesis~\cite{radford2019language}, as well as the usage of large-scale pre-trained models, video generation also started to be explored with various approaches.
+
+MoCoGANHD~\cite{mocoganhd} builds the model on top of a well-trained StyleGAN2~\cite{stylegan2} by integrating an LSTM in the latent space towards disentangling content and motion. DIGAN~\cite{digan} and StyleGAN-V~\cite{stylegan-v} and MoStGAN-V~\cite{mostgan}, inspired by NeRF~\cite{feichtenhofer2019slowfast}, proposed an implicit neural representation approach to model time as a continuous signal aiming for long-term video generation. VideoGPT~\cite{videogpt} and TATS~\cite{tats} introduced to first train 3D-VQ models to learn discrete spatio-temporal codebooks, which are then be refined temporally by modified transformers~\cite{transformer}. Recently, several works{~\cite{vdm,pvdm,videofusion}} have shown promising capacity to model complex video distribution by incorporating spatio-temporal operations in Diffusion Models. While previous approaches have proposed various attempts either in training strategies~\cite{mocoganhd,videogpt,tats} or in model architectures~\cite{wang2020g3an,wang2021inmodegan,digan,stylegan-v} to disentangle appearance and motion, due to the lack of strong constrains, it is still difficult to obtain satisfying results. 
+
+\begin{figure*}[!ht]
+\centering
+\includegraphics[width=1.0\textwidth]{framework3.pdf}
+\caption{\textbf{Overview of LEO.} Our framework incorporates two main parts, (i) an image animator, aiming to generate flow maps and synthesize videos in the pixel space, and (ii) Latent Motion Diffusion Model (LMDM), focusing on modeling the motion distribution in a latent motion space. Our framework requires a two-phase training. In the first phase, we train the image animator in a self-supervised manner towards mapping latent codes to corresponding flow maps $\phi_i$. Once the image animator is well-trained, motion codes $\mathbf{a}$ are extracted from a frozen encoder and used as inputs of LMDM. In the second phase, LMDMs are trained to learn the motion distribution by providing the starting motion $\alpha_1$ as condition. Instead of directly learning the distribution of $\mathbf{a}$, we adopt a Linear Motion Condition (LMC) mechanism in LMDM towards synthesizing sequences of residuals with respect to $x_1$. At the inference stage, given a starting image $x_i$ and corresponding motion code $\alpha_i$, LMDM firstly generates a motion code sequence, which is then used by the image animator to generate flow maps to synthesize output videos in a warp-and-inpaint manner.}
+\label{fig:main-img}
+\end{figure*}
+
+In contrast to unconditional video generation, \textbf{conditional video generation} seeks to produces high-quality videos, following image-to-image generation pipeline~\cite{chu2017cyclegan,isola2017image, huang2018munit}. In this context, additional signals such as semantic maps~\cite{pan2019video, wang2018vid2vid,wang2019fewshotvid2vid}, human key-points~\cite{jang2018video, yang2018pose, walker2017pose, chan2019everybody, zakharov2019few, wang2019fewshotvid2vid, wang2021dance}, motion labels~\cite{WANG_2020_WACV}, 3DMM~\cite{Zhao_2018_ECCV, yang20223dhumangan} and optical flow~\cite{li2018flow,ohnishi2018ftgan} have been exploited to guide motion generation. In addition, text description, has been used in large-scale video diffusion models~{\cite{makeavideo,imagenvideo,videoLDM,lavie,vdm,show1,snapvideo,videocrafter2,latte,seine,svd}} for high-quality video generation. Our framework also supports for conditional video generation based on a single image. However, unlike previous approaches, our method follows the image animation pipeline~\cite{fomm,mraa,wang2022latent} which leverages the dense flow maps for motion modeling. We introduce our method in details in the following. 
+
+\section{Method}
+Fig.~\ref{fig:main-img} illustrates the training of LEO, comprising of two-phases. We firstly train an image animator towards learning high-quality latent motion codes of the datasets. In the second phase, we train the Latent Motion Diffusion Model (LMDM) to learn a motion prior over the latent motion codes. To synthesize a video, the pre-trained image animator takes the motion codes to generate corresponding flow maps, which are used to warp and inpaint starting frame. The warp-and-inpaint operation is conducted in two modules inside image animator. The warping module firstly produces flow fields based on motion codes to warp starting frame, then the inpainting module learns to fill in the holes in the warped starting frame and refine the entire image. Each video sequence is produced frame by frame.
+
+We formulate a video sequence $v = \{x_i\}^{L}_{i=1}, x_i\sim \mathcal{X}\in\mathbb{R}^{3\times H\times W}$ as $v = \{\mathcal{T}(x_1, G(\alpha_i))\}^{L}_{i=2}, \alpha_i\sim \mathcal{A}\in \mathbb{R}^{1\times N}$, where $x_i$ denotes the $i^{th}$ frame, $\alpha_i$ denotes a latent motion code at timestep $i$, $G$ represents the generator in the image animator aiming to generate a flow map $\phi_{i}$ from $\alpha_{i}$.
+
+\subsection{Learning Latent Motion Codes}
+Towards learning a frame-wise latent motion code, we adopt the state-of-the-art image animator LIA~\cite{wang2022latent} as it enables to encode input images into corresponding motion codes.  LIA consists of two modules, an encoder $E$ and a generator $G$. During training, given a source image $x_s$ and a driving image $x_d$, $E$ encodes $x_s, x_d$ into a motion code $\alpha = E(x_s, x_d)$, and $G$ generates a flow field $\phi = G(\alpha)$ from the code. LIA is trained in a self-supervised manner with the objective to reconstruct the driving image. 
+
+Training LIA in such a self-supervised manner brings two notable benefits for our framework, (i) it enables LIA to achieve high-quality perceptual results, and (ii) as a motion code is strictly equivalent to flow maps, there are guarantees that $\alpha$ is only motion-related without any appearance interference. 
+
+\begin{figure*}[t!]
+\centering
+\begin{subfigure}[t]{1.0\textwidth}
+\centering
+\includegraphics[width=1.0\textwidth]{taichi-compare.pdf}
+\caption{\footnotesize{\textbf{TaichiHD}}}
+\end{subfigure}
+\begin{subfigure}[t]{1.0\textwidth}
+\centering
+\includegraphics[width=1.0\textwidth]{face-compare.pdf}
+\caption{\footnotesize{\textbf{FaceForensics}}}
+\end{subfigure}
+\caption{\textbf{Qualitative Comparison.} We qualitatively compare LEO with DIGAN, TATS, StyleGAN-V on short video generation. The results indicate that on both (a) TaichiHD (128 and 256 resolutions) and (b) FaceForensics datasets, our proposed method achieves the best visual quality and is able to capture the human structure well. Other approaches either modify the facial structure (e.g., StyleGAN-V) or fail to generate a complete human body (e.g., TATS and DIGAN).}
+\label{fig:qualitative}
+\end{figure*} 
+
+\subsection{Leaning a Motion Prior}
+Once LIA is well-trained on a target dataset, for any given video $v=\{x_i\}^{L}_{i=1}$, we are able to obtain a motion sequence $\mathbf{a}=\{\alpha_i\}^{L}_{i=1}$ with the frozen $E$. In the second phase of our training, we propose to learn a motion prior by temporal Diffusion Models. 
+
+Unlike image synthesis, data in our second phase is a set of sequences. We firstly apply a temporal Diffusion Model for modeling the temporal correlation of $\mathbf{a}$. The general architecture of this model is a 1D U-Net adopted from~\cite{ddpm}. To train this model, we follow the standard training strategy with a simple mean-squared loss,
+\begin{align}
+    L_{\text{LMDM}} = \mathbb{E}_{\epsilon \sim \mathcal{N} (0,1), t}\left [ \left \| \epsilon - \epsilon_{\theta}(\mathbf{a}_t, t)\right \|^{2}_{2}\right],  
+\end{align}
+where $\epsilon$ denotes the unscaled noise, $t$ is the time step, $\mathbf{a}_t$ is the latent noised motion code to time $t$. During inference, a random Gaussian noise $\mathbf{a}_T$ is iteratively denoised to $\mathbf{a}_0=\{\alpha_i\}^{L}_{i=1}$, and the final video sequence is obtained through the generator. %$v^{'} = \{\mathcal{T}(x_1, G(\alpha_{i}))\}^{L}_{i=1}$.
+
+At the same time in our experiments, we found that learning motion sequences in a complete unconditional manner brings to the fore limitations, namely (i) the generated codes are not consistent enough for producing smooth videos, as well as (ii) the generated motion codes can only be used to produce fixed length videos. Hence, towards addressing those issues, we propose a \textbf{conditional Latent Motion Diffusion Model (cLMDM)} which aims for high-quality and long-term human videos.    
+
+One major characteristic of LIA has to do with the linear motion space. Any motion code $\alpha_t$ in $\mathbf{a}$ can be re-formulated as
+\begin{equation}\label{eq:2}
+    \alpha_{i} = \alpha_{1} + m_{i}, i\ge 2,
+\end{equation}
+where $\alpha_{1}$ denotes the motion code at the first timestep and $m_{i}$ denotes the motion difference between timestep $1$ and $i$, so that we can re-formulate $\mathbf{a}$ as
+\begin{equation}\label{eq:3}
+    \mathbf{a} = \alpha_{1} + \mathbf{m},
+\end{equation}
+where $\mathbf{m}=\{m_i\}^{L}_{i=2}$ denotes the motion difference sequence. Therefore, Eq.~\ref{eq:2} and \ref{eq:3} indicate that a motion sequence can be represented by $\alpha_{1}$ and $\mathbf{m}$. Based on this, we propose a \textbf{Linear Motion Condition (LMC)} mechanism in cLMDM to condition the generative process with $\alpha_1$. During training, at each time step, we only add noise onto $\mathbf{m_t}$ instead of the entire $\mathbf{a}$ and leave $\alpha_1$ intact. The objective function of cLMDM is
+\begin{equation}
+\begin{split}
+    L_{\text{cLMDM}} &= \mathbb{E}_{\epsilon \sim \mathcal{N} (0,1), t}\left [ \left \| \epsilon - \epsilon_{\theta}(\mathbf{m}_{t}, \alpha_1, t)\right \|^{2}_{2}\right], \\
+\end{split}
+\end{equation}
+where $\alpha_{1}$ denotes the condition signal and $\mathbf{m}_t$ stands for the noised $\mathbf{m}$ to time $t$. $\alpha_1$ is first added on $\mathbf{m}_t$ and then concatenated along temporal dimension. LMC will be applied at each time step until we reach $\mathbf{m}_0$. The final motion sequence is obtained as $\mathbf{a}_0 = [\alpha_1, \mathbf{m}_0]$. We find that following this, a related generated motion sequence is more stable and contains fewer artifacts, as $\alpha_1$ serves as a strong signal to constrain the generated $\mathbf{m}$ to follow the initial motion. 
+
+While the results from cLMDM outperforms previous models, the groundtruth $\alpha_1$ is necessitated during both, training and inference stage. Towards \textit{unconditional generation}, we train an additional simple DM to fit the distribution $p(\alpha_i)$ in a frame-wise manner. We refer to the cLMDM and such simple DM jointly as \textbf{Latent Motion Diffusion Model (LMDM)}. By this way, LMDM are able to work in both conditional and unconditional motion generation. 
+
+Towards generating videos of arbitrary length, we propose an autoregressive approach based on proposed LMDM. By taking the last motion code from the previous generated sequence as the $\alpha_1$ in the current sequence, with a randomly sampled noise, LMDM are able to generate an infinite-length motion sequence. By combining such sequence in pre-trained LIA with a starting image, LEO can synthesize photo-realistic and long-term videos.
+
+\begin{figure*}[t!]
+\centering
+\includegraphics[width=1.0\textwidth]{long-term.pdf}  
+\caption{\textbf{Comparison on long-term video generation.} We compare with TATS by generating 512-frame videos. Videos from TATS start crashing around 50 frames while our model is able to continue producing high-quality frames with diverse motion.}
+\label{fig:long-term}
+\end{figure*}
+
+\subsection{Learning Starting Frames}\label{sec:img-cond}
+In our framework, a starting image $x_1$ is required to synthesize a video. As image space is modeled independently, here we propose two options to obtain $x_1$.
+
+\textbf{Option 1: existing images.} The first option is to directly take the images either from a real distribution or from an image generation network. In this context, our model is a conditional video generation model, which learns to predict future motion from $x_1$. Starting motion $\alpha_1$ is obtained through $\alpha_1 = E(x_1)$.
+
+\textbf{Option 2: conditional Diffusion Models.} The second option is to learn a conditional DDPM~\cite{ddpm} (cDDPM) with $\alpha_1$ as a condition to synthesize $x_1$. By combining LEO with LMDM as well as cDDPM, we are able to conduct unconditional video synthesis.
+
+\section{Experiments}
+In this section, we firstly briefly describe our experimental setup, introducing datasets, evaluation metrics and implementation details. Secondly, we qualitatively demonstrate generated results on both, short and long video synthesis. Then we show quantitative evaluation w.r.t. video quality, comparing LEO with SoTA. Next, we conduct an ablation study to prove the effectiveness of proposed conditional mechanism LMC. Finally, we provide additional analysis of our framework, exhibiting motion and appearance disentanglement, video editing and infinite-length video generation. 
+
+\textbf{Datasets.} As we focus on human video synthesis, evaluation results are reported on three human-related datasets, TaichiHD~\cite{fomm}, FaceForensics~\cite{rossler2018faceforensics} and CelebV-HQ~\cite{zhu2022celebvhq}. We 
+use both $128\times 128$ and $256\times 256$ resolution TaichiHD datasets, and only $256\times 256$ resolution FaceForensics and CelebV-HQ datasets.
+
+\begin{itemize}
+    \item \textbf{TaichiHD}~\cite{fomm} comprises 3100 video sequences downloaded from YouTube. In train and test splits, it contains 2815 and 285 videos, respectively. We conducted all our experiments on the train split and used both $128\times 128$ and $256\times 256$ resolutions in our experiments.
+    \item \textbf{FaceForensics}~\cite{rossler2018faceforensics} includes 1000 video sequences downloaded from YouTube. Following the preprocessing of previous methods~\citep{TGAN2020, stylegan-v}, face areas are cropped based on the provided per-frame meshes. We resized all videos to $256\times 256$ resolution.
+    \item \textbf{CelebV-HQ}~\cite{zhu2022celebvhq} comprises 35666 high-quality talking head videos of 3 to 20 seconds each. In total, it represents 15653 celebrities. We resized the original videos to $256\times 256$ resolution, in order to train our models. 
+\end{itemize}
+
+\textbf{Evaluation metric.} For quantitative evaluation, we apply the commonly used metrics FVD and KVD, in order to compare with other approaches on video quality and apply Average Content Distance (ACD) towards evaluating the identity consistency of faces and bodies in the generated videos. In addition, we conduct a user study with 20 users towards comparing with objective quantitative evaluation. 
+
+\begin{itemize}
+\item \textbf{Frechet video distance (FVD) and Kernel Video Distance (KVD).} We use I3D~\citep{carreira2017quo} trained on Kinetics-400 as feature extractor to compute FVD and KVD. However, we find FVD is a very sensitive metric, which can be affected by many factors such as frame-rate, single image quality, video length and implementation, which also mentioned in~\citep{stylegan-v}. Therefore, towards making a fair comparison, on the TaichiHD dataset, we adopt the implementation from DIGAN~\citep{digan}. As for FaceForensics and CelebV-HQ, we chose to follow the implementation of StyleGAN-V~\citep{stylegan-v}. 
+\item \textbf{Average Content Distance (ACD).} ACD measures the content consistency in generated videos. To evaluate results from FaceForensics and TaichiHD, we extract features from each generated frame and proceed to extract a per-frame feature vector in a video. The ACD was then computed using the average pairwise L2 distance of the per-frame feature vectors. We follow the implementation in~\citep{mocoganhd} to compute ACD for FaceForensics. As for TaichiHD, we employ the pre-trained person-reID model~\citep{zheng2018discriminatively} to extract person identity features.
+\item \textbf{User study.} We asked 20 human raters to evaluate generated video quality, as well as video coherency. In each user study, we show paired videos and ask the raters, to rate 'which clip is more realistic / which clip is more coherent'. Each video-pair contains one generated video from our method, whereas the second video is either \textit{real} or generated from other methods.
+
+\end{itemize}
+
+\textbf{Implementation details.} Our framework requires two-phase training. In the first phase, we follow the standard protocol to train LIA~\citep{wang2022latent} to encode input images into low-dimensional latent motion codes, and map such codes to flow maps, which are used for reconstruction via warp-and-inpaint. Therefore, once trained, LIA naturally provides a space of motion codes that are strictly constrained to only containing motion-related information. In the second phase, we only train LMDM on the extracted motion codes from Encoder. We note that the LMDM is a 1D U-Net adopted from~\citep{nichol2021improved}, we set the input size as $64\times 20$, where 64 is the length of the sequence and 20 is the dimension of the motion code. We use 1000 diffusion steps and a learning rate of $1\mathrm{e}{-4}$. As the training of LMDM is conducted in the latent space of LIA, the entire training is very efficient and only requires one single GPU. 
+
+\subsection{Qualitative Evaluation}
+We qualitatively compare LEO with SoTA by visualizing the generated results. We firstly compare our method with DIGAN, TATS and StyleGAN-V on the FaceForensics and TaichiHD datasets for \textit{short video generation}. As shown in Fig.~\ref{fig:cover} and~\ref{fig:qualitative}, the visual quality of our generated results outperforms other approaches w.r.t both, appearance and motion. For both resolutions on TaichiHD datasets, our method is able to generate complete human structures, whereas both, DIGAN and TATS fail, especially for arms and legs. When compared with StyleGAN-V on FaceForensics dataset, we identify that while LEO preserves well facial structures, StyleGAN-V modifies such attributes when synthesizing large motion. 
+
+Secondly, we compare with TATS for long-term video generation. Specifically, 512 frames are produced for the resolution $128\times 128$ pertained to the TaichiHD dataset. As shown in Fig.~\ref{fig:long-term}, the subject in the videos from TATS starts crashing around 50 frames and the entire video sequence starts to fade. On the other hand, in our results, the subject continues to perform diverse actions whilst well preserving the human structure. We note that our model is only trained using a 64-frame sequence.
+
+\begin{table*}[!t]
+\begin{center}
+\setlength\arrayrulewidth{1pt}
+\scalebox{0.8}{
+\begin{tabular}{ccccccccccccc}
+\hline
+& \multicolumn{4}{c}{TaichiHD128} & \multicolumn{3}{c}{TaichiHD256} & \multicolumn{3}{c}{FaceForensics} & \multicolumn{1}{c}{CelebV-HQ} \\
+Method & $\text{FVD}_{16}$ & $\text{KVD}_{16}$ & $\text{ACD}_{16}$ && $\text{FVD}_{16}$ & $\text{KVD}_{16}$ && $\text{FVD}_{16}$ & $\text{ACD}_{16}$ && $\text{FVD}_{16}$   \\
+\cmidrule{2-4}\cmidrule{6-7}\cmidrule{9-10}\cmidrule{12-12}
+MoCoGAN-HD & $144.7\pm 6.0$ & $25.4\pm 1.9$ & - && - & - && 111.8 & 0.33 && 212.4  \\
+DIGAN & $128.1\pm 4.9$ & $20.6\pm 1.1$ & 2.17 && $156.7\pm 6.2$ & - && 62.5 & - && 72.9  \\
+TATS & ${136.5\pm1.2}^{*}$ & ${22.2\pm1.0}^{*}$ & 2.28 && - & - && - & - && -  \\
+StyleGAN-V & - & - & - && - & - && 47.4 & 0.36 && 69.1  \\
+MoStGAN-V & - & -& - && - & - && 39.7 & 0.38 && 132.1 \\
+\cmidrule{1-12}
+Ours (uncond) & $100.4\pm 3.1$ & $11.4\pm 3.2$ & 1.83 && $122.7\pm 1.1$ & $20.49\pm 0.9$ && 52.3 & 0.28 && -  \\
+Ours (cond) & $\mathbf{57.6\pm 2.0}$ & $\mathbf{4.0\pm 1.5}$ & \textbf{1.22} && $\mathbf{94.8\pm 4.2}$ & $\mathbf{13.47\pm 2.3}$ && \textbf{35.9} & \textbf{0.27} && \textbf{40.2}  \\
+\hline
+\end{tabular}}
+\end{center}
+\caption{\textbf{Evaluation for unconditional and conditional short video generation.} LEO systematically outperforms other approaches on conditional video generation, and achieves better or competitive results on unconditional generation w.r.t. FVD, KVD and ACD. (*results are reproduced based on official code and released checkpoints.)}
+\label{tab:fvd-cond-uncond-short}
+\end{table*}
+
+\begin{table}[!t]
+\begin{center}
+\setlength\arrayrulewidth{0.8pt}
+\scalebox{0.68}{
+\begin{tabular}{ccccccc}
+\hline
+& \multicolumn{4}{c}{TaichiHD128} & \multicolumn{2}{c}{FaceForensics} \\
+Method & $\text{FVD}_{128}$ & $\text{KVD}_{128}$ & $\text{ACD}_{128}$ && $\text{FVD}_{128}$ & $\text{ACD}_{128}$ \\
+\cmidrule{2-4}\cmidrule{6-7}
+DIGAN & - & - & - && 1824.7 & - \\
+TATS & $1194.58\pm 1.1$ & $462.03\pm 8.2$ & 2.85 && - & -\\
+StyleGAN-V & - & - & - && \textbf{89.34} & 0.49 \\
+\cmidrule{1-7}
+Ours & $\mathbf{155.54\pm 2.6}$ & $\mathbf{48.82\pm 5.9}$ & \textbf{2.06} && 96.28 & \textbf{0.34}\\
+\hline
+\end{tabular}}
+\end{center}
+\caption{\textbf{Evaluation for unconditional long-term video generation.} LEO outperforms other methods on long-term (128 frames) video generation w.r.t. FVD, KVD and ACD.}
+\label{tab:fvd-uncond-long}
+\end{table}
+
+\subsection{Quantitative evaluation}
+In this section, we compare our framework with five state-of-the-art for both, conditional and unconditional short video generation, as well as unconditional long-term video generation.
+
+\textbf{Unconditional short video generation.} In this context, as described in Sec.~\ref{sec:img-cond}, Option 2, the $x_1$ is randomly generated by a pre-trained cDDPM. We compare with SoTA by generating 16 frames. To compare with DIGAN on high-resolution generation, we also generate videos of $256\times 256$ resolution. Related FVDs and KVDs are reported in Tab.~\ref{tab:fvd-cond-uncond-short}. LEO systematically outperforms other methods w.r.t. video quality, obtaining lower or competitive FVD and KVD on all datasets. On high-resolution generation, our results remain better than DIGAN. 
+
+However, by comparing the results between StyleGAN-V and ours, we find FVD is not able to represent the quality of generated videos veritably. We observe that StyleGAN-V is not able to preserve facial structures, whereas LEO is able to do so, see Fig.~\ref{fig:qualitative}. We additionally compute ACD, in order to further analyze the identity consistency in 16-frame videos. Tab.~\ref{tab:fvd-cond-uncond-short} reflects on the fact that our method achieves significantly better results compared to other approaches. In addition, we conduct user study \textit{w.r.t.} video quality and coherency of generated videos among different methods. Results in Tab.~{\ref{tab:user-study}} showcase that as nearly all users rated for our generated results to be superior than other approaches. Hence, we conclude that a metric, replacing FVD is in urgent need in the context of video generation.
+
+\textbf{Unconditional long video generation} 
+We evaluate our approach for long-term video generation w.r.t. FVD and ACD. In this context, we compare LEO with StyleGAN-V on the FaceForensics dataset, and both DIGAN and TATS on the TaichiHD. We report results based on 128-frame generation in Tab.~\ref{tab:fvd-uncond-long}, which clearly shows that our method outperforms others in such context. We hypothesize that consistent and stable motion codes produced by our LMDM are key to producing high-quality long-term videos.
+
+\textbf{Conditional short video generation}
+As described in Sec.~\ref{sec:img-cond}, Option 1, our framework additionally caters for conditional video generation by taking an existing image to hallucinate the following motion. Specifically, we randomly select 2048 images from both, TaichiHD and FaceForensics datasets as $x_1$ and compute corresponding $\alpha_1$ as input of LMDM. As depicted in Tab.~\ref{tab:fvd-cond-uncond-short}, results conditioned on the real images achieve the lowest FVD, KVD and ACD values, suggesting that the quality of a starting image is pertinent for output video quality, which further signifies that in the setting of unconditional generation, training a better cDDPM will be instrumental for improving results.
+
+\begin{figure*}[t!]
+\centering
+\includegraphics[width=1.0\textwidth]{distanglement.pdf}  
+\caption{\textbf{Disentanglement of motion and appearance.} The first and second row share the same appearance, with different motion codes. Results display that our model is able to produce diverse motion from the same content.}%, demonstrating the ability of LEO to disentangle appearance and motion.}
+\label{fig:disentanglement}
+\end{figure*}
+
+\begin{figure*}[t!]
+\centering
+\includegraphics[width=1.0\textwidth]{video-edit-v2.pdf}  
+\caption{\textbf{Video editing.} We show video editing results by combining LEO with off-the-shelf image editing model ControlNet. We are able to edit the appearance of the entire video sequence through only editing the starting image.}
+\label{fig:semantic-edit-taichi}
+\end{figure*}
+
+\begin{table}[!t]
+\begin{minipage}[t]{0.45\textwidth}
+\centering
+\setlength{\tabcolsep}{3.5pt}
+\setlength\arrayrulewidth{1pt}
+\scalebox{0.9}{
+\begin{tabular}{cccc}
+\hline
+Method & TaichiHD (\%) & FaceForensics (\%) \\
+\cmidrule{1-3}
+Ours / TATS & \textbf{93.00} / 7.00  & - \\
+Ours / StyleGAN-V  & - & \textbf{91.33} / 8.67 \\
+\hline
+\hline
+Method & TaichiHD (\%) & FaceForensics (\%) \\
+\cmidrule{1-3}
+Ours / TATS & \textbf{98.60} / 1.40  & - \\
+Ours / StyleGAN-V  & - & \textbf{93.20} / 6.80 \\
+\hline
+\end{tabular}}
+\captionof{table}{\textbf{User study.} We conduct user studies pertaining to the datasets TaichiHD and FaceForensics \textit{w.r.t.} video quality (up) as well as coherency (down).}
+\label{tab:user-study}
+\end{minipage}
+\begin{minipage}[t]{0.05\textwidth}
+\quad
+\end{minipage}
+\begin{minipage}[t]{0.45\textwidth}
+\centering
+\setlength\arrayrulewidth{1pt}
+\scalebox{1.0}{
+\begin{tabular}{ccc}
+\hline
+ & TaichiHD & FaceForensics \\
+\cmidrule{1-3}
+w/o LMC & 118.6 & 60.03 \\
+with LMC & \textbf{100.4} & \textbf{52.32} \\
+\hline
+\end{tabular}}
+\captionof{table}{\textbf{Ablation study of proposed LMC.} Models with LMC achieved the lowest FVD on both datasets.}
+\label{tab:ablation-lmc}
+\end{minipage}
+\end{table}
+
+\section{Ablation Study}
+In this section, we place emphasis on analyzing the effectiveness of proposed Linear Motion Condition (LMC) in  LMDM. We train two models, with and without LMC on both TaichiHD and FaceForensics datasets. As shown in Tab.~\ref{tab:ablation-lmc}, using LMC significantly improves the generated video quality, which proves that our proposed LMC is an effective mechanism for involving $\alpha_1$ in LMDM.
+
+\section{Additional Analysis}
+
+\textbf{Motion and appearance disentanglement.} We proceed to combine the same $x_1$ with different $\mathbf{m}$, aiming to reveal whether $\mathbf{m}$ is only motion-related. Fig.~\ref{fig:disentanglement} illustrates that different $\mathbf{m}$ enables the same subject to perform different motion - which proves that our proposed LMDM is indeed learning a motion space, and appearance and motion are clearly disentangled. This experiment additionally indicates that our model does not overfit on the training dataset, as different noise sequences are able to produce diverse motion sequences.
+
+\textbf{Video Editing.} As appearance is modeled in $x_1$, we here explore the task of video editing by modifying the semantics in thestarting image. Compared to previous approaches, where image-to-image translation is required, our framework simply needs an edit of the semantics in an one-shot manner. Associated results are depicted in Fig.~\ref{fig:cover} and Fig.~\ref{fig:semantic-edit-taichi}. We apply the open-source approach ControlNet~\cite{controlnet} on the starting frame by entering various different prompts. Given that the motion space is fully disentangled from the appearance space, our videos maintain the original temporal consistency, uniquely altering the appearance. 
+
+\textbf{Infinite-length video generation.}  
+In addition to presented settings, our framework is able to generate infinite-length videos. To generate long-term FaceForensics, as shown in Fig.~\ref{fig:long-term-face}, we provide the last generated code from the previous sequence as the starting code of the current sequence. The entire long-term video is generated in an \textit{autoregressive} manner. Surprisingly, we find that such a simple approach is sufficient to produce more than 1000 frames. We note that for TaichiHD dataset, due to limited motion patterns, this setting yields repeated motion. Towards addressing this limitation, as shown in Fig.~\ref{fig:long-term-taichi}, we design an additional \textit{Transition Diffusion Model (Transition DM)} aimed at generating transition motion between the last code from original generated sequence and a new motion code generated from the \textit{simple DM}. Doing so, the Transition DM enforces the network to exit the original motion pattern and transit to new pattern. To evaluate the effectiveness of the proposed method, we generate long videos \textit{with} and \textit{without} Transition DM and request human raters to watch respective videos and answer the question `Does the clip contain repeated motion?'. Results are reported in Tab.~{\ref{tab:tdm}}, which shows the effectiveness of Transition DM to prevent repeated motion.
+
+\begin{table}[!h]
+\centering
+\setlength{\tabcolsep}{25pt}
+\setlength\arrayrulewidth{1pt}
+\begin{tabular}{cc}
+\hline
+ & Occurrence (\%) \\
+\cmidrule{1-2}
+w/o Transition DM & 0.45 \\
+with Transition DM & 0.02 \\
+\hline
+\end{tabular}
+\caption{\textbf{User study of repeated motion.} We show the occurrence of repeated motion with and without the usage of Transition DM.}
+\label{tab:tdm}
+\end{table}
+
+\textbf{\begin{figure*}[th!]
+    \centering
+    \includegraphics[width=0.9\textwidth]{infinite-fig-taichi.pdf}
+    \caption{Infinite-length video generation for TaichiHD.}
+    \label{fig:long-term-taichi}
+\end{figure*}}
+
+\begin{figure}[t!]
+    \centering
+    \includegraphics[width=0.47\textwidth]{infinite-fig-face.pdf}
+    \caption{Infinite-length video generation for FaceForensics.}
+    \label{fig:long-term-face}
+\end{figure}
+
+Compared to current diffusion-based methods, our approach is very efficient in long video generation. We autoregressively run LMDM for the generation of long motion code sequences in latent space. Given that LMDM is a small-scale network, which only focuses on generating 1-D motion code, even for very long sequence generation, it only requires few seconds during inference stage. In addition, the image animator itself is a one-step inference model which enables our proposed method to be significantly efficient.
+
+\section{Limitations}
+We list several limitations in current framework and proposed potential solutions for future work.
+\begin{itemize}
+\item \textit{Geometry ambiguity and temporal coherency.} Since we use a 2D generator to predict 2D flow maps, LEO is not able to handle human body occlusion very well especially in Taichi dataset. One solution would be to incorporate the architecture of NeRF or Tri-plane into our generator to support 3D-aware generation. We think in this way, the issues of geometry ambiguity and human body occlusion could be addressed.
+\item \textit{Generalizability.} Since the pre-trained image animator focuses on talking head and human bodies, our proposed framework currently performs better on human-centric videos. However, to analyze the generalizability of LEO, we conducted a small-scale experiment on UCF101 and report quantitative evaluation in Tab.~{\ref{tab:ucf}}. The results show that under current model design, LEO achieves competitive results with previous GAN-based methods but still has large performance gap compared with large-scale video diffusion models. 
+
+We believe our framework is pushing the boundaries of video generation, as it solves a challenge, which constitutes generation of long human-centric videos. While this is a first step, the proposed method has the potential to generalize onto additional settings such as text-to-video generation. However, achieving such goals requires scaling up and re-designing (a) the original LIA, as well as (b) LMDM, and (c) training the entire system on larger-scale well-curated video datasets, which requires extremely expensive computational resources. We will explore such research directions in our future work.
+
+\begin{table}[!h]
+\centering
+\setlength{\tabcolsep}{25pt}
+\setlength\arrayrulewidth{1pt}
+\begin{tabular}{cc}
+\hline
+Methods & $\text{FVD}_{16}$ \\
+\cmidrule{1-2}
+MoCoGAN-HD & 1729.6  \\
+DIGAN & 1630.2 \\
+StyleGAN-V & 1431.0 \\
+\cmidrule{1-2}
+Make-A-Video & 367.23 \\
+Video LDM & 550.61 \\
+LaVie & 540.30 \\
+\cmidrule{1-2}
+Ours & 1356.2 \\
+\hline
+\end{tabular}
+\caption{Quantitative evaluation on UCF101 \textit{w.r.t.} FVD.}
+\label{tab:ucf}
+\end{table}
+
+\item \textit{Architecture.} Current architect of LEO still relies on convolutional networks in both image animator and latent motion diffusion models. Advanced techniques such as transformers have not been explored yet. Future work would be involving novel architecture design and training LEO on larger-scale dataset to explore the limits of current approach.
+\end{itemize}
+
+\section{Conclusions}
+In this paper, we introduced LEO, a novel framework incorporating a Latent Image Animator (LIA), as well as a Latent Motion Diffusion Model (LMDM), placing emphasis on spatio-temporal coherency in human video synthesis. By jointly exploiting LIA and LMDM in a two-phase training strategy, we endow LEO with the ability to disentangle appearance and motion. We quantitatively and qualitatively evaluated proposed method on both, human body and talking head datasets and demonstrated that our approach is able to successfully produce photo-realistic, long human videos. In addition, we showcased that the effective disentanglement of appearance and motion in LEO allows for two additional tasks, namely infinite-length human video synthesis by autoregressively applying LMDM, as well as content-preserving video editing (employing an off-the-shelf image editor (e.g., ControlNet)). We postulate that LEO opens a new door in design of generative models for video synthesis and plan to extend our method onto more general videos and applications.
+
+\end{document}

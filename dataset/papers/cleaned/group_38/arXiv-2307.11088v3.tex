@@ -1,0 +1,411 @@
+\title{L-Eval: Instituting Standardized Evaluation for Long Context Language Models}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+Recently, there has been growing interest in extending the context length of large language models (LLMs), aiming to effectively process long inputs of one turn or conversations with more extensive histories. While proprietary models such as GPT-4 and Claude can largely preserve the reasoning ability in an extended context, open-source models are still progressing through the early stages of development. 
+To bridge this gap, we propose L-Eval to institute a more standardized evaluation for long context language models (LCLMs) addressing two key aspects: dataset construction and evaluation metrics. On the one hand, we build a new evaluation suite containing 20 sub-tasks, 508 long documents, and over 2,000 human-labeled query-response pairs encompassing diverse question styles, domains, and input length (3k$\sim$200k tokens). On the other hand, we investigate the effectiveness in evalution metrics for LCLMs. Results show that popular n-gram matching metrics generally can not correlate well with human judgment, and thus we strongly advocate for length-instruction-enhanced (LIE) evaluation and employing LLM judges.  We conducted a comprehensive study of 4 popular commercial LLMs and 12 open-source counterparts using the L-Eval benchmark. Our empirical findings offer useful insights into the study of LCLMs and lay the groundwork for the development of more principled evaluation of these models.\footnote{We release our new evaluation suite, code, and all generation results on  \url{https://github.com/OpenLMLab/LEval}}
+
+\end{abstract}
+
+\section{Introduction}
+Currently, a significant amount of effort is being dedicated to research on extending the context length of large language models. Popular solutions mainly involve further pretraining or finetuning standard models on longer inputs using more efficient architectures~\citep{ding2023longnet, NEURIPS2022_67d57c32, liang2023unleashing, mohtashami2023landmark, li2023incontext}, as well as scaled positional embedding~\citep{su2022roformer, sun2022lengthextrapolatable, fixedNTK, qin2023linear}. 
+
+There are extensive multi-task benchmarks~\citep{hendrycks2021measuring, suzgun2022challenging} for language models with short prompts, yet a high-quality one in long context modeling has not yet been established, presenting an opportunity for further development in this area.  Meanwhile, almost all previous long-sequence text generation benchmarks relied primarily on n-gram matching metrics~\citep{zhang2023cab, shaham2022scrolls}, such as ROUGE~\citep{lin-2004-rouge}. Whether these commonly used metrics correlate well with human judgment when testing LCLMs in a zero-shot setting remains a question. Furthermore, the open-source community has released a considerable number of language models with 16k, or 32k context length~\citep{longchat2023, du2022glm}. A comprehensive comparative study of these models can be of great value.
+
+To address these issues, we propose \textit{L-Eval} to call for a more standardized evaluation of long context language models. For dataset construction, L-Eval has 20 sub-tasks, 4 sub-tasks are annotated from scratch (\S\ref{sec:scratch}), 4 sub-tasks are re-annotated from the public datasets (\S\ref{sec:re-anno}), and the remaining 12 sub-tasks are manually cleaned from previous long sequence datasets.  
+We divide these tasks in L-Eval into two groups: closed-ended tasks and open-ended tasks. The closed-ended group primarily tests the reasoning and understanding ability regarding a longer context, and the open-ended group consists of more summarization tasks that require aggregation of long document information. In the design of L-Eval, we prioritize diversity and quality over quantity, ensuring correctness by manually validating all samples after data collection (\S\ref{sec:postprocess}). Our data diversity, indicative in question styles, domain selection, and input lengths, is detailed in Table~\ref{tab:datasets}.
+
+In addition, the development of suitable evaluation metrics for LCLMs on open-ended tasks where multiple outputs are acceptable is crucial, yet challenging. In this work, we study the limitations of traditional metrics based on lexical matching. We demonstrate that these metrics often fail to correlate with human evaluation results. Our further experiments suggest that LLM judges~\citep{alpaca_eval, zheng2023judging} provide superior accuracy in the evaluation of open-ended tasks. \S\ref{sec:metric} explains how we set a short-context LLM judge in a long-context evalution setting. 
+Considering the influence of generation length on performance and in order to avoid drawing misleading conclusions, we propose the Length-Instruction-Enhanced (LIE) evaluation technique for all reference-based metrics, including those employing an LLM judger. The empirical results demonstrate a substantial improvement brought by LIE evaluation in the Kendall-Tau correlation coefficient ($\tau$) with human judgments (Figure~\ref{fig:cor}), for all automatic metrics.
+
+We also conducted a comprehensive study with 16 different LLMs (\S\ref{sec:baselines}) in L-Eval. Some of our key findings are summarized below:
+(1) There is still a significant gap between open-source LCLMs and commercial models, for both closed-ended tasks (Table~\ref{table:acc_exam}) and open-ended tasks evaluated by LLMs and human (Table~\ref{tab:llm_eval},~\ref{tab:human_eval}). However, this gap is not accurately reflected by n-gram metrics.
+(2) While current efforts on open-source LCLMs improve performance on closed-ended tasks, they significantly fall short on open-ended tasks. This is largely due to the models' misunderstanding of instructions as the input context length increases.
+(3) Experiments on GPT-3.5-Turbo with both dense and sparse retrievers show that end-to-end full-context models outperform traditional retrieval-based systems.
+(4) Training-free scaled positional embeddings can enhance the retrieval capability of LLMs over longer input, while it may adversely affect their reasoning ability.
+    
+
+More interesting conclusions can be found in \S\ref{sec:main_results} and \S\ref{sec:analysis_app}. We hope \textit{L-Eval} and our findings contribute to a deeper understanding of current LCLM research and the further development of models and evaluation metrics.
+
+\subsection{Long Context Language Models}\label{sec:lclms}
+Feeding long context leads to bottlenecks in language model training and inference due to computational resources. Some community efforts focus on developing 
+ {efficient attention} mechanisms to build efficient language models~\citep{sun2023retentive,ding2023longnet,li2023incontext,fu2023hungry,peng2023rwkv}. 
+In addition to optimizing the attention mechanism, some works~\citep{bulatov2023scaling,dai-etal-2019-transformer, mohtashami2023landmark} focus on {chunking the input} to model both the current text in the chunk and the previous context states, effectively extending the length of context processing.
+Besides the efficiency challenge, the {scalability of positional embedding} is also crucial. ALiBi~\citep{press2022train}, and \textsc{xPos}~\citep{sun2022lengthextrapolatable} emphasize the significance of local context to enhance the language model's ability to perform extrapolation.
+Moreover, position interpolation (PI)~\citep{chen2023extending} and NTK-aware~\citep{fixedNTK, dynamicNTK} are the most popular approaches based on RoPE~\citep{su2022roformer} to efficiently and effectively extend the context length. However, these works mainly validated their methods with perplexity (PPL)~\citep{sun2021long, fixedNTK}, and there has not been systematic validation on practical tasks.  
+
+\subsection{Long Sequences Benchmarks}
+\cite{tay2020long} introduce the Long Range Arena (LRA), a benchmark encompassing five distinct classification tasks. CAB~\citep{zhang2023cab} is another benchmark for different efficient attention designs by comparing both efficiency and accuracy. In language domain, 
+previous work on LCLMs tends to report PPL to evaluate language models~\citep{su2022roformer, peng2023yarn} on longer context. However, PPL may not usually correlate with the actual performance~\citep{sun2021long}.  ZeroScrolls~\citep{shaham2022scrolls, shaham2023zeroscrolls} and LongBench~\citep{bai2023longbench} are concurrent long context evaluation suites. L-Eval differs from them in 3 aspects: (1) Manually selected samples. Testing samples are automatically filtered by their benchmarks, while those for L-Eval are manually filtered. (2) Standardized metrics.  We are the first to investigate the correlations between traditional lexical metrics and recently proposed LLM metrics with human judgment on Long context settings. L-Eval no longer mainly relies on N-gram metrics.  (3) More closed-ended tasks. Due to fairness issues in open-ended tasks. L-Eval has more closed-ended tasks reflecting unbiased results.
+
+\section{Towards High-Quality and Diverse Long Context DataSets}
+\label{sec:data}
+In this section, we highlight some key procedures in L-Eval data construction.
+Concretely, we show the annotation, re-annotation, and manual filtering pipeline and the statistics of L-Eval.  Please refer to Appendix~\ref{sec:data-appendix} for the complete annotation details and examples. 
+
+\subsection{Data Annotation from Scratch}\label{sec:scratch}
+There are 4 datasets annotated from scratch in L-Eval: Coursera, SFcition, CodeU, and LongFQA. The original resources are videos from Coursera, previous open-source datasets, source code from famous Python libraries, and public earning call transcripts, respectively.
+
+\vspace{-0.7em}
+\paragraph{Coursera} This dataset originates from the Coursera website.\footnote{\url{https://coursera.org/}} To reduce the difficulty of annotation, we choose four public courses related to big data and machine learning (\S\ref{sec:coursera}).
+The input long document is the subtitles of the videos. Questions and the ground truth answers are labeled by the authors. The instruction style of Coursera takes the format of multiple choice. In order to increase the difficulty of the task, we have set \textbf{multiple correct options}. To the best of our knowledge, this is the first multi-choice dataset with multiple correct answers and it is more challenging than single-option questions (Table~\ref{table:acc_exam}).
+
+\vspace{-0.7em}
+\paragraph{SFcition} 
+We annotate this sub-task to test the loyalty of the LCLM to the input context. We argue that in LCLMs, contextual knowledge (stored in long input) is more crucial than parametric knowledge (gained during pretraining). Practically, many long documents are private and can never be seen during pretraining. LLMs should follow the contextual knowledge instead of parametric knowledge in long context settings. To simulate this scenario, we annotate a science fiction dataset consisting of True or False questions. Most of the answers to these questions contradict real-world principles and do not comply with actual physical laws (\S\ref{sec:sfiction}). We find that Turbo-16k struggles on this task, which tends to answer questions relying on parametric knowledge (Table~\ref{table:acc_exam}).
+
+\vspace{-0.7em}
+\paragraph{CodeU} As a code understanding dataset, it requires LLM to infer the output of a lengthy Python program. We mainly use source code from Numpy\footnote{\url{https://github.com/numpy/numpy}} and construct a string processing codebase. To prevent LLMs from answering the question based on their parametric knowledge, we replace the original function name. LLMs should first locate where the function is called and determine which functions are invoked. CodeU is the most challenging task in L-Eval (\S\ref{sec:codeU}).
+
+\vspace{-0.7em}
+\paragraph{LongFQA} We also notice that there is a lack of long context question answering datasets in the finance domain and we annotate the QA pairs based on public earning call transcripts from the \textit{Investor Relations} section of 6 company websites.  Please refer to \S\ref{sec:longfqa} for details.
+
+\subsection{Data Re-annotation from Public Datasets}\label{sec:re-anno}
+We re-annotate 5 publicly available datasets in L-Eval. 
+\textbf{GSM(16-shot)} is derived from 100-grade school math problems in the GSM8k dataset~\citep{cobbe2021training}. If the LCLM maintain its reasoning ablilty on longer context, ultizing more high-quality examples will a positive effect on solving math problems~\citep{li2023incontext}. We construct 16 in-context examples with lengthy Chain-of-Thought where 8 examples come from  \textit{chain-of-thought-hub}\footnote{\url{https://github.com/FranxYao/chain-of-thought-hub}} and 8 examples are constructed by us.  We experiment with the newly constructed examples and the accuracy of Turbo-16k-0613 rises from 79 (8-shot) to 84 (16-shot).  
+
+We inject come new synthesis instructions to test global context modeling into \textbf{QuALITY}~\citep{pang2022quality}, such as \textit{``What can we infer from the longest sentence in this story?''} and \textit{``How many words are there in the story?''}. Given that these types of questions may rarely occur in real-world conversations, their proportion in L-Eval is extremely small. 
+The \textbf{Openreview} dataset contains papers collected from \url{openreview.net}. We ask the model to (1) write an Abstract
+section, (2) summarize the related work, and (3) finally give feedback including valuable suggestions and 
+some questions for the authors. We select the paper with high-quality related work sections and helpful reviews written by human reviewers to form this test set.\footnote{Ethic statement:
+we discourage reviewers from using large models for reviews. Our goal is to assist authors in further improving their papers.} Next, we use \textbf{SPACE}~\citep{angelidis-etal-2021-extractive} to test the aspect-based review summarization task, and the instructions for the dataset are annotated by us. We adopt diverse instructions to prevent overfitting.
+
+\begin{wrapfigure}{r}{0.4\textwidth}
+  \centering
+  \vspace{-4mm}
+  \includegraphics[width=0.4\textwidth]{fig/topic_ret.pdf}
+  \caption{Test Accuracy (\%) of different models with retrieving the first topic and retrieving the second/third topic.}
+  \label{fig:topic}
+  \vspace{-5mm}
+\end{wrapfigure}
+Previous work~\citep{longchat2023,liu2023lost} has used retrieval tasks to test the ability of modeling long context dependency via retrieving something over lengthy context. L-Eval includes a popular first topic retrieval task \textbf{TopicRet}~\citep{longchat2023}, formatted as: ``\textit{[topic-1] Chat History [instruction]} ''. However, as we can see from Figure~\ref{fig:topic}, retrieving the first topic is too easy to distinguish the ability of different models. However, the task of retrieving the second and the third topics presents a significantly higher level of challenge. It is observed that nearly all open-source models struggle in  task.  So we enhance the task with second/third topic retrieval.
+
+\subsection{Data Filtering and Correction}\label{sec:postprocess}
+The remaining 12 tasks originates from existing datasets following previous evaluation suites~\citep{zhang2023cab}.  However, L-Eval involves more human labor after data collection because we find the annotation quality of previous long sequence datasets fluctuates severely and there are many unanswerable questions that are unrelated to the context. These mistakes can hardly be corrected using the automatic preprocessing scripts in previous works. In L-Eval, all samples are manually filtered and corrected after data collection. Specifically, we use Claude-100k as our assistant to filter mistaken QAs and unanswerable questions. First, we input the lengthy document into Claude and request it to provide the answer and offer an explanation. If Claude produces an answer greatly mismatching the ground truth or states that we cannot deduce the answer from the context, we will either perform re-annotation or simply remove them. 
+
+\begin{table}[t]
+\vspace{-1em}
+\centering  
+\caption{This table presents the statistics of the L-Eval suite where \textbf{Question-style} indicates the type of task or the style of instruction in the dataset, \textbf{\#Doc} refers to the number of long documents, and \textbf{\#Instr} denotes the number of instructions provided for each long input. \textbf{Avg/Max len} signifies the average/maximum length of the document inputs. We tokenize the raw text with Llama2 tokenizer and report the number of tokens.
+}
+\vspace{-0.5em}
+\resizebox{\textwidth}{!}{
+\begin{tabular}{lllrrrr}
+\toprule
+\bf Dataset &\bf Question-style &\bf Domain &\bf Avg len & \bf Max len &\bf \#Instr  &\bf \#Doc \\
+\midrule
+\rowcolor{mypink!50}
+\multicolumn{7}{c}{\textbf{\textit{Closed - Ended \, Tasks}}} \\
+\midrule 
+
+TOEFL & Multiple choice & English test & 3,907 & 4,171  &  269 & 15\\
+GSM(16-shot)$^\dag$ & Solving math problems & In-context examples & 5,557  & 5,638 & 100 & 100  \\
+QuALITY~\cite{}$^\dag$ & Multiple choice & Gutenberg & 7,169  & 8,560  & 202 & 15 \\
+Coursera$^*$  & Multiple choice  & Advanced courses & 9,075 & 17,185 & 172  & 15 \\
+TopicRet$^\dag$  & Retriving topics & Conversation  &  12,506 & 15,916  & 150 & 50 \\
+SFcition$^*$ & True or False Questions & Scientific fictions & 16,381 & 26,918 & 64 & 7 \\
+CodeU$^*$ & Deducing program outputs & Python Codebase  &  31,575 & 36,509 & 90 & 90 \\
+
+\midrule
+\rowcolor{mypink!50}
+\multicolumn{7}{c}{\textbf{\textit{Open - Ended \, Tasks}}} \\
+\midrule
+MultiDoc2Dial & Goal-oriented dialogues & Grounded documents & 3,905 & 7888  & 136 & 20 \\
+Qasper & QA on papers & NLP papers & 5,019 & 6,547  & 160 & 20 \\
+LongFQA$^*$  & QA on earning call & Finance  & 6,032 & 7824  & 52 & 6 \\
+NQ & QA from Google Search & Wikipedia & 23,698 & 47,726 & 104 & 20\\
+CUAD & Extracting key information & Law & 30,966 & 68,625  & 130 & 20 \\
+NarrativeQA & QA on narratives  & Gutenberg  & 62,335  & 210,541 & 182 & 20 \\
+\midrule
+Multi-News & Multi-doc Summarization & Multiple News articles  & 7,320& 19,278  & 11 &11 \\
+GovReport & Single-doc Summarization & Government reports  & 7,495 & 27,128  &13 & 13 \\
+BigPatent & Single-doc Summarization & Lengthy patents  & 7,718  & 12,867 & 13 & 13 \\
+SummScreen & Transcripts Summarization & TV series transcripts  & 10,688 & 14,544  & 13 & 13 \\
+Openreview$^\dag$ & Paper writing \& reviewing & Papers from Openreview  & 11,170 & 33,303 & 60 & 20 \\
+QMSum &  Query-based summarization & Meeting transcripts  & 16,692 & 33,310 & 156 & 20 \\
+SPACE$^\dag$ & Aspect-based summarization & Reviews on Hotels  &  19,978 & 22,158 & 120 & 20 \\
+\bottomrule
+\end{tabular}
+}
+
+\label{tab:datasets}
+\end{table}
+
+\subsection{Statistics}\label{sec:stat}
+The statistics of L-Eval are shown in Table~\ref{tab:datasets}.
+The L-Eval contains various question styles such as multiple choice questions (TOFEL~\citep{tseng2016towards}, QuALITY, Coursera), true or false questions (SFiction), math problems (GSM), code understanding (CodeU), goal-oriented dialogues (MultiDoc2Dial~\citep{Feng_2021}), extractive QA (CUAD~\citep{hendrycks2021cuad}, NQ~\citep{kwiatkowski-etal-2019-natural}), abstractive QA (LongFQA, NarrativeQA~\citep{kočiský2017narrativeqa}, Qasper~\citep{dasigi2021dataset}), single document summarization (GovReport~\citep{huang-etal-2021-efficient}, BigPatent~\citep{sharma-etal-2019-bigpatent}, SummScreen~\citep{chen2022summscreen}, QMSum~\citep{zhong2021qmsum}), multi-document summarization (Multi-News~\citep{fabbri2019multinews}, SPACE~\citep{angelidis-etal-2021-extractive}), research writing (Openreview) and so on. The long documents in L-Eval across many domains such as law, finance, academic papers, lectures, lengthy conversations, news, famous Python codebase, long-form novels, and meetings. The average input length in L-Eval ranges from 4k to 60k. The maximum sample in L-Eval contains nearly 200k tokens. This diversity represents real-world scenarios where different tasks may require different lengths of context and instructions. The length of reference in L-Eval also varies significantly across tasks.
+
+\section{Towards Standardized Long Context Evaluation Metrics}
+\label{sec:metric}
+In this section, we present various evaluation metrics for text generation, including exam evaluation for close-ended tasks and different levels of open-ended evaluation, most of which are reference-based metrics.
+We also conduct experiments to study the correlation between automated metrics and human scoring. 
+
+\vspace{-0.7em}
+\paragraph{Exam evaluation} This is designed for closed-ended tasks, i.e., multiple-choice questions. The evaluation metric used for these tasks follows the exact match format (accuracy \%), similar to grading exam papers. Each question's score is calculated as 100 divided by the number of questions. 
+
+\vspace{-0.7em}
+\paragraph{Human evaluation} This is the most accurate evaluation for open-ended tasks. Despite that some works show GPT-4 can be coherent with human judgment, LLMs cannot replace human evaluation. We engage human evaluators to score the outputs on a scale of 1 to 5, which signifies from poor output to excellent output.
+To save human laboratories, we propose a subset used for the human evaluation which has 12 long documents with 85 open-ended questions (\textbf{85-question subset}). 
+
+\vspace{-0.7em}
+\paragraph{Large language model judges for evaluating LCLMs}
+In short context settings,  evaluation using LLMs is the most accurate metric for automatically evaluating models on open-ended tasks~\citep{zheng2023judging,alpaca_eval, dubois2023alpacafarm}. These works assume the LLM evaluator is a ``super model'', but this assumption does not hold in long context settings because it's impossible to feed the entire lengthy inputs into LLMs like GPT-4. Unlike short context evaluation, GPT-4 is unable to infer the ground truth answer itself. Consequently, evaluation results mainly depend on the reference answer and user questions. In L-Eval, we take the pair-wise battle format and we select Turbo-16k-0613 as the base model and report the \textit{win-rate vs. Turbo-16k-0613 \%} which means how many samples can beat Turbo-16k. We study two LLM judges: GPT-4 and GPT-3.5 in the experiment section.
+LLM evaluators have been reported to favor more detailed and lengthy answers~\citep{zheng2023judging}. This bias becomes more pronounced in long context settings as the invisible input makes it difficult for the judge to accurately determine the correctness of specific details and information. Therefore, the judgment model must bear in mind that details not corroborated by the reference answers should not be considered beneficial. We enhance the judgment prompt with: \textit{Additional details or information that are not mentioned in the reference answer cannot be considered as advantages and do not let them sway your judgment.} If you only want to evaluate a portion of the tasks in L-Eval, we recommend using LLM judges.
+Verifying the 1000+ open-ended questions via GPT-4 is unaffordable.\footnote{Testing the 4 datasets in Table~\ref{tab:length_bias} needs about \$100!} Thus we manually split a subset for GPT-4 evaluation consisting of 17 diverse long documents with 96 open-ended questions (\textbf{96-question subset}).\footnote{Evaluating outputs from the 96-question subset with GPT-4 only needs about \$5.}
+
+\vspace{-0.7em}
+\paragraph{N-gram matching evaluation}
+Considering that assessing all tasks is still expensive for human/LLM evaluators, L-Eval also takes into account n-gram metrics. 
+N-gram metrics like ROUGE-L (R-L) and F-1 score are widely used in traditional datasets and they are also widely adopted in the text generation benchmarks via performing lexical matching. It is worth noting that n-gram matching metrics are very sensitive to the length of the ground truth, exhibiting a length bias. The related analysis is in the following \S\ref{sec:length-instruction}.
+
+\subsection{Length Instruction Enhanced Long Context Evaluation}
+\label{sec:length-instruction}
+
+\begin{wrapfigure}{r}{0.4\textwidth}
+  \centering
+  \vspace{-6mm}
+  \includegraphics[width=0.4\textwidth]{fig/kt_cor.png}
+  \caption{Kendall-Tau correlation coefficient of different automatic metrics with the average human score.}
+  \label{fig:cor}
+  \vspace{-5mm}
+\end{wrapfigure}
+In preliminary experiments, we find that LLMs tend to generate very long responses bringing obstacles for the reference-based evaluation (see $\Delta$\textbf{L} Table~\ref{tab:length_bias}). This length bias results in a significant influence on the n-gram metrics. For instance, Claude-100k only achieves a 9.84 F-1 score due to undesired output length.
+
+In L-Eval, we argue that long context language models should further focus on more accurate content rather than accurate length. Practically, issues about undesired generation length can be easily solved by prompting the model.  We first adopt \textbf{Length-Instruction-Enhanced} (LIE) evaluation in LLMs evaluation benchmarks which is simple but effective in overcoming the length bias, i.e., the number of words of ground truth is directly exposure to LCLMs. 
+LIE evaluation in this work is implemented by injecting the model with the desired length into the original instruction (e.g., [Origin Instruction]: \textit{Please summarize the opinions of the professor}. [Length Instruction]: \textit{We need a 50-word summary}, where 50 is the number of words in the reference answer). The results of Claude-100k in Table~\ref{tab:length_bias} demonstrate a substantial improvement in terms of the F-1 score: there is a near \textbf{50}-point gap depending on whether or not the model generates with the expected length.
+
+\begin{figure}[t]
+\vspace{-1em}
+    \centering
+    \includegraphics[width=0.85\textwidth]{fig/metrics_cmp_v2.png}
+    \vspace{-0.5em}
+    \caption{The ranking of six models under various evaluation metrics (Human-avg, Human-1, GPT-4, GPT-3.5, R-L, and F-1) with or without length instruction. {Human-avg} represents the average score from human evaluation, and {Human-1} signifies the score given by the first human annotator.}
+    \label{fig:radar}
+\end{figure}
+
+\vspace{-0.7em}
+\paragraph{Experimental validation} To validate the LIE evaluation, we then conduct a human evaluation on the 85-questions subset. We have 3 annotators to verify 7 models and calculate the Kendall-Tau correlation coefficient ($\tau$) between these metrics and the average human score. The main results are shown in Figure~\ref{fig:cor} (Blue bar) and experimental settings are in \S\ref{sec:appendix:human-eval}. Results indicate that all these automatic metrics (except GPT-4) \textbf{fail to correlate} to human judgment. Compared with N-gram metrics, LLM judges are more accurate and robust to output length.
+As we can see from Figure~\ref{fig:cor}, the improvements brought by length instruction are marked with yellow, and after adding the length instructions, $\tau$ has been improved from 0.5 to 0.8 for ROUGE-L and $\tau$ of GPT-4 evaluator has even reached to 1. In Figure~\ref{fig:radar}, we convert the score to rankings (the best one is 5 and the worst is 1) and show the score of 6 models evaluated with 6 different evaluation systems. Figure~\ref{fig:radar} (a) shows the results given by metrics without length instruction. These hexagons are often distorted because these metrics usually cannot achieve good correlation. When comparing the models enhanced with length instruction in (b), it is observed that the hexagons become more regular.
+
+\begin{table}[t]
+\vspace{-1em}
+\centering
+\caption{Results on 2 open-ended summarization and 2 abstractive QA tasks.  \textbf{GPT-4} means the win-rate with Turbo-16k using GPT-4 as the judge.  \textbf{$\Delta$L} means the difference of generated answer length with ground truth length. The best results are underlined. Results in red mean decoding in a desired length makes a big difference in performance.}
+\vspace{-0.5em}
+
+\resizebox{\textwidth}{!}{
+\begin{tabular}{l|ccc|ccc|ccc|ccc}
+\toprule
+\multirow{2}{*}{\textbf{Model}} & \multicolumn{3}{c|}{\textbf{SPACE}} & \multicolumn{3}{c|}{\textbf{QMSum}} & \multicolumn{3}{c|}{\textbf{NQ}} & \multicolumn{3}{c}{\textbf{NrtvQA}} \\
+\cmidrule(lr){2-4} \cmidrule(lr){5-7} \cmidrule(lr){8-10} \cmidrule(lr){11-13}
+&\textbf{R-L} &  \textbf{GPT-4} &  \textbf{$\Delta$L} & \textbf{R-L} & \textbf{GPT-4} & \textbf{$\Delta$L}  & \textbf{F-1}  & \textbf{GPT-4} & \textbf{$\Delta$L}  & \textbf{F-1} & \textbf{GPT-4}  & \textbf{$\Delta$L}  \\
+\midrule
+
+\rowcolor{mypink!60}
+Claude-100k & 15.43 & \color{red}{45.65} & \bf165 & 14.04 & 58.77 & \bf183 & \color{red}{9.84} & \underline{56.19} & \bf135 & \color{red}{10.39} & \underline{68.96} & \bf127 \\
+ \quad + Length Instruction &18.61 & \color{red}{\underline{61.40}} & 27 & 18.13 & \underline{58.89} & 22 & \color{red}{\underline{57.76}} & {51.00} & 1 & \color{red}{\underline{19.09}} & 57.77 & 0 \\
+
+\rowcolor{mypink!60}
+Chatglm2-32k & 17.56 & 24.13 & -23 & 20.06 & 38.84 & \bf287 & 31.45 & 33.71 & 3 & 12.24 & 34.67 & 74 \\
+ \quad + Length Instruction & 16.61 & 17.11 & 11 & \underline{20.83} & 33.75 & 9 & 37.94 & 33.71 & -1 & 14.00 & 34.52 & -2 \\
+
+\rowcolor{mypink!60}
+Longchat-7b-16k  & 15.10 & \color{red}{15.61} & \bf120 & 9.31 & 25.56 & 40 & {8.83} & 32.33 & \bf105 & 8.36 & 31.80 & 83 \\
+ \quad + Length Instruction& 17.06 & \color{red}{36.23} & -3 & 13.21 & 30.20 & 70 & {20.21} & 35.00 & 37 &15.17&43.38&40\\
+
+\rowcolor{mypink!60}
+Llama2-13b-chat & 16.83&32.46&\bf102&14.72&30.79& \bf116 &\color{red}{8.29} &38.99&90&7.20 & \color{red}{30.69} & \bf130 \\
+ \quad + Length Instruction & \underline{19.23} & 43.15 &-7 &19.65 &34.82 &-1&\color{red}{35.43} &41.07 & 6 & 13.48 & \color{red}{45.07} & 14 \\
+
+\bottomrule
+\end{tabular}
+}
+\label{tab:length_bias}
+\end{table}
+
+\section{Benchmarking LLMs with L-Eval}
+In this section, we list our 16 baseline models and the results on both open-ended and closed-ended tasks. Generally, there are considerable gaps between open-source models and commercial models. A detailed description of baseline models can be found in \S\ref{sec:baselines_appendix}.  The prompt templates for each task are available in \S\ref{sec:data-appendix}. We run all the experiments using FlashAttention~\citep{NEURIPS2022_67d57c32} on a single NVIDIA A800 GPU. The document input is truncated from the right.
+
+\vspace{-0.5em}
+\subsection{Baselines}\label{sec:baselines}
+\vspace{-0.3em}
+\paragraph{Commercial Models}
+(1) {Claude-100k} developed by Anthropic, (2) GPT-4-32k, OpenAI's most powerful long context model, (3)
+{Turbo-4k-0613} and (4) Turbo-16k-0613 is the snapshot of {GPT-3.5} from June 13th 2023 which can handle up to 4k/16k input tokens.
+\vspace{-0.7em}
+\paragraph{Open-source Models}
+(5) {Llama1}~\citep{touvron2023llama}, a widely used open-source model developed by Meta AI with a 2k pre-training length, (6) {Vicuna1.3}~\citep{vicuna2023}, tuned on shareGPT based on Llama1, (7) Longchat-16k, the long context version of Vicuna1.3 using PI, (8) Llama2, the next version of Llama with 4k pre-training context, (9) Llama2-chat, a finetuned version for dialogue usage, (10) Llama2-NTK, extending the context length of Llama2-chat with NTK-aware RoPE, (11) Vicuna1.5-16k~\citep{zheng2023judging}, the long context version of Llama2 using PI \& ShareGPT (12) Longchat1.5-32k, the 32k context version of Llama2 using PI \& ShareGPT.
+(13) {Chatglm2-8k}, the second version of the Chatglm~\citep{du2022glm}, (14) Chatglm2-32k, the 32k context length version,  (15)\ {XGen-8k-inst}~\citep{XGen}, an 8k context models developed by salesforce  (16) {MPT-7B-StoryWriter-65k}, based on MPT-7B and ALiBi with a context length of 65k tokens on a subset of Books3 dataset.
+\vspace{-0.7em}
+\paragraph{Retriever}  We implement the dense retriever with the OpenAI AdaEmbedding as the dense retriever and BM25 as the sparse retriever to extract 4 pieces of most related 1k-chunked documents, which are further provided as the context to answer questions.
+
+\begin{table}[t!]
+\vspace{-1.5em}
+\centering
+\setlength{\tabcolsep}{1.0mm}
+\caption{Exam evaluation results on  \textbf{closed-ended tasks} for current LCLMs. \textbf{Ret.} indicates whether we use retrieve-based algorithms for the base model. \textbf{Tokens} denotes the maximum number of input tokens we feed into the model. {\color{red}{\tiny{$\downarrow$ / $\uparrow$}}} indicates a remarkable decrease/increase in performance, compared to using the original short context counterpart. {\color{blue} *} indicates the model is not further trained.}
+\vspace{-0.5em}
+\renewcommand\arraystretch{1.05}
+\resizebox{\textwidth}{!}{
+\begin{tabular}{@{}lcccccccccc@{}}
+\toprule
+\textbf{Model} & \textbf{Ret.} & \textbf{Tokens} & \textbf{Coursera} & \textbf{GSM} & \textbf{QuALITY} & \textbf{TOEFL}  & \textbf{CodeU} & \textbf{SFiction} &  \textbf{Avg.} \\
+\midrule
+Claude1.3-100k & \xmark & \cellcolor{gray!70}100k & 60.03 & {88.00} & {73.76} & {83.64} & 17.77 & 72.65 & 65.97  \\
+GPT-4-32k & \xmark & \cellcolor{gray!60}32k & \textbf{75.58} & \textbf{96.00} & \textbf{82.17} & \textbf{84.38} & \textbf{25.55} & \bf74.99 & \bf73.11 \\
+Turbo-16k-0613 & \xmark & \cellcolor{gray!40}16k & 63.51 & {84.00} & 61.38 & 78.43 & 12.22 & 64.84 & 60.73 \\
+AdaEmb-Turbo-4k-0613 & \cmark & \cellcolor{gray!15}4k & 61.77 & {23.00} & 58.91 & 76.95 & {6.66} &71.09 & 49.73 \\
+BM25-Turbo-4k-0613 & \cmark & \cellcolor{gray!15}4k & 63.80 & {23.00} & 59.40 & 75.09 & {5.55} & 71.09  & 49.65 \\
+
+\midrule
+\rowcolor{mypink!50}
+\multicolumn{10}{c}{\textit{Truncating input tokens to the pretraining context length}} \\
+\midrule
+
+Llama1-7b-2k (w/o SFT) & \xmark & \cellcolor{gray!5}2k & 13.37 & 7.00 & 21.78 & 30.85 & 1.11 & 35.15  & 19.22 \\
+Vicuna1.3-7b-2k & \xmark & \cellcolor{gray!5}2k & 34.73 & 19.00 & 32.67 & 43.49 & 1.11 & 60.93 & 30.01 \\
+
+Llama2-7b-4k (w/o SFT) & \xmark & \cellcolor{gray!15}4k  & 20.05 & 2.00 & 28.71 &  24.53 & 0.00 & 40.62  & 19.31 \\
+Llama2-7b-chat & \xmark & \cellcolor{gray!15}4k  & 29.21 & {19.00} & 37.62 & 51.67 & 1.11 & 60.15 & 33.12 \\
+Llama2-13b-chat & \xmark & \cellcolor{gray!15}4k  & 35.75 & \textbf{39.00} & \textbf{42.57} & \textbf{60.96} & 1.11 & 54.68 & \bf39.01 \\
+
+Chatglm2-6b-8k & \xmark & \cellcolor{gray!5}2k & \bf43.75 & {13.00} & {40.59} & {53.90} & 2.22 & 54.68 & 34.69  \\
+XGen-7b-8k (2k-4k-8k) & \xmark & \cellcolor{gray!5}2k & 26.59 & 3.00 &  35.15  & 44.23 & 1.11 & 48.43 & 26.41 \\
+
+\midrule
+\rowcolor{mypink!50}
+\multicolumn{10}{c}{\textit{Truncating input tokens to the further finetuning context length}} \\
+\midrule
+Chatglm2-6b-32k & \xmark & \cellcolor{gray!60}32k  & \textbf{47.81} & 27.00\color{red}{\tiny{$\uparrow$}} & 45.04 & 55.01 & 2.22 & 57.02 & 39.01\color{red}{\tiny{$\uparrow$}} \\
+Longchat1.5-7b-32k & \xmark & \cellcolor{gray!60}32k  & 32.99 & 18.00 & 37.62 & 39.77 & 3.33 & 57.02 & 31.45\\
+
+Longchat-7b-16k & \xmark & \cellcolor{gray!40}16k  & 29.74 & 10.00\color{red}{\tiny{$\downarrow$}}  & 33.66 & 47.95 & 3.33 & \bf64.84 & 31.58\color{red}\\ 
+Vicuna1.5-7b-16k & \xmark & \cellcolor{gray!40}16k  & 38.66 & 19.00 & 39.60 & 55.39 & \bf5.55 & 60.15 & 36.39\color{red}{\tiny{$\uparrow$}} \\
+Llama2-7b-NTK\color{blue}{*} & \xmark & \cellcolor{gray!40}16k  & 32.71 & 19.00 & 33.16 & 52.78 & 0.00 & \bf64.84 & 33.74 \\
+
+Longchat-13b-16k & \xmark & \cellcolor{gray!40}16k & 31.39 & 15.00 & 40.59 & 55.39 &  2.22 & \bf64.84  & 34.90 \\
+Vicuna1.5-13b-16k & \xmark & \cellcolor{gray!40}16k & 40.69 & 36.00 & \textbf{53.96}\color{red}{\tiny{$\uparrow$}} & \textbf{68.40}\color{red}{\tiny{$\uparrow$}} & 0.00 & 61.71 & \bf43.46\color{red}{\tiny{$\uparrow$}}\\
+Llama2-13b-NTK\color{blue}{*} & \xmark & \cellcolor{gray!40}16k  & 36.48 & 11.00\color{red}{\tiny{$\downarrow$}} & 35.64  & 54.64&  1.11  & 63.28 & 33.69 \\
+Llama2-13b-NTK(Dyn)\color{blue}{*} & \xmark & \cellcolor{gray!40}16k  & 30.08 & \textbf{43.00} & 41.58 & 64.31 & 1.11 & 35.15 & 35.87\\
+
+Chatglm2-6b-8k & \xmark & \cellcolor{gray!25}8k & 42.15 & {18.00} & {44.05} & {54.64} & 2.22 &54.68 & 35.95\\
+XGen-7b-8k & \xmark & \cellcolor{gray!25}8k & 29.06 & 16.00 &  33.66  & 42.37 & 3.33 & 41.40 & 27.63\\
+MPT-7b-65k & \xmark & \cellcolor{gray!25}8k & 25.23 & 8.00 & 25.24 & 17.84 & 0.00 & 39.06 & 19.22\\
+
+\bottomrule
+\end{tabular}
+}
+
+\label{table:acc_exam}
+\end{table}
+
+\begin{table*}[t]
+\vspace{-1.5em}
+\caption{In comparing various models to Turbo-16k-0613 on \textbf{open-ended tasks}. We evaluate these models on the 96-question subset using GPT-4 and two subsets (85+96 questions) using GPT-3.5. We reduce the positional biases by swapping paired predictions, so the GPT-4 evaluator is used in 96$\times$2 evaluation rounds, while the GPT3.5 evaluator is used in 181$\times$2 rounds}
+\vspace{-1.0em}
+\center
+\footnotesize
+\renewcommand\arraystretch{0.97}
+\resizebox{0.9\textwidth}{!}{
+\tabcolsep 0.035 in
+\begin{tabular}{lccccccccc}
+\toprule
+\multicolumn{1}{c}{\multirow{2}[1]{*}{\textbf{Model}}} &
+\multicolumn{1}{c}{\multirow{2}[1]{*}{\textbf{Ret.}}} &
+\multicolumn{1}{c}{\multirow{2}[1]{*}{\textbf{Tokens}}} &
+\multicolumn{3}{c}{\textbf{GPT-4 }}&
+\multicolumn{3}{c}{\color{darkgray}{\textbf{GPT-3.5}}} &
+\multicolumn{1}{c}{\multirow{2}[1]{*}{\color{gray}{\textbf{R-L}}}}
+\\
+ & & & \textbf{wins} & \textbf{ties} & \textbf{win-rate \%}  &
+\textbf{wins} & \textbf{ties} & \textbf{win-rate \%}  \\
+\cmidrule(lr){1-1} \cmidrule(lr){2-2} \cmidrule(lr){3-3} \cmidrule(lr){4-6} \cmidrule(lr){7-9} \cmidrule(lr){10-10} 
+
+Claude1.3-100k & \xmark & \cellcolor{gray!70}100k & \textbf{96} & 42 & \textbf{60.94}  & 189 & 34 & {\textbf{58.68}} & 28.22 \\
+GPT-4-32k & \xmark & \cellcolor{gray!60}32k & 76 &  56 & 54.16  &  171 & 50 & {56.32} & \underline{36.18} \\
+Turbo-16k-0613 & \xmark & \cellcolor{gray!15}4k & 0 & 192 & 50.00  & 0 & 362 & 50.00 & 28.61\\
+
+Turbo-4k-0613 & \xmark & \cellcolor{gray!15}4k & 38 & 69 & 39.83\color{red}{\tiny{$\downarrow$}}  & 109 &  61 & {41.39} & 26.90\\
+AdaEmb-Turbo-4k-0613 & \cmark & \cellcolor{gray!15}4k & 61 & 56 &  46.84 & 123 & 77  & 45.36 & 26.09 \\
+BM25-Turbo-4k-0613 & \cmark & \cellcolor{gray!15}4k & 50 & 69 & 44.01 & 125 & 78 & {45.30} & 26.83\\
+
+\midrule
+\rowcolor{mypink!50}
+\multicolumn{10}{c}{\textit{Truncating input tokens to the pretraining context length}} \\
+\midrule
+
+Vicuna1.3-7b-2k  & \xmark & \cellcolor{gray!5}2k & 29 & 55 & 29.42 & 97 & 42 & 34.91 & 16.17 \\
+Longchat-7b-16k & \xmark & \cellcolor{gray!5}2k & 26 & 63 & 29.94  &  87 &  38 & {31.26} & 19.77\\
+
+Llama2-7b-chat  & \xmark & \cellcolor{gray!15}4k & 48 & 58 & 40.10 & 127 & 44 & {42.45}  & \underline{24.25}\\
+Llama2-13b-chat & \xmark & \cellcolor{gray!15}4k & \textbf{51} & 61 & \textbf{42.44}  & \textbf{143} & 49 & \textbf{47.85} & 24.07  \\
+
+\midrule
+\rowcolor{mypink!50}
+\multicolumn{10}{c}{\textit{Truncating input tokens to the further finetuning context length}} \\
+\midrule
+
+Chatglm2-6b-32k & \xmark & \cellcolor{gray!60}32k & 28 & 60 & 30.20 &  53 & 65 & {24.63} & \underline{22.04} \\
+Longchat1.5-7b-32k & \xmark & \cellcolor{gray!60}32k & \bf38 & 53 & 33.59 &  136 & 37 & 44.91 & 21.21\\
+
+Longchat-7b-16k & \xmark & \cellcolor{gray!40}16k & 36 & 56 & 33.68\color{red}{\tiny{$\uparrow$}} & 108 & 42 & {37.94} & 20.59\\
+Vicuna1.5-7b-16k & \xmark & \cellcolor{gray!40}16k & 22 & 54 & 25.52\color{red}{\tiny{$\downarrow$}} & 102 & 52 & {37.86} & 18.05 \\
+Llama2-7b-NTK\color{blue}{*} & \xmark & \cellcolor{gray!40}16k & 18 & 49 & 22.13 & 58 & 35 & {23.59} & 11.50 \\
+
+Longchat-13b-16k & \xmark & \cellcolor{gray!40}16k & 36 & 59 & \textbf{34.11} & \bf128 & 24 & 40.11 & 18.98\\
+Vicuna1.5-13b-16k & \xmark & \cellcolor{gray!40}16k & 36 & 59 & \textbf{34.11}\color{red}{\tiny{$\downarrow$}} &  116 &  43 & \bf{40.92} & 19.69 \\
+Llama2-13b-NTK\color{blue}{*} & \xmark & \cellcolor{gray!40}16k & 31 & 52 & 29.68 & 91 & 44 & 34.55 &  15.63\\
+Llama2-13b-NTK(Dyn)\color{blue}{*} & \xmark & \cellcolor{gray!40}16k &  23 & 48 & 24.47 & 55 & 64 & 26.60 & 11.62\\
+
+Chatglm2-6b-8k & \xmark & \cellcolor{gray!25}8k & 18 & 64 & 26.04  &  86 & 54 & {32.84} & 18.19  \\
+XGen-7b-8k & \xmark & \cellcolor{gray!25}8k & 24 & 62 & 28.64  & 89 & 72 & {36.02} & 20.51 \\
+\bottomrule
+\end{tabular}
+}
+
+\label{tab:llm_eval}
+\end{table*}
+
+\subsection{Main Results}\label{sec:main_results}
+The performance of LCLMs on closed-ended tasks is shown Table~\ref{table:acc_exam}. As for open-ended tasks, we test the 96-question subset (Table~\ref{tab:llm_eval}) with GPT-4 evaluation. Results from n-gram metrics on all test sets and the rankings of LLMs can be found in \S\ref{sec:analysis_app}. From the main results, we have the following observations. 
+GPT-4-32k clearly outperforms all other models by a very significant margin, establishing SOTA in L-Eval closed-ended tasks. 
+There is still a near \textbf{20}-points gap between the best open-source 16k models and Turbo-16k.  As for open-ended tasks, since the input texts are generally longer and a global understanding of the context is required, Claude-100k, with the longest context length, surpasses all baseline models including GPT-4-32k. Although results of n-gram metrics indicate that open-source LCLMs have achieved performance close to GPT-Turbo on open-ended tasks, the evaluation outcomes from both LLM (Table~\ref{tab:llm_eval}) and human judges (Table~\ref{tab:human_eval}) reveal that there is still a significant gap between them. Moreover, retrieval-based methods based on Turbo-4k fall short in comparison to encoding the entire context (Turbo-16k), as certain tasks are difficult to address through simple retrieval.
+
+\vspace{-0.7em}
+\paragraph{Fine-tuning longer offers benefits for closed-ended tasks but falls short in open-ended tasks} 
+\begin{wrapfigure}{r}{0.4\textwidth}
+  \centering
+  \vspace{-5mm}
+  \includegraphics[width=0.4\textwidth]{fig/split_data.png}
+  \caption{Number of invalid outputs from Llama2 and Turbo.}
+  \label{fig:percent}
+  \vspace{-3mm}
+\end{wrapfigure}
+In Table~\ref{table:acc_exam}, for open-source models using scaled positional embedding, Longchat and Vicuan1.5-16k obviously outperform their original version Vicuna-2k and Llama2-chat. The results suggest that further tuning on longer input from a model with short pretraining context length does benefit long context modeling. However, according to Table~\ref{tab:llm_eval}, unlike results on closed-ended tasks, the best model Vicuna1.5-13b-16k only wins Turbo-16k by 34\%, \textbf{8} points lower than its short version Llama2-13b. Llama2-13b-chat~\citep{touvron2023llama} is still the strongest open-source baseline, indicating that current LCLMs simply based on scaled position embedding may not be enough for these challenging open generation tasks. Based on our human evaluation, we find that although scaled position embedding techniques such as NTK~\citep{fixedNTK} or PI~\citep{sun2022lengthextrapolatable} effectively extend models' context length, the models tend to get lost when facing lengthy input tokens and are unable to follow the instruction. We classify these outputs as ``invalid outputs''. 
+To investigate model performance on different context lengths, we split the 85-questions subset into 2 parts: PART-A contains samples with less than 4k tokens, and PART-B more than 4k tokens. We compare the number of invalid outputs from Llama2/Vicuna1.5-16k and Turbo/Turbo-16k in Figure~\ref{fig:percent}. Results show that the number of invalid outputs from Turbo-16k remains a very small amount on both PART-A and B while the invalid outputs from Llama2-16k dramatically increase on samples with longer input. Thus, LCLMs are less capable of following instructions on open-ended tasks for long contexts, compared with closed-ended tasks, such as multiple choice. A possible reason is that the pertaining or SFT corpus is highly likely to contain many training samples with similar question styles. This strongly enhances their instruction-following ability on closed-ended tasks. 
+
+\vspace{-1em}
+\paragraph{Performance on retrieval tasks contradicts reasoning tasks}
+\begin{wrapfigure}{r}{0.35\textwidth}
+  \centering
+  \vspace{-1mm}
+  \includegraphics[width=0.35\textwidth]{fig/ntk.pdf}
+  \caption{Test retrieval ability and reasoning ability with NTK base.}
+  \label{fig:ret_reasoning}
+  \vspace{-2mm}
+\end{wrapfigure}
+The most popular NTK-ware positional embedding methods increase the base 10,000 
+in the vanilla RoPE to implement extrapolation without further fine-tuning. However, we find that the performance on topic retrieval tasks does not match the reasoning capability over lengthy context. As can be seen from Figure~\ref{fig:ret_reasoning}, when we increase the base from 20,000 to 160,000, there is a continuous improvement on topic retrieval. However, performance on math reasoning tasks with lengthy examples exhibits a completely opposite trend, indicating that it is challenging for the model to maintain its reasoning abilities when increasing the base. In contrast, the performance on retrieval tasks seems to remain unaffected after the base reaches 60,000.
+
+We have further analysis in \S\ref{sec:analysis_app}, including full results of n-grams metrics on open-ended tasks, the rankings of current LLMs, NTK-aware positional embedding and retrieval-based systems.
+
+\section{Conclusion}
+In conclusion, the much-needed rigorous benchmark L-Eval introduced in this work provides a comprehensive suite of tasks and evaluation metrics to assess the capabilities of long context language models.
+We tested most of open-source LCLMs and experiments demonstrate promising gains from extending context length and gaps compared to commercial models. Our analysis using L-Eval offers valuable insights into the current state and limitations of LCLMs. We believe that with its focus on practical, long-form documents across domains, L-Eval can serve as a challenging testbed to drive advances in modeling longer contexts.
+
+\newpage
+
+\end{document}

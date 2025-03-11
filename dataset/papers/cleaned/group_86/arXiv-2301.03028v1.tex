@@ -1,0 +1,769 @@
+\title{Generative Time Series Forecasting with Diffusion, Denoise, and Disentanglement}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+
+Time series forecasting has been a widely explored task of great importance in many applications.
+However, it is common that real-world time series data are recorded in a short time period, which results in a big gap between the deep model and the limited and noisy time series. 
+In this work, we propose to address the time series forecasting problem with generative modeling and propose a bidirectional variational auto-encoder (BVAE) equipped with diffusion, denoise, and disentanglement, namely \ourmodel.
+Specifically, a coupled diffusion probabilistic model is proposed to augment the time series data without increasing the aleatoric uncertainty and implement a more tractable inference process with BVAE. 
+To ensure the generated series move toward the true target, we further propose to adapt and integrate the multiscale denoising score matching into the diffusion process for time series forecasting. 
+In addition, to enhance the interpretability and stability of the prediction, we treat the latent variable in a multivariate manner and disentangle them on top of minimizing total correlation. 
+Extensive experiments on synthetic and real-world data show that \ourmodel~outperforms competitive algorithms with remarkable margins. 
+Our implementation is available at \url{https://github.com/PaddlePaddle/PaddleSpatial/tree/main/research/D3VAE}. 
+
+\end{abstract}
+
+\setcounter{footnote}{0}
+
+\section{Introduction}
+
+Time series forecasting is of great importance for risk-averse and decision-making.~%
+Traditional RNN-based methods capture temporal dependencies of the time series to predict the future. 
+Long short-term memories (LSTMs) and gated recurrent units (GRUs)~\cite{yu2019review,greff2016lstm,gers2002learning,sherstinsky2020fundamentals} introduce the gate functions into the cell structure to handle long-term dependencies effectively.~%
+The models based on convolutional neural networks (CNNs)
+capture complex inner patterns of the time series through convolutional operations~\cite{lea2016temporal,borovykh2017conditional,binkowski2018autoregressive}.~%
+Recently, the Transformer-based models have shown great performance in time series forecasting~\cite{xu2021autoformer,zhou2021informer,kitaev2020reformer,li2019enhancing} with the help of multi-head self-attention. 
+However, one big issue of neural networks in time series forecasting is the   uncertainty~\cite{gawlikowski2021survey,abdar2021review} resulting from the properties of the deep structure.~%
+The models based on vector autoregression (VAR)~\cite{cao2003support,fokianos2009poisson,kim2003financial} try to model the distribution of time series from hidden states, which could provide more reliability to the prediction, while the performance is not satisfactory~\cite{lai2018modeling}. 
+
+Interpretable representation learning is another merit of time series forecasting.~%
+Variational auto-encoders (VAEs) have shown not only the superiority in modeling latent distributions of the data and reducing the gradient noise~\cite{roeder2017sticking,kingma2016improved, li2016renyi, vahdat2020nvae} but also the interpretability of time series forecasting~\cite{fortuin2020gp,fortuin2019som}. 
+However, the interpretability of VAEs might be inferior due to the entangled latent variables. 
+There have been  efforts to learn representation disentangling~\cite{kim2018disentangling,bengio2013representation,higgins2016beta}, which show that the well-disentangled representation can  improve the performance and robustness of the algorithm.
+
+Moreover, real-world time series are often noisy and recorded in a short time period,  which may result in overfitting and generalization issues~\cite{gamboa2017deep,wang2018gaussian,zou2019complex,arima_2020}{\footnote{The detailed literature review can be found in \cref{sec:related}.}}.~%
+To this end, we address the time series forecasting problem with generative modeling.
+Specifically, we propose a bidirectional variational auto-encoder (BVAE) equipped with diffusion, denoise, and disentanglement, namely \ourmodel. 
+More specifically, 
+we first propose a coupled diffusion probabilistic model to remedy the limitation of time series data by augmenting the input time series, as well as the output time series, inspired by the forward process of the diffusion model~\cite{sohl2015deep,ho2020denoising,nichol2021improved,rasul2021autoregressive}.~%
+Besides, 
+we adapt the Nouveau VAE~\cite{vahdat2020nvae} to the time series forecasting task and develop a BVAE as a substitute for the reverse process of the diffusion model.~%
+In this way, the expressiveness of the diffusion model plus the tractability of the VAE can be leveraged together for generative time series forecasting.~%
+Though the merit of generalizability is helpful, the diffused samples might be corrupted, which results in a generative model moving toward the noisy target.
+Therefore, we further develop a scaled denoising score-matching network for cleaning diffused target time series.~%
+In addition, we disentangle the latent variables of the time series by assuming that different disentangled dimensions of the latent variables correspond to different temporal patterns (such as trend, seasonality, etc.). 
+Our contributions can be summarized as follows: 
+
+\begin{itemize}
+\item
+We propose a coupled diffusion probabilistic model aiming to reduce the aleatoric uncertainty of the time series and improve the generalization capability of the generative model. 
+
+\item
+We integrate the multiscale denoising score matching into the coupled diffusion process to improve the accuracy of generated results. 
+
+\item 
+We disentangle the latent variables of the generative model to improve the interpretability for time series forecasting. 
+
+\item 
+Extensive experiments on synthetic and real-world datasets demonstrate that \ourmodel ~outperforms  competitive  baselines with satisfactory  margins.
+
+\end{itemize}
+
+\section{Methodology} 
+\label{sec:method}
+
+\subsection{Generative Time Series Forecasting}
+
+{\bf Problem Formulation.~}
+Given an input multivariate time series $X = \{x_1, x_2, \cdots, x_n \,|\, x_i \in \mathbb{R}^{d} \} $ and the corresponding target time series $ Y = \{y_{n+1}, y_{n+2}, \cdots , y_{n+m} \,|\, y_j \in \mathbb{R}^{d'} \}$ ($ d^{'} \leq d $).~%
+We assume that $Y$ can be generated from latent variables $Z \in \Omega_Z$ that can be drawn from the Gaussian distribution $Z \sim p(Z|X)$. 
+The latent distribution can be further formulated as $ p_\phi(Z|X) = g_\phi(X) $ where  $g_\phi $ denotes a nonlinear function.
+Then, the data density of the target series is given by:
+\begin{equation}
+p_\theta(Y) = \int_{\Omega_Z} p_\phi(Z|X)( Y - f_\theta(Z) ) dZ \, ,
+\end{equation}
+where $f_\theta$ denotes a parameterized function.~%
+The target time series can be obtained directly  by sampling from  $p_\theta(Y)$. 
+
+\begin{figure}[t]
+    \centering
+    \includegraphics[width=.9\textwidth]{fig/figure5/framework_crv.png}
+    \caption{
+    The framework overview of \ourmodel. 
+    First, the input and output series are augmented simultaneously with the {\em coupled diffusion process}.~%
+    Then the diffused input series are fed into a proposed BVAE model for inference, which can be deemed a {\em reverse process}.~%
+    A denoising score-matching mechanism is applied to make the estimated target move toward the true target series. 
+    Meanwhile, the latent states in BVAE are leveraged for disentangling such that the model interpretability and reliability can be improved.
+    }	
+    \label{fig:method:framework}
+\end{figure}
+
+In our problem setting, 
+time series forecasting is to learn the representation $Z$ that captures useful signals of $X$, 
+and map the low dimensional $X$ to the latent space with high expressiveness. 
+The framework overview of \ourmodel ~is demonstrated in \cref{fig:method:framework}. 
+Before diving into the detailed techniques, we first introduce a preliminary proposition. 
+
+\begin{prop} \label{prop1}
+Given a time series $X$ and its inherent noise  $\epsilon_X$,  we have the  decomposition: $X = \langle X_{r}, \, \epsilon_X \rangle $, where $X_r$ is the ideal time series data without noise. 
+$ X_{r}$ and $\epsilon_X $ are independent of each other. 
+Let $p_{\phi} (Z|X) = p_{\phi} (Z| X_{r} , \epsilon_X) $,
+the estimated target series $\widehat{Y}$  can be generated with the distribution $p_{\theta} (\widehat{Y}|Z) = p_{\theta} (\widehat{Y}_r|Z) \cdot p_{\theta} (\epsilon_{\widehat{Y}}|Z)$ where $ \widehat{Y}_r $ is the ideal part of $ \widehat{Y} $ and $ \epsilon_{\widehat{Y}} $ is the estimation noise. 
+Without loss of generality, $ \widehat{Y}_r $ can be fully captured by the model.
+That is,  $ \| Y_r - \widehat{Y}_r \| \longrightarrow 0 $ where $Y_r$ is the ideal part of ground truth target series $Y$.
+In addition, $Y$ can be decomposed as $Y = \langle \widehat{Y}_r , \epsilon_Y \rangle$ ($\epsilon_Y$ denotes the noise of $Y$). 
+Therefore, the error between ground truth and prediction, i.e., $ \| Y - \widehat{Y} \| = \| \epsilon_Y - \epsilon_{\widehat{Y}} \| > 0$, 
+can be deemed as the combination of aleatoric uncertainty and epistemic uncertainty.
+\end{prop}
+
+\subsection{Coupled Diffusion Probabilistic Model} \label{sec2.2}
+
+The diffusion probabilistic model (diffusion model for brevity) is a family of latent variable models aiming to generate high-quality samples. 
+To equip the generative time series forecasting model with high expressiveness, a coupled {\em forward process} is developed to augment the input series and target series synchronously. 
+Besides, in the forecasting task, more tractable and accurate prediction is expected. 
+To achieve this, we propose a bidirectional variational auto-encoder (BVAE) to take the place of the {\em reverse process} in the diffusion model. 
+We present the technical details in the following two parts, respectively. 
+
+\subsubsection{Coupled Diffusion Process}
+
+The forward diffusion process is fixed to a Markov chain that gradually adds Gaussian noise to the data \cite{sohl2015deep,ho2020denoising}.~%
+To diffuse the input and output series, we propose a coupled diffusion process, which is demonstrated in \cref{fig:diffusion_process}.~%
+Specifically, given the input  $X = X^{(0)} \sim q(X^{(0)})$, the approximate posterior $q(X^{(1:T)}|X^{(0)})$  can be obtained as 
+\begin{equation}
+    q(X^{(1:T)}|X^{(0)}) = \prod_{t=1}^{T} q(X^{(t)}|X^{(t-1)})\, , \quad 
+    q(X^{(t)}|X^{(t-1)}) = \mathcal{N} (X^{(t)}; \sqrt{1 - \beta_t} X^{(t)}, \beta_t I) \, ,
+\end{equation}
+where a uniformly increasing 
+variance schedule $ \bm{\beta} = \{\beta_1, \cdots, \beta_{T} \, | \, \beta_t \in [0, 1) \} $  is employed to control the level of noise to be added. 
+Then, let $ \alpha_t = 1 - \beta_t$ and $\bar{\alpha}_t = \prod_{s=1}^{t}\alpha_s$, we have
+\begin{equation}    \label{diff}
+    q(X^{(t)}|X^{(0)}) = \mathcal{N} ( X^{(t)}; \sqrt{\bar{\alpha}_t} X^{(0)}, (1 - \bar{\alpha}_t) I) \, .
+\end{equation}
+
+Furthermore, according to \cref{prop1} we decompose $X^{(0)}$ as $X^{(0)} = \langle X_r, \epsilon_X \rangle$.~%
+Then, with \cref{diff}, the diffused $X^{(t)}$ can be decomposed as follows: 
+\begin{equation}    \label{x_t}
+    X^{(t)} = \sqrt{\bar{\alpha}_t}X^{(0)} + (1-\bar{\alpha}_t)\delta_X 
+    \vcentcolon = 
+    \langle 
+    \underbrace{\sqrt{\bar{\alpha}_t}X_r}_{\text{ideal}\,\, \text{part}}, \,
+    \underbrace{\sqrt{\bar{\alpha}_t}\epsilon_X + (1-\bar{\alpha}_t)\delta_{X}}_{\text{noisy} \,\, \text{part}}
+    \rangle 
+    \, ,
+\end{equation}
+where $\delta_X$ denotes the standard Gaussian noise of $X$. 
+As $\bm{\alpha}$ can be determined when the variance schedule $\bm{\beta}$ is known, the ideal part is also determined in the diffusion process. 
+Let $\widetilde{X}_r^{(t)} = \sqrt{\bar{\alpha}_t}X_r$ and ${\delta}_{\widetilde{X}}^{(t)} = \sqrt{\bar{\alpha}_t} \epsilon_X + (1-\bar{\alpha}_t) \delta_X $,  
+then, according to \cref{prop1} and \cref{x_t}, we have   
+\begin{equation}    \label{eq:target}
+    p_\phi (Z^{(t)} | X^{(t)}) = p_\phi (Z^{(t)}|\widetilde{X}_r^{(t)}, {\delta}_{\widetilde{X}}^{(t)}) 
+\, , \quad 
+    p_\theta (\widehat{Y}^{(t)}|Z^{(t)}) = p_\theta (\widehat{Y}_r^{(t)} | Z^{(t)})  p_\theta ({\delta}_{\widehat{Y}}^{(t)} | Z^{(t)})
+    \, ,
+\end{equation}
+where $ \delta_{\widehat{Y}}^{(t)} $ denotes the generated noise of $\widehat{Y}^{(t)}$.~%
+To relieve the effect of aleatoric uncertainty resulting from time series data, we further apply the  diffusion process to the target series $Y = Y^{(0)} \sim q(Y^{(0)})$. 
+In particular, 
+a scale parameter $\omega \in (0, 1)$ is adopted, such that 
+$ {\beta}_t^{\prime} = \omega \beta_t, \alpha_t^{\prime} = 1 - {\beta}_t^{\prime}$ 
+and 
+$ \bar{\alpha}^{\prime}_{t} =  \prod_{s=1}^{t} \alpha_s^{\prime}$. 
+Then, according to \cref{prop1}, we can obtain the following decomposition (similar to \cref{x_t}):
+\begin{equation}    \label{eq:true}
+    Y^{(t)} = \sqrt{\bar{\alpha}^{\prime}_t} Y^{(0)} + (1-\bar{\alpha}^{\prime}_t) \delta_Y 
+    \vcentcolon = 
+    \langle 
+    \underbrace{\sqrt{\bar{\alpha}^{\prime}_t}Y_r}_{\text{ideal} \, \text{part}},
+    \underbrace{\sqrt{\bar{\alpha}^{\prime}_t}\epsilon_{Y} + (1-\bar{\alpha}^{\prime}_t)\delta_Y}_{\text{noisy} \, \text{part}} 
+    \rangle 
+    = \langle \widetilde{Y}_r^{(t)}, {\delta}_{\widetilde{Y}}^{(t)} \rangle \, . 
+\end{equation}
+Consequently, we have 
+$  q(Y^{(t)})  =  q(\widetilde{Y}_r^{(t)})  q({\delta}_{\widetilde{Y}}^{(t)}) $.
+Afterward, we can draw the following conclusions with \cref{prop1} and \cref{eq:target,eq:true}. 
+The proofs can be found in \cref{appendix:lemma:derivation}. 
+
+\begin{figure}[t]
+    \centering
+    \begin{minipage}[t]{1.0\textwidth}
+    \centering
+    \includegraphics[width=0.8\textwidth]{fig/figure1/diffusion/diff_p.png}
+    \caption{
+    An illustration of the coupled diffusion process.
+    The input $X^{(0)}$ and the corresponding target $Y^{(0)}$ are diffused simultaneously with different variance schedules.
+    $\bm{\beta} = \{ \beta_1, \cdots, \beta_T \}$ is the variance schedule for the input and $\bm{\beta}^{\prime} = \{ \beta_1^{\prime},  \cdots, \beta_T^{\prime} \}$ is for the target.
+    }   \label{fig:diffusion_process}
+    \end{minipage}
+\end{figure}
+
+\begin{lemma}  \label{theo1}
+$ \forall \varepsilon > 0 $, 
+there exists a probabilistic model $ \, f_{\phi, \theta} \vcentcolon = (p_{\phi}, p_{\theta})$ 
+to guarantee that $ \mathcal{D}_{\mathrm{KL}} (q(\widetilde{Y}_r^{(t)}) || p_{\theta}(\widehat{Y}_r^{(t)})) < \varepsilon $, 
+where $ \widehat{Y}_r^{(t)} = f_{\phi,\theta} (X^{(t)})  $. 
+\end{lemma}
+
+\begin{lemma} \label{theo2}
+With the coupled diffusion process, 
+the difference between  diffusion noise and  generation noise will be reduced, 
+i.e., 
+$ \lim_{t \rightarrow \infty} \mathcal{D}_{\mathrm{KL}} (q ({\delta_{\widetilde{Y}}^{(t)}}) || p_{\theta} (\delta_{\widehat{Y}}^{(t)} | Z^{(t)}) ) < 
+\mathcal{D}_{\mathrm{KL}} (q(\epsilon_Y) || p_{\theta}(\epsilon_{\widehat{Y}}))$ . 
+\end{lemma}
+
+Therefore, the uncertainty raised by the generative model and the inherent data noise can be reduced through the coupled diffusion process. 
+In addition, the diffusion process simultaneously augments the input series and the target series, which can improve the generalization capability for (esp. short) time series forecasting. 
+
+\subsubsection{Bidirectional Variational Auto-Encoder}
+
+Traditionally, in the diffusion model, a reverse process is adopted to generate high-quality samples~\cite{sohl2015deep,ho2020denoising}. 
+However, for the generative time series forecasting problem, 
+not only the expressiveness but also the supervision of the ground truths should be considered. 
+In this work, 
+we employ a more efficient generative model, i.e.,  bidirectional variational auto-encoder (BVAE)~\cite{vahdat2020nvae}, to take the place of the reverse process of the diffusion model.~%
+The architecture of BVAE is described in~\cref{fig:method:framework} where $Z$ is treated in a multivariate fashion $Z = \{z_1, \cdots, z_n\}$ ($ z_i \in \mathbb{R}^{m}, z_i = [z_{i,1}, \cdots, z_{i,m}] $) and $z_{i+1} \sim p(z_{i+1}|z_{i}, X)$.
+Then, $n$ is determined in accordance with the number of residual blocks in the encoder, as well as the decoder. 
+Another merit of BVAE is that it opens an interface to integrate the disentanglement for improving model interpretability (refer to \cref{sec:disentangle}).
+
+\subsection{Scaled Denoising Score Matching for Diffused Time Series Cleaning} \label{sec_denoise}
+
+Although the time series data can be augmented with the aforementioned coupled diffusion probabilistic model, the generative distribution $ p_{\theta}(\widehat{Y}^{(t)}) $ tends to move toward the diffused target series $ Y^{(t)} $ which has been corrupted~\cite{li2019learning, song2019generative}. 
+To further ``clean'' the generated target series, we employ the Denoising Score Matching (DSM) to accelerate the de-uncertainty process without sacrificing the model flexibility. 
+DSM~\cite{vincent2011connection,li2019learning} was proposed to link Denoising Auto-Encoder (DAE)~\cite{vincent2010stacked} to Score Matching  (SM)~\cite{hyvarinen2009estimation}.
+Let $ \widehat{Y} $ denote the generated target series, then we have the objective 
+\begin{equation}
+    L_{\text{DSM}}(\zeta) = \mathbb{E}_{ p_{\sigma_0} (\widehat{Y}, Y)} 
+    \| \nabla_{\widehat{Y}} \log(q_{\sigma_0} (\widehat{Y}|Y)) + \nabla_{\widehat{Y}} E(\widehat{Y}; \zeta) \|^{2} \, ,
+\end{equation}
+where $p_{\sigma_0} (\widehat{Y}, Y)$ is the joint density of pairs of corrupted and clean samples $(\widehat{Y}, Y)$, 
+$ \nabla_{\widehat{Y}} \log(q_{\sigma_0} (\widehat{Y}|Y)) $ is derivative of the log density of a single noise kernel, which is dedicated to replacing the Parzen density estimator: $ p_{\sigma_0} (\widehat{Y}) = \int q_{\sigma_0} (\widehat{Y}|Y) p(Y) dY$ in score matching, 
+and $E(\widehat{Y}; \zeta)$ is the energy function. 
+In the particular case of Gaussian noise, 
+$\log(q_{\sigma_0} (\widehat{Y}|Y)) = - (\widehat{Y} - Y)^2/2 {\sigma_0}^2 + C$. 
+Thus, we have 
+\begin{equation}
+    L_{\text{DSM}}(\zeta) = \mathbb{E}_{p_{\sigma_0}(\widehat{Y}, Y)} \| Y - \widehat{Y} + \sigma_0^2 \nabla_{\widehat{Y}} E(\widehat{Y}; \zeta) \|^{2} \, .
+\end{equation}
+Then, for the diffused target series at step $t$, we can obtain 
+\begin{equation}
+    L_{\text{DSM}}(\zeta, t) = \mathbb{E}_{p_{\sigma_0} (\widehat{Y}^{(t)}, Y)} \| Y - \widehat{Y}^{(t)} + \sigma_0^2 \nabla_{\widehat{Y}^{(t)}} E(\widehat{Y}^{(t)}; \zeta) \|^2 \, .
+\end{equation}
+To scale the noise of different levels~\cite{li2019learning}, a monotonically decreasing series of fixed $\sigma$ values $ \{ \sigma_1, \cdots, \sigma_T \,|\, \sigma_t = 1-\bar{\alpha}_t \}$ (refer to the aforementioned variance schedule $\bm{\beta}$ in \cref{sec2.2}) is adopted.
+Therefore, the objective of the multi-scaled DSM is 
+\begin{equation}    \label{eq:dsm}
+    L(\zeta,t) = \mathbb{E}_{q_{\sigma}(\widehat{Y}^{(t)}|Y)p(Y)} 
+    l(\sigma_t) 
+    \| Y - \widehat{Y}^{(t)} + \sigma_0^2 \nabla_{\widehat{Y}^{(t)}} 
+    E(\widehat{Y}^{(t)}; \zeta) \|^2
+    \, ,
+\end{equation}
+where $ \sigma \in \{ \sigma_1, \cdots, \sigma_T \} $ and $l(\sigma_t) = \sigma_t$. 
+With~\cref{eq:dsm}, we can ensure that the gradient has the right magnitude by setting $\sigma_0$.
+
+In the generative time series forecasting setting, the generated samples will be tested without applying the diffusion process. 
+To further denoise the generated target series $\widehat{Y}$, we apply a single-step gradient denoising jump~\cite{saremi2019neural}:
+\begin{equation}	    \label{eq:clean}
+    \widehat{Y}_{\text{clean}} = \widehat{Y} - \sigma_0^2 \nabla_{\widehat{Y}} E (\widehat{Y}; \zeta) \, .
+\end{equation}
+The generated results tend to possess a larger distribution space than the true target,  and the noisy term in~\cref{eq:clean} approximates the noise between the generated target series and the ``cleaned'' target series.
+Therefore,  $\sigma_0^2 \nabla_{\widehat{Y}} E (\widehat{Y}; \zeta)$  can be treated as the estimated uncertainty of the prediction.
+
+\subsection{Disentangling Latent Variables for Interpretation}     \label{sec:disentangle}
+
+The interpretability of the time series forecasting model is of great importance for many downstream tasks~\cite{tonekaboni2020went, hardt2020explaining, ismail2020benchmarking}.
+Through disentangling the latent variables of the generative model, not only the interpretability but also the reliability of the prediction can be further enhanced~\cite{li2021learning}.
+
+To disentangle the latent variables $ Z = \{ z_1, \cdots, z_n \} $, we attempt to minimize the Total Correlation (TC)~\cite{watanabe1960information, kim2018disentangling}, which is a popular metric to measure  dependencies among multiple random variables, % 
+\begin{equation}
+    \text{TC}(z_i) = \mathcal{D}_{\mathrm{KL}} (p_\phi (z_i) || \bar{p}_{\phi} (z_i)), 
+    \qquad 
+    \bar{p}_\phi (z_i) = \prod_{j=1}^{m} p_\phi (z_{i,j})
+\end{equation}
+where $m$ denotes the number of factors of $z_i$ that need to be disentangled. 
+Lower TC generally means better disentanglement if the latent variables preserve useful information.
+However, a very low TC can still be obtained when the latent variables carry no meaningful signals. 
+Through the bidirectional structure of BVAE, such issues can be tackled without too much effort.
+As shown in~\cref{fig:method:framework}, the signals are disseminated in both the encoder and decoder, such that rich semantics are aggregated into the latent variables. 
+Furthermore, to alleviate the effect of potential irregular values, we average the total correlations of $z_{1:n}$, 
+then the loss w.r.t. the TC  score of BVAE can be obtained:  
+\begin{equation}	    \label{tc}
+    L_{\text{TC}} = \frac{1}{n}\sum_{i=1}^{n}\text{TC}(z_i) \, .
+\end{equation}
+
+\par\smallskip\noindent
+\centerline{
+\begin{minipage}[t]{.8\textwidth}
+\begin{algorithm}[H]
+\caption{Training Procedure.} \label{alg_train}
+\begin{algorithmic}[1]
+  \small{
+  \REPEAT 
+  \STATE
+  $ X^{(0)} \sim q(X^{(0)}), \quad Y^{(0)} \sim q(Y^{(0)}), \quad \delta_X \sim N(0, I_d), \quad \delta_Y \sim N(0, I_d)$ 
+  \STATE 
+  Randomly choose $t \in \{ 1, \cdots, T\}$ and with \cref{x_t,eq:true}, 
+  \STATE 
+  $\quad X^{(t)} = \sqrt{\bar{\alpha}_t}X^{(0)} + (1-\bar{\alpha}_t)\delta_X, 
+   \quad  Y^{(t)} = \sqrt{\bar{\alpha}^{\prime}_{t} }Y^{(0)} + (1-\bar{\alpha}^{\prime}_{t})\delta_Y 
+  $
+  \STATE
+  Generate the latent variable $Z$ with BVAE, $Z \sim p_\phi(Z|X^{(t)})$
+  \STATE 
+  Sample $\widehat{Y}^{(t)} \sim p_{\theta}(\widehat{Y}^{(t)}|Z)$ and calculate $\mathcal{D}_{\mathrm{KL}} (q(Y^{(t)})||p_\theta(\widehat{Y}^{(t)}))$ 
+  \STATE 
+  Calculate DSM loss with \cref{eq:dsm} 
+  \STATE 
+  Calculate total correlation of $Z$ with \cref{tc}
+  \STATE 
+  Construct the total loss $ \mathcal{L} $ with \cref{loss}
+  \STATE 
+  $\theta, \phi \leftarrow \mathrm{argmin} (\mathcal{L})$
+  \UNTIL 
+  Convergence
+  }
+\end{algorithmic} %\label{alg_train}
+\end{algorithm}
+\end{minipage}
+}
+
+\vspace{-3ex}
+
+\par\smallskip\noindent
+\centerline{
+\begin{minipage}[t]{.65\textwidth}
+\begin{algorithm}[H]
+\caption{Forecasting Procedure.} \label{alg_pred}
+\begin{algorithmic}[1]
+\small{
+  \STATE 
+  \textbf{Input:} $X \sim q(X)$
+  \STATE 
+  Sample $Z \sim p_{\phi}(Z|X)$
+  \STATE 
+  Generate $\widehat{Y} \sim p_{\theta}(\widehat{Y}|Z)$
+  \STATE 
+  \textbf{Output:} $\widehat{Y}_{\text{clean}}$ and the estimated uncertainty with \cref{eq:clean}
+}
+\end{algorithmic} %\label{alg_pred}
+\end{algorithm}
+\end{minipage}
+}
+
+\iffalse 
+\par\smallskip\noindent
+\centerline{
+}
+\fi 
+
+\subsection{Training and Forecasting}
+
+\textbf{Training Objective.} 
+To reduce the effect of uncertainty, the coupled diffusion equipped with the denoising network is proposed without sacrificing generalizability. 
+Then we disentangle the latent variables of the generative model by minimizing the TC of the latent variables. 
+Finally, we reconstruct the loss with several trade-off parameters, 
+and with \cref{eq:dsm,eq:clean,tc} we have
+\begin{equation}    \label{loss}
+\mathcal{L} 
+= 
+\psi \cdot  \mathcal{D}_{\mathrm{KL}} (q(Y^{(t)})||p_\theta(\widehat{Y}^{(t)})) 
++ 
+\lambda \cdot {L} (\zeta, t) 
++ 
+\gamma \cdot L_{\text{TC}} 
++ 
+L_{\text{mse}} (\widehat{Y}^{(t)}, Y^{(t)}) 
+\, ,
+\end{equation}
+where $L_{\text{mse}}$ calculates the mean square error (MSE) between $\widehat{Y}^{(t)}$ and $Y^{(t)}$.
+We minimize the above objective to learn the generative model accordingly. 
+
+{\bf Algorithms.}
+\cref{alg_train} displays the complete training procedure of \ourmodel~with the loss function in~\cref{loss}. 
+For inference, as described in \cref{alg_pred}, given the input series $X$, the target series can be generated directly from the distribution $p_{\theta}$ which is conditioned on the latent states drawn from the distribution $p_{\phi}$. 
+
+\section{Experiments} \label{experiment}
+
+\subsection{Experiment Settings}  \label{setting}
+
+\textbf{Datasets.~}%\quad
+We generate two synthetic datasets suggested by~\cite{farnoosh2020deep}, 
+\begin{equation*}
+\begin{gathered}
+     w_t = a \cdot  w_{t-1} + \text{tanh}(b \cdot  w_{t-2}) + \text{sin}(w_{t-3}) + \mathcal{N}(0, 0.5I)\\
+     X = [w_1, w_2, ..., w_N] \cdot  F + \mathcal{N}(0, 0.5I) \, ,
+\end{gathered}
+\end{equation*}
+where $w_t \in \mathbb{R}^2$ and $ 0 \leq w_{t, 1}, w_{t, 2} \leq 1 $ ($t = 1,2,3$), 
+$F \in \mathbb{R}^{2 \times k} \sim \mathcal{U}[-1, 1]$, $k$ denotes the dimensionality and $N$ is the number of time points, $a, b$ are two constants.~%
+We set $a=0.9, b=0.2, k=20$ to generate D$_1$, and $a=0.5, b=0.5, k=40$ for D$_2$, and $N = 800$ for both D$_1$ and D$_2$.
+
+\begin{table}[t]
+    \caption{
+    Performance comparisons on synthetic data in terms of MSE and CRPS. 
+    The best results are boldfaced.
+    }
+    \centering
+    \small
+    \setlength\tabcolsep{2.5pt}
+    \renewcommand{\arraystretch}{1.2}
+    \begin{tabular}{c|c|ccccccccc}
+    \toprule 
+    \multicolumn{2}{c}{Model}& \ourmodel &NVAE &$\beta$-TCVAE &f-VAE &DeepAR &TimeGrad &GP-copula & VAE \\
+   \midrule
+    \multirow{4}{*}{D$_1$} & \multirow{2}{*}{8}&$\textbf{0.512}_{\pm.033}$ &$1.201_{\pm.027}$&$0.631_{\pm.003}$&$0.854_{\pm.099}$&$1.153_{\pm.125}$&$0.966_{\pm.102}$&$1.202_{\pm.108}$&$0.912_{\pm.132}$\\
+    ~&~&$\textbf{0.585}_{\pm.021}$&$0.905_{\pm.011}$&$0.658_{\pm.002}$&$0.745_{\pm.036}$&$0.758_{\pm.038}$&$0.698_{\pm.024}$&$0.773_{\pm.033}$&$0.786_{\pm.053}$\\
+    \cline{2-10}
+   
+    ~& \multirow{2}{*}{16}& $\textbf{0.571}_{\pm.025}$&$1.184_{\pm.025}$&$0.758_{\pm.047}$&$1.046_{\pm.270}$&$0.911_{\pm.046}$&$0.945_{\pm.315}$&$0.915_{\pm.059}$&$0.908_{\pm.177}$\\
+    ~&~&$\textbf{0.625}_{\pm.013}$&$0.897_{\pm.012}$&$0.747_{\pm.027}$&$0.835_{\pm.108}$&$0.699_{\pm.014}$&$0.709_{\pm.100}$&$0.704_{\pm.020}$&$0.765_{\pm.067}$\\
+    
+    \midrule
+    \multirow{4}{*}{D$_2$} &  \multirow{2}{*}{8} &$\textbf{0.599}_{\pm.049}$&$1.966_{\pm.047}$&$3.096_{\pm.197}$&$3.353_{\pm.430}$&$0.977_{\pm.137}$&$0.963_{\pm.385}$&$1.037_{\pm.082}$&$3.079_{\pm.345}$\\
+    ~&~&$\textbf{0.628}_{\pm.027}$& $1.255_{\pm.021}$&$1.680_{\pm.062}$&$1.640_{\pm.154}$&$0.727_{\pm.058}$&$0.706_{\pm.123}$&$0.753_{\pm.026}$&$1.504_{\pm.098}$\\
+    \cline{2-10}
+    ~& \multirow{2}{*}{16}& $\textbf{0.786}_{\pm.041}$&$1.955_{\pm.051}$&$3.067_{\pm.443}$&$3.109_{\pm.428}$&$0.972_{\pm.144}$&$0.850_{\pm.061}$&$1.082_{\pm.071}$&$3.132_{\pm.160}$\\
+    
+    ~&~&$0.728_{\pm.026}$ &$1.251_{\pm.020}$&$1.643_{\pm.183}$&$1.558_{\pm.157}$&$0.720_{\pm.050}$&$\textbf{0.649}_{\pm.017}$&$0.762_{\pm.008}$&$1.560_{\pm.060}$\\
+    \bottomrule
+    \end{tabular}
+    \label{toy1}
+\vspace{-2ex}
+\end{table}
+
+\begin{table}[t]
+  \caption{
+  The performance comparisons on real-world datasets in terms of MSE and CRPS, and the best results are in boldface.
+  }
+  \label{real}
+    \centering
+    \small
+    \setlength\tabcolsep{2.0pt}
+    \renewcommand{\arraystretch}{1.2}
+    \begin{threeparttable}
+    \begin{tabular}{c|c|ccccccccc}
+    \toprule  
+    \multicolumn{2}{c}{Model}& \ourmodel &NVAE &$\beta$-TCVAE &f-VAE & DeepAR & TimeGrad & GP-copula & VAE \\
+   \midrule
+    \multirow{4}{*}{\rotatebox{90}{Traffic}} & \multirow{2}{*}{8}&$\textbf{0.081}_{\pm.003}$&$1.300_{\pm.024}$&$1.003_{\pm.006}$&$0.982_{\pm.059}$&$3.895_{\pm.306}$&$3.695_{\pm.246}$&$4.299_{\pm.372}$&$0.794_{\pm.130}$\\
+    ~&~&$\textbf{0.207}_{\pm.003}$&$0.593_{\pm.004}$&$0.894_{\pm.003}$&$0.666_{\pm.032}$&$1.391_{\pm.071}$&$1.410_{\pm.027}$&$1.408_{\pm.046}$&$0.759_{\pm.07}$\\
+    \cline{2-10}
+    ~& \multirow{2}{*}{16}&$\textbf{0.081}_{\pm.009}$&$1.271_{\pm.019}$&$0.997_{\pm.004}$&$0.998_{\pm.042}$&$4.141_{\pm.320}$&$3.495_{\pm.362}$&$4.575_{\pm.141}$&$0.632_{\pm.057}$\\
+    ~&~&$\textbf{0.200}_{\pm.014}$&$0.589_{\pm.001}$&$0.893_{\pm.002}$&$0.692_{\pm.026}$&$1.338_{\pm.043}$&$1.329_{\pm.057}$&$1.506_{\pm.025}$&$0.671_{\pm.038}$\\
+     \midrule
+    \multirow{4}{*}{\rotatebox{90}{Electricity}} &  \multirow{2}{*}{8}&$\textbf{0.251}_{\pm.015}$&$1.134_{\pm.029}$&$0.901_{\pm.052}$&$0.893_{\pm.069}$&$2.934_{\pm.173}$&$2.703_{\pm.087}$&$2.924_{\pm.218}$&$0.853_{\pm.040}$\\
+    ~&~&$\textbf{0.398}_{\pm.011}$&$0.542_{\pm.003}$&$0.831_{\pm.004}$&$0.809_{\pm.024}$&$1.244_{\pm.037}$&$1.208_{\pm.024}$&$1.249_{\pm.048}$&$0.795_{\pm.016}$\\
+    \cline{2-10}
+    ~& \multirow{2}{*}{16}&$\textbf{0.308}_{\pm.030}$&$1.150_{\pm.032}$&$0.850_{\pm.003}$&$0.807_{\pm.034}$&$2.803_{\pm.199}$&$2.770_{\pm.237}$&$3.065_{\pm.186}$&$0.846_{\pm.062}$\\
+    ~&~&$\textbf{0.437}_{\pm.020}$&$0.531_{\pm.003}$&$0.814_{\pm.002}$&$0.782_{\pm.024}$&$1.220_{\pm.048}$&$1.240_{\pm.048}$&$1.307_{\pm.042}$&$0.793_{\pm.029}$\\
+     \midrule
+    \multirow{4}{*}{\rotatebox{90}{Weather}} & \multirow{2}{*}{8} & $\textbf{0.169}_{\pm.022}$&$0.801_{\pm.024}$&$0.234_{\pm.042}$&$0.591_{\pm.198}$&$2.317_{\pm.357}$&$2.715_{\pm.189}$&$2.412_{\pm.761}$&$0.560_{\pm.192}$\\
+    ~&~&$\textbf{0.357}_{\pm.024}$&$0.757_{\pm.013}$&$0.404_{\pm.040}$&$0.565_{\pm.080}$&$0.858_{\pm.078}$&$0.920_{\pm.013}$&$0.897_{\pm.115}$&$0.572_{\pm.077}$\\
+     \cline{2-10}
+    ~& \multirow{2}{*}{16}&$\textbf{0.187}_{\pm.047}$&$0.811_{\pm.016}$&$0.212_{\pm.012}$&$0.530_{\pm.167}$&$1.269_{\pm.187}$&$1.110_{\pm.083}$&$1.357_{\pm.145}$&$0.424_{\pm.141}$\\
+    ~&~&$\textbf{0.361}_{\pm.046}$&$0.759_{\pm.009}$&$0.388_{\pm.014}$&$0.547_{\pm.067}$&$0.783_{\pm.059}$&$0.733_{\pm.016}$&$0.811_{\pm.032}$&$0.503_{\pm.068}$\\
+     \midrule
+    \iffalse
+    \multirow{4}{*}{\rotatebox{90}{Exchange}} &  \multirow{2}{*}{8} & $0.607_{\pm.120}$&$2.112_{\pm.054}$&$1.003_{\pm.006}$&$3.747_{\pm.673}$&$0.419_{\pm.058}$&$0.314_{\pm.035}$&$0.509_{\pm.031}$&$3.486_{\pm.747}$\\
+    ~&~&$0.753_{\pm.077}$&$1.338_{\pm.027}$&$0.894_{\pm.003}$&$1.791_{\pm.173}$&$0.493_{\pm.018}$&$0.444_{\pm.015}$&$0.528_{\pm.021}$&$1.741_{\pm.167}$\\
+    \cline{2-10}
+    ~& \multirow{2}{*}{16}&$1.406_{\pm.315}$&$2.107_{\pm.030}$&$2.761_{\pm.405}$&$3.701_{\pm.482}$&$0.393_{\pm.045}$&$0.283_{\pm.041}$&$0.376_{\pm.023}$&$3.758_{\pm.484}$\\
+    ~&~&$1.144_{\pm.128}$&$1.330_{\pm.054}$&$1.629_{\pm.120}$&$1.804_{\pm.102}$&$0.467_{\pm.034}$&$0.411_{\pm.020}$&$0.451_{\pm.029}$&$1.815_{\pm.083}$\\
+     \midrule
+    \fi
+    \multirow{4}{*}{\rotatebox{90}{ETTm1}} &  \multirow{2}{*}{8} & $\textbf{0.527}_{\pm.073}$&$0.921_{\pm.026}$&$1.538_{\pm.254}$&$2.326_{\pm.445}$&$2.204_{\pm.420}$&$1.877_{\pm.245}$&$2.024_{\pm.143}$&$2.375_{\pm.405}$\\
+    ~&~&$\textbf{0.557}_{0.048}$&$0.760_{\pm.026}$&$1.015_{\pm.112}$&$1.260_{\pm.167}$&$0.984_{\pm.074}$&$0.908_{\pm.038}$&$0.961_{\pm.027}$&$1.258_{\pm.104}$\\
+    \cline{2-10}
+    ~& \multirow{2}{*}{16}&$\textbf{0.968}_{\pm.104}$&$1.100_{\pm.032}$&$1.744_{\pm.100}$&$2.339_{\pm.270}$&$2.350_{\pm.170}$&$2.032_{\pm.234}$&$2.486_{\pm.207}$&$2.321_{\pm.469}$\\
+    ~&~&$\textbf{0.821}_{\pm.072}$&$0.822_{\pm.026}$&$1.104_{\pm.041}$&$1.249_{\pm.088}$&$0.974_{\pm.016}$&$0.919_{\pm.031}$&$0.984_{\pm.016}$&$1.259_{\pm.132}$\\
+     \midrule
+    \multirow{4}{*}{\rotatebox{90}{ETTh1}} & \multirow{2}{*}{8} &$\textbf{0.292}_{\pm.036}$&$0.483_{\pm.017}$&$0.703_{\pm.054}$&$0.870_{\pm.134}$&$3.451_{\pm.335}$&$4.259_{\pm1.13}$&$4.278_{\pm1.12}$&$1.006_{\pm.281}$\\
+    ~&~&$\textbf{0.424}_{\pm.033}$&$0.461_{\pm.011}$&$0.644_{\pm.038}$&$0.730_{\pm.060}$&$1.194_{\pm.034}$&$1.092_{\pm.028}$&$1.169_{\pm.055}$&$0.762_{\pm.115}$\\
+    \cline{2-10}
+    ~& \multirow{2}{*}{16}&$\textbf{0.374}_{\pm.061}$&$0.488_{\pm.010}$&$0.681_{\pm.018}$&$0.983_{\pm.139}$&$1.929_{\pm.105}$&$1.332_{\pm.125}$&$1.701_{\pm.088}$&$0.681_{\pm.104}$\\
+    ~&~&$0.488_{\pm.039}$&$ \textbf{0.463}_{\pm.018}$&$0.640_{\pm.008}$&$0.760_{\pm.062}$&$1.029_{\pm.030}$&$0.879_{\pm.037}$&$0.999_{\pm.023}$&$0.641_{\pm.055}$\\
+    \midrule
+    \multirow{4}{*}{\rotatebox{90}{Wind}} & \multirow{2}{*}{8} & $\textbf{0.681}_{\pm.075}$&$1.854_{\pm.032}$&$1.321_{\pm.379}$&$1.942_{\pm.101}$&$12.53_{\pm2.25}$&$12.67_{\pm1.75}$&$11.35_{\pm6.61}$&$2.006_{\pm.145}$\\
+    ~&~&$\textbf{0.596}_{\pm.052}$&$1.223_{\pm.014}$&$0.863_{\pm.143}$&$1.067_{\pm.086}$&$1.370_{\pm.107}$&$1.440_{\pm.059}$&$1.305_{\pm.369}$&$1.103_{\pm.100}$\\
+     \cline{2-10}
+    ~& \multirow{2}{*}{16}&$1.033_{\pm.062}$&$1.955_{\pm.015}$&$\textbf{0.894}_{\pm.038}$&$1.262_{\pm.178}$&$13.96_{\pm.1.53}$&$12.86_{\pm2.60}$&$13.79_{\pm5.37}$&$1.138_{\pm.205}$\\
+    ~&~&$\textbf{0.757}_{\pm.053}$&$1.247_{\pm.011}$&$0.785_{\pm.037}$&$0.843_{\pm.066}$&$1.347_{\pm.060}$&$1.240_{\pm.070}$&$1.261_{\pm.171}$&$0.862_{\pm.092}$\\
+    \bottomrule
+    \end{tabular}
+    \end{threeparttable}
+\vspace{-2ex}
+\end{table}
+
+Six real-world datasets with diverse spatiotemporal dynamics are selected, 
+including Traffic~\cite{lai2018modeling}, 
+Electricity\footnote{\url{https://archive.ics.uci.edu/ml/datasets/ElectricityLoadDiagrams20112014}}, 
+Weather\footnote{\url{https://www.bgc-jena.mpg.de/wetter/}}, 
+Wind (Wind Power) \footnote{This dataset is published at 
+\url{https://github.com/PaddlePaddle/PaddleSpatial/tree/main/paddlespatial/datasets/WindPower}.
+},
+and ETTs~\cite{zhou2021informer} (ETTm1 and ETTh1). 
+To highlight the uncertainty in short time series scenarios, for each dataset, we slice a subset from the starting point to make sure that each sliced dataset contains at most 1000 time points.~%
+Subsequently, we obtained 
+$5\%$-Traffic, $3\%$-Electricity, $2\%$-Weather, $2\%$-Wind, $1\%$-ETTm1, and $5\%$-ETTh1.~%
+The statistical descriptions of the real-world datasets can be found in \cref{exp_repro}.~%
+All datasets are split chronologically and adopt the same train/validation/test ratios, i.e., 7:1:2. 
+
+\textbf{Baselines.~}
+We compare \ourmodel ~with one GP (Gaussian Process) based method 
+(GP-copula~\cite{salinas2019high}), two auto-regressive methods (DeepAR~\cite{salinas2020deepar} and TimeGrad~\cite{rasul2021autoregressive}), 
+and four VAE-based methods, i.e., vanilla VAE, NVAE~\cite{vahdat2020nvae}, factor-VAE (f-VAE for short)~\cite{kim2018disentangling} and $\beta$-TCVAE~\cite{chen2018isolating}.
+
+\textbf{Implementation Details.~}%\quad
+An input-$l_x$-predict-$l_y$ window is applied to roll the train, validation, and test sets with stride one time-step, respectively, and this setting is adopted for all datasets. 
+Hereinafter, the last dimension of the multivariate time series is selected as the target variable by default.
+
+We use the Adam optimizer with an initial learning rate of $5e-4$.
+The batch size is $16$, and the training is set to $20$ epochs at most equipped with early stopping. 
+The number of disentanglement factors is chosen from $\{4, 8\}$, 
+and $\beta_t \in \bm{\beta} $ is set to range from $0.01$ to $0.1$ with different diffusion steps $T \in [100, 1000]$, 
+then $\omega$ is set to $0.1$. 
+The trade-off hyperparameters are set as $\psi = 0.05, \lambda=0.1, \gamma=0.001$ for ETTs, and $\psi = 0.5, \lambda=1.0, \gamma=0.01$ for others. 
+All the experiments were carried out on a Linux machine with a single NVIDIA P40 GPU.
+The experiments are repeated five times, and the average and variance of the predictions are reported. 
+We use the Continuous Ranked Probability Score~(CRPS)~\cite{matheson1976scoring} and Mean Squared Error~(MSE) as the evaluation metrics.
+For both metrics, the lower, the better. 
+In particular, CRPS is used to evaluate the similarity of two distributions and is equivalent to Mean Absolute Error (MAE) when two distributions are discrete.
+
+\subsection{Main Results} \label{e1}
+
+Two different prediction lengths, i.e., $l_y \in \{8, 16\}$ ($l_x = l_y$), are evaluated.
+The results of longer prediction lengths are available in~\cref{extra}. 
+
+\textbf{Toy Datasets.~~}
+In~\cref{toy1}, we can observe that 
+\ourmodel ~achieves SOTA performance most of the time, and achieves competitive CRPS in D$_2$ for prediction length 16. 
+Besides, VAEs outperform VARs and GP on D$_1$, 
+but VARs achieve better performance on D$_2$, which demonstrates the advantage of VARs in learning complex temporal dependencies. 
+
+\textbf{Real-World Datasets.~~} 
+As for the experiments on real-world data, \ourmodel ~achieves consistent  SOTA performance except for the prediction length 16 on the Wind dataset (\cref{real}). 
+Particularly, under the input-8-predict-8 setting, \ourmodel~can provide remarkable improvements in Traffic, Electricity, Wind, ETTm1, ETTh1 and Weather w.r.t. MSE reduction (90\%, 71\%, 48\%, 43\%, 40\% and 28\%). 
+Regarding the CRPS reduction, \ourmodel~achieves a 73\% reduction in Traffic, 31\% in Wind, and 27\% in Electricity under the input-8-predict-8 setting, 
+and a 70\% reduction in Traffic, 18\% in Electricity, and 7\% in Weather under the input-16-predict-16 setting.~%
+Overall, \ourmodel~gains the averaged 43\% MSE reduction and 23\% CRPS reduction among the above settings.~%
+More results under longer prediction-length settings and on full datasets can be found in  \cref{appendix:supp-main-results}. 
+
+\textbf{Uncertainty Estimation.~~} 
+The  uncertainty can be assessed by estimating the noise of the outcome series when doing the prediction~(see~\cref{sec_denoise}).  
+Through scale parameter $\omega$, the generated distribution space can be adjusted accordingly (results on the effect of $\omega$ can be found  in Appendix D.3). %~\cref{App_omega}). 
+The showcases in \cref{noise} demonstrate the uncertainty estimation of the yielded series in the Traffic dataset, where the last six dimensions are treated as target variables. 
+We can find that noise estimation can quantify the uncertainty effectively. 
+For example, the estimated uncertainty grows rapidly when extreme values are encountered. 
+
+\begin{figure}[htbp]
+    \centering
+    \begin{subfigure}[t]{0.31\textwidth}
+      \includegraphics[width=\textwidth]{fig/figure9/dim1.png}
+    \end{subfigure}
+    \begin{subfigure}[t]{0.31\textwidth}
+      \includegraphics[width=\textwidth]{fig/figure9/dim2.png}
+    \end{subfigure}
+    \begin{subfigure}[t]{0.31\textwidth}
+      \includegraphics[width=\textwidth]{fig/figure9/dim3.png}
+    \end{subfigure}
+    
+    \begin{subfigure}[t]{0.31\textwidth}
+      \includegraphics[width=\textwidth]{fig/figure9/dim4.png}
+    \end{subfigure}
+    \begin{subfigure}[t]{0.31\textwidth}
+      \includegraphics[width=\textwidth]{fig/figure9/dim5.png}
+    \end{subfigure}
+    \begin{subfigure}[t]{0.31\textwidth}
+      \includegraphics[width=\textwidth]{fig/figure9/dim6.png}
+    \end{subfigure}
+    \caption{
+    Uncertainty estimation of the prediction of the last six dimensions in the Traffic dataset and the colored envelope denotes the estimated uncertainty.
+    }
+    \label{noise}
+\end{figure}
+
+\textbf{Disentanglement Evaluation.~} %\quad
+For time series forecasting,
+it is difficult to label disentangled factors by hand, 
+thus we take different dimensions of $Z$ as the factors to be disentangled: $ z_i = [ z_{i, 1}, \cdots, z_{i, m}] $ ($z_i \in Z $). 
+We build a classifier to discriminate whether an instance $z_{i,j}$ belongs to class $j$ such that the disentanglement quality can be assessed by evaluating the classification performance.  
+Besides, 
+we adopt the Mutual Information Gap (MIG) \cite{chen2018isolating} as a metric to evaluate the disentanglement more straightforwardly. 
+Due to the space limit, the evaluation of disentanglement with different factors can be found in~\cref{disentangle}.
+
+\begin{table}[t]
+   \begin{minipage}[b]{0.63\textwidth}
+    \centering
+    \small
+    \caption{
+    Ablation study of the coupled diffusion probabilistic model w.r.t. MSE and CSPR. 
+    } \label{tab:abla:diffusion}
+    \renewcommand{\arraystretch}{1.0}
+    \setlength\tabcolsep{0.8pt}
+    \begin{threeparttable}
+    \begin{tabular}{c|cc|cc}
+    \toprule
+     \multirow{2}{*}{Dataset}& \multicolumn{2}{c|}{Traffic} & \multicolumn{2}{c}{Electricity}\\
+     \cline{2-5}
+     ~&16&32&16&32\\
+    \midrule
+    \multirow{2}{*}{\ourmodel $_{-\widetilde{Y}}$} & 
+    $0.122_{\pm.006}$&$0.126_{\pm.013}$&
+    $0.350_{\pm.043}$&$0.422_{\pm.012}$\\
+    ~& 
+    $0.250_{\pm.008}$&$0.261_{\pm.017}$&
+    $0.480_{\pm.032}$&$0.551_{\pm.012}$\\
+    \midrule
+    \multirow{2}{*}{\ourmodel $_{-\widetilde{Y}-\mathrm{DSM}}$} & 
+    $0.096_{\pm.006}$& $0.092_{\pm.008}$ & $ 0.331_{\pm.023}$&$0.502_{\pm.079} $\\
+    ~& $0.217_{\pm.010}$ & $0.220_{\pm.013}$& $ 0.450_{\pm.021}$&$0.584_{\pm.053}$\\
+    \midrule
+    \multirow{2}{*}{\ourmodel $_{-\widetilde{X}}$}&
+    $0.123_{\pm.003}$&$0.117_{\pm.007}$&
+    $0.351_{\pm.047}$&$0.420_{\pm.056}$\\
+    ~&
+    $0.256_{\pm.006}$&$0.253_{\pm.013}$&
+    $0.481_{\pm.036}$&$0.540_{\pm.046}$\\
+    \midrule
+    \multirow{2}{*}{\ourmodel $_{-\mathrm{CDM}}$}&
+    $0.123_{\pm.004}$&$0.118_{\pm.008}$&
+    $0.365_{\pm.025}$&$0.439_{\pm.014}$\\
+    ~&
+    $0.255_{\pm.007}$&$0.252_{\pm.015}$&
+    $0.498_{\pm.018}$&$0.561_{\pm.016}$\\
+    \midrule
+    \multirow{2}{*}{\ourmodel $_{-\mathrm{CDM}-\mathrm{DSM}}$}&
+    $0.123_{\pm.003}$&$0.119_{\pm.003}$&
+    $0.338_{\pm.041}$&$0.448_{\pm.062}$\\
+    ~&
+    $0.255_{\pm.003}$&$0.253_{\pm.005}$&
+    $0.467_{\pm.029}$&$0.555_{\pm.041}$\\
+    \midrule
+    \multirow{2}{*}{\ourmodel}&$\textbf{0.081}_{\pm.009}$&$\textbf{0.091}_{\pm.007}$&$\textbf{0.308}_{\pm.030}$&$\textbf{0.410}_{\pm.075}$\\
+    ~&$\textbf{0.200}_{\pm.014}$&$\textbf{0.216}_{\pm.012}$&$\textbf{0.437}_{\pm.020}$&$\textbf{0.534}_{\pm.058}$\\
+    \bottomrule
+    \end{tabular}
+    \end{threeparttable}
+    \label{tab:my_label}
+    \end{minipage}
+\hfill
+\begin{minipage}[p]{0.35\textwidth}
+    \centering
+    \begin{subfigure}[t]{\textwidth}
+     \includegraphics[width=0.9\textwidth,height=0.54\textwidth]{fig/figure9/end6.png}
+    \end{subfigure}
+    \vspace{1ex}
+     \begin{subfigure}[t]{\textwidth}
+     \includegraphics[width=0.9\textwidth,height=0.54\textwidth]{fig/figure9/step5.png}
+    \end{subfigure}
+    \captionof{figure}{
+      Comparisons of predictions with different $\beta_{T}$ and varying $T$ on the Electricity dataset.
+    }
+    \label{fig:beta}
+\end{minipage}
+\vspace{-3ex}
+\end{table}    
+ 
+ 
+
+\subsection{Model Analysis} \label{ablation}
+
+\textbf{Ablation Study of the Coupled Diffusion and Denoising Network.} 
+To evaluate the effectiveness of the coupled diffusion model (CDM), we compare the full versioned \ourmodel ~with its three variants: 
+i) \ourmodel $_{-\widetilde{Y}}$, i.e. \ourmodel ~without diffused $Y$, 
+ii) \ourmodel $_{-\widetilde{X}}$, i.e. \ourmodel ~without diffused $X$, 
+and 
+iii) \ourmodel $_{-\mathrm{CDM}}$, i.e. \ourmodel ~without any diffusion. 
+Besides, the performance of \ourmodel~without denoising score matching (DSM) is also reported when the target series is not diffused, which are denoted as \ourmodel $_{-\widetilde{Y}-\mathrm{DSM}}$ and \ourmodel $_{-\mathrm{CDM}-\mathrm{DSM}}$. 
+The ablation study is carried out on Traffic and Electricity datasets under input-16-predict-16 and input-32-predict-32. 
+In \cref{tab:abla:diffusion},  we can find that the diffusion process can effectively augment the input or the target. 
+Moreover, when the target is not diffused, the denoising network would be deficient since the noise level of the target cannot be estimated by then. 
+
+\textbf{Variance Schedule $\bm{\beta}$ and The Number of Diffusion Steps $T$.} %\quad
+To reduce the effect of the uncertainty while preserving the informative temporal patterns, the extent of the diffusion should be configured properly.~%
+Too small a variance schedule or inadequate diffusion steps will lead to a meaningless diffusion process. Otherwise, the diffusion could be out of control {\footnote{
+An illustrative showcase can be found in Appendix F. % \cref{B1}.
+}}.~%
+Here we analyze the effect of the variance schedule $\bm{\beta}$ and the number of diffusion steps $T$.  
+We set $\beta_1 = 0$ and change the value of $\beta_t$ in the range of $[0.01, 0.1]$, and $T$ ranges from $100$ to $4000$.
+As shown in~\cref{fig:beta}, we can  see  that the prediction performance can be improved if proper $\bm{\beta}$ and $T$ are employed.
+
+\section{Discussion} \label{discuss}
+
+\textbf{Sampling for Generative Time Series Forecasting.~}\\
+The Langevin dynamics has been widely applied to the sampling of energy-based models~(EBMs)~\cite{xie2016theory,du2019implicit,xie2019learning},
+\begin{equation}
+    Y_k = Y_{k-1} - \frac{\rho}{2}\nabla_{Y}E_{\phi}(Y_{k-1})  + \rho^{\frac{1}{2}} \mathcal{N} (0, I_d) \, ,
+\end{equation}
+where $k \in \{ 0, \cdots, K \} $, 
+$K$ denotes the number of sampling steps, 
+and $\rho$ is a constant. 
+With $K$ and $\rho$ being properly configured, high-quality samples can be generated.  
+The Langevin dynamics has been successfully applied to applications in computer vision~\cite{kumar2019maximum,xie2021generative}, and natural language processing~\cite{deng2020residual}.
+
+We employ a single-step gradient denoising jump in this work to generate the target series. 
+The experiments that were carried out demonstrate the effectiveness of such single-step sampling. 
+We conduct an extra empirical study to investigate whether it is worth taking more sampling steps for further performance improvement of time series forecasting. 
+We showcase the prediction results under different sampling strategies in \cref{fig:sample}. 
+By omitting the additive noise in Langevin dynamics, we employ the multi-step denoising for \ourmodel~to generate the target series and plot the generated results in \cref{steps}. 
+Then, with the standard Langevin dynamics, we can implement a generative procedure instead of denoising and compare the generated target series with different $\rho$ (see~\cref{rho=0.003,rho=0.005,rho=0.007}). 
+We can observe that more sampling steps might not be helpful in improving prediction performance for generative time series forecasting~(\cref{steps}). 
+Besides, larger sampling steps would lead to high computational complexity. 
+On the other hand, different configurations of Langevin dynamics (with varying $\rho$) cannot bring indispensable benefits for time series forecasting (\cref{rho=0.003,rho=0.005,rho=0.007}). 
+
+\begin{figure}[ht]
+    \centering
+      \begin{subfigure}[t]{0.24\textwidth}
+      \centering
+       \includegraphics[width=0.96\textwidth]{fig/figure9/tmp/samplesteps1.png}
+       \caption{
+       Multi-step denoising.
+       }
+       \label{steps}
+      \end{subfigure}
+      \begin{subfigure}[t]{0.24\textwidth}
+      \centering
+       \includegraphics[width=0.96\textwidth]{fig/figure9/tmp/rho-003.png}
+       \caption{$\rho = 0.003$.}
+       \label{rho=0.003}
+      \end{subfigure}
+     \begin{subfigure}[t]{0.24\textwidth}
+        \centering
+       \includegraphics[width=0.96\textwidth]{fig/figure9/tmp/rho-005.png}
+       \caption{$\rho = 0.005$.}
+       \label{rho=0.005}
+      \end{subfigure}
+      \begin{subfigure}[t]{0.24\textwidth}
+      \centering
+       \includegraphics[width=0.96\textwidth]{fig/figure9/tmp/rho-007.png}
+       \caption{$\rho = 0.007$.}
+       \label{rho=0.007}
+      \end{subfigure}
+      \caption{
+      The prediction showcases in the Electricity dataset with different sampling strategies.
+      }
+     \label{fig:sample}
+\end{figure}
+ 
+
+\textbf{Limitations.~} %\quad 
+\\
+With the coupled diffusion probabilistic model, although the aleatoric uncertainty of the time series can be reduced, a new bias is brought into the series to mimic the distribution of the input and target.
+However, as a common issue in VAEs that any introduced bias in the input will result in bias in the generated output~\cite{von2021self}, the diffusion steps and variance schedule need to be chosen cautiously, such that this model can be applied to different time series tasks smoothly. 
+The proposed model is devised for general time series forecasting, it should be used properly to avoid the potential negative societal impacts, such as illegal applications. 
+
+In time series predictive analysis, disentanglement of the latent variables has been very important for interpreting the prediction to provide more reliance.~%
+Due to the lack of prior knowledge of the entangled factors in generative time series forecasting, only unsupervised disentanglement learning can be done, which has been proven theoretically feasible for time series~\cite{li2021learning}. 
+Despite this, for boarder applications of disentanglement and better performance, it is still worth exploring how to label the factors of time series in the future.  
+Moreover, because of the uniqueness of time series data, it is also a promising direction to explore more generative and sampling methods for the time series generation task. 
+
+\section{Conclusion} \label{conclusion}
+
+In this work, we propose a generative model with the bidirectional VAE as the backbone. 
+To further improve the generalizability, we devise a coupled diffusion probabilistic model for time series forecasting. 
+Then a scaled denoising network is developed to guarantee the prediction accuracy. 
+Afterward, the latent variables are further disentangled for better model interpretability. 
+Extensive experiments on synthetic data and real-world data validate that our proposed generative model achieves SOTA performance compared to existing competitive generative models.
+
+\section*{Acknowledgement}
+
+We thank Longyuan Power Group Corp. Ltd. for supporting this work.  
+
+\newpage
+
+\newpage
+
+\end{document}

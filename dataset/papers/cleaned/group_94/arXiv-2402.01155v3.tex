@@ -1,0 +1,428 @@
+\title{CABINET: Content Relevance based Noise\ \ \ \ Reduction for Table Question Answering}
+
+\begin{document}
+
+\def \approach{ToReQA }
+
+\maketitle
+
+\def\thefootnote{*}\footnotetext{These authors contributed equally to this work}\def\thefootnote{\arabic{footnote}}
+
+\begin{abstract}
+
+Table understanding capability of Large Language Models (LLMs) has been extensively studied through the task of question-answering (QA) over tables. Typically, only a small part of the whole table is relevant to derive the answer for a given question. The irrelevant parts act as noise and are \textit{distracting information}, resulting in sub-optimal performance due to the vulnerability of LLMs to noise. To mitigate this, we propose \textbf{\approachname}\ (\approachtext) -- a framework to enable LLMs to focus on relevant tabular data by suppressing extraneous information. \approachname\ comprises an Unsupervised Relevance Scorer (URS), trained differentially with the QA LLM, that weighs the table content based on its relevance to the input question before feeding it to the question-answering LLM (QA LLM). To further aid the relevance scorer, \approachname\ employs a weakly supervised module that generates a parsing statement describing the criteria of rows and columns relevant to the question and highlights the content of corresponding table cells. \approachname\ significantly outperforms various tabular LLM baselines, as well as GPT3-based in-context learning methods, is more robust to noise, maintains outperformance on tables of varying sizes, and establishes new SoTA performance on WikiTQ, FeTaQA, and WikiSQL datasets. We release our code and datasets \href{https://github.com/Sohanpatnaik106/CABINET_QA}{here}.
+\vspace{-2mm}
+
+\vspace{-2mm}
+\section{Introduction}
+\vspace{-1mm}
+
+Understanding tabular data through ML models has been extensively explored through various tasks such as question-answering (QA)~\citep{chen-etal-2022-convfinqa, cheng-etal-2022-hitab, nan-etal-2022-fetaqa}, fact-verification~\citep{Chen2020TabFact, wang-etal-2021-semeval, 68d30a95}, table-to-description generation~\citep{chen-etal-2020-logical, parikh-etal-2020-totto, chen-etal-2020-logic2text, suadaa-etal-2021-towards, nan-etal-2021-dart} and table grounded dialogue~\citep{nakamura-etal-2022-hybridialogue}. Table QA has been studied with a specific focus as it allows to conveniently query the table in natural language to extract desired information. Large Language Models (LLMs), which have shown remarkable generalization on various Natural Language Processing (NLP) tasks, have also been used to reason over tables achieving impressive performance~\citep{yu2021grappa, neeraja-etal-2021-incorporating, gu-etal-2022-pasta, chen-2023-large}. 
+
+Tables contain information organized in rows and columns, and typical transformer-based LLMs such as BERT~\citep{devlin-etal-2019-bert}, T5~\citep{JMLR:v21:20-074}, and GPT~\citep{NEURIPS2020_1457c0d6} trained over unstructured natural language text using standard language modeling objectives do not account for the table structure and underlying compositionality of data~\citep{yu2021grappa}. Many works on table understanding therefore, adapt LLMs for tables through joint learning over tabular and text content~\citep{yin-etal-2020-tabert}, pre-training on table semantic parsing~\citep{liu2022tapex, jiang-etal-2022-omnitab} and synthesizing template-based questions to improve reasoning skills over tables~\citep{gu-etal-2022-pasta}. Typically, only a small number of cells contain the information required to derive the answer for a question. The irrelevant tabular data acts as \textit{distracting information} or noise, resulting in sub-optimal performance since LLMs are susceptible to noise in the input~\citep{kumar-etal-2023-multi, chen2023benchmarking}. Performance degradation is further amplified in large tables due to presence of even more data as illustrated in Figure~\ref{fig:perf_vs_size} in Section~\ref{subsec:size_abl}.
+
+Consequently, significant efforts have been made to mitigate the issue of noise by pruning of tabular data, albeit at the cost of accuracy~\citep{krichene-etal-2021-dot}, and by retrieving content from table and passages for QA~\citep{wang-etal-2022-muger2, lei-etal-2023-s3hqa, kumar-etal-2023-multi}. More recently, DATER~\citep{10.1145/3539618.3591708}, one of the state-of-the-art methods for table QA, proposed decomposing a table into simpler sub-tables containing information needed to answer the question by providing in-context examples to GPT-3 based Codex~\citep{DBLP:journals/corr/abs-2107-03374}. 
+
+  
+
+\begin{figure}[t]
+     \centering
+     \includegraphics[scale=0.42]{figs/cabinet_introsample.pdf} 
+    \caption{Comparison between \approachname and DATER (a GPT-3 based in-context learning method). For the given example, DATER extracts a wrong sub-table through hard decomposition (resulting in loss of useful information) that causes QA reasoner to answer incorrectly. \approachname\ weighs relevant table parts higher without removing content explicitly allowing QA LLM to answer correctly.}
+    \vspace{-15pt}
+    \label{fig:comparision_intro}
+\end{figure}
+
+Such a question-conditioned hard decomposition of table is sub-optimal as the subsequent QA model cannot correct the error made during decomposition if relevant information is not selected (as shown in Figure~\ref{fig:comparision_intro}). To mitigate this, we propose \approachname\ (\approachtext) --  a framework for table QA that weighs different table parts based on their relevance to the question without explicitly removing any content. \approachname\ comprises a relevance scorer (\S~\ref{sec:meth_uns_relevance}), which takes question and table as input to provide a relevance score to table content. The score is used to weigh corresponding content passed to the QA LLM, allowing it to focus more on the relevant content. The relevance scorer is unsupervised and trained with QA LLM differentiably due to lack of annotations denoting relevant table information. Although answer generation loss enables learning of relevance scorer, it acts as an indirect training signal. 
+
+Hence, to aid relevance scorer, inspired by how humans process tables, \approachname\ employs a parsing statement generator (\S~\ref{sec:highlight}) that describes which rows and columns are relevant to the question. For instance, consider the example in Figure~\ref{fig:comparision_intro}, \approachname\ generates ``consider rows with result as 'loss', and note the higher value in the 'score' column". The parsing statement is then used to identify corresponding cells, and their content is given more weight during relevance scoring. \approachname\ establishes new SoTA on three challenging table QA datasets (WikiTQ, FeTaQA and WikiSQL) significantly outperforming various strong baselines (\S~\ref{sec:main_res}). We show that \approachname\ is more robust to noise in tables and structural biases i.e. row and column ordering (\S~\ref{sec:robustness}). Further, the performance gains achieved by \approachname\ are even more pronounced for larger tables (\S~\ref{subsec:size_abl}), indicating that it successfully mitigates noisy table information irrelevant to a given question.
+
+\section{Related Work}
+\vspace{-2mm}
+\textbf{Table Specific Architecture:}
+Tables contain information in a structured format, organized in rows and columns. Hence, many works have focused on developing table-specific models to utilize the semantics of table structure through its description. TabBERT \citep{yin-etal-2020-tabert} pre-trains BERT~\citep{devlin-etal-2019-bert} on paired table-text samples through masked language modeling (MLM). \citet{deng2020turl} modified the bidirectional attention in BERT to incorporate table structure while performing MLM. TAPAS~\citep{herzig-etal-2020-tapas} utilizes positional embeddings for rows and columns to explicitly capture cell location. \citet{yang-etal-2022-tableformer} noted that methods using positional embeddings are vulnerable to column and row permutations. To address this, they introduce TableFormer, a table-text encoding architecture that incorporates tabular structure through learnable attention biases. We show that LLMs become less susceptible to such permutations by learning to focus on relevant table parts through \approachname\ (\S~\ref{sec:robustness}). We discuss use of graphs to capture table structure and similarity between table-question samples across the dataset~\citep{iyer-etal-2023-question} in Appendix~\ref{app:add_related_work}
+
+\textbf{Table QA Specific Pre-training}: \citet{eisenschlos-etal-2020-understanding} argued that the MLM objective to just fill in the blanks of table cells and descriptions is insufficient to capture relations between cells and associated text needed to perform table QA. They introduced additional pre-training tasks that require explicit question-table reasoning and complex table operations (such as aggregation). Other improvements include handling of numeric tokens~\citep{han2022luna}, temporal relations~\citep{zhao-etal-2022-reastap}, and selectively masking tokens that require table based reasoning~\citep{gu-etal-2022-pasta}. Another direction focuses on applying semantic parsing over the input text (question) and table to generate a logical form (such as SQL) which when executed fetches relevant information~\citep{yu2021grappa}. Such methods like TAPEX~\citep{liu2022tapex}, OmniTab~\citep{jiang-etal-2022-omnitab} etc. typically involve joint training over natural language-SQL pairs so that the underlying model learns to map the information implied in the question to the required table operations. However, as discussed in experiments (\S~\ref{sec:robustness} and \ref{subsec:size_abl}), these methods suffer significant performance drop when dealing with large and noisy tables owing to their limited capability at identifying information relevant to question.
+
+\textbf{Few/Zero-Shot Learning with Large Language Models:} Given the remarkable performance of LLMs on various tasks without any task-specific training, their use for table understanding has also been explored extensively. \citet{chen-2023-large} have shown that LLMs perform strongly on various table QA tasks using Chain of Thought (CoT)~\citep{wei2022chain, wang2023selfconsistency} prompting. Since typical LLMs are trained over unstructured text data, models specifically designed to handle structured data, such as StructGPT~\citep{jiang2023structgpt} have also been used for table QA. LEVER~\citep{ni2023lever} and BINDER~\citep{cheng2023binding} utilized code-optimized GPT-Codex~\citep{DBLP:journals/corr/abs-2107-03374} to generate SQL statements that can be executed to answer questions over tabular data. DATER~\citep{10.1145/3539618.3591708} uses Codex to break table into sub-tables conditioned on a given question through in-context learning. Such methods have no way to recover relevant table part to generate the correct answer in case it is omitted while generating sub-tables (as discussed in Figure~\ref{fig:comparision_intro}).
+
+\vspace{-2mm}
+\section{Methodology}
+\vspace{-2mm}
+
+We summarize the architecture of \approachname\ in Figure~\ref{fig:overview}. It comprises two components: \textbf{1) Unsupervised Relevance Scorer}, an unsupervised module comprising a transformer encoder that takes question and table as input and tokenizes them (steps 1 and 2 in Fig.~\ref{fig:overview}) followed by assigning a relevance score to each table token (step 3 in Fig.~\ref{fig:overview}). The relevance score is then multiplied with the corresponding token embedding at the time of giving it as input to QA LLM encoder (step 7 in Fig.~\ref{fig:overview}). This ensures that noisy content with lower relevance score get suppressed and the QA LLM can focus on relevant tokens. The unsupervised relevance scorer is connected to QA LLM in a differentiable manner enabling it to be trained through answer generation loss (step 8 in Fig.~\ref{fig:overview}). 
+
+Even though answer generation loss enables learning of unsupervised relevance scorer, it acts as an indirect training signal. To aid relevance scoring, we propose a weakly supervised module: \textbf{2) Relevant Cell Predictor through Table Parsing} that parses table conditioned on question to highlight cells containing relevant information (steps 4 and 5 in Fig.~\ref{fig:overview}). It comprises two sub-steps where we first train a \textit{Parsing Statement Generator} that describes criteria in natural language about which rows and columns should be used to derive the answer (step 4 in Fig.~\ref{fig:overview}). Table cells corresponding to the criteria described in the parsing statement (step 5 in Fig.~\ref{fig:overview}) are highlighted such that score for content tokens in highlighted cells is boosted by combining it with unsupervised relevance score through a linear combination (step 6 in Fig.~\ref{fig:overview}). We conduct extensive ablations to establish efficacy for different modules (\S~\ref{sec:abl_exp_design}). We now discuss the details of each component.
+
+\begin{figure}[t]
+    \centering
+    \includegraphics[width=\textwidth]{figs/cabinet_final_arch_diag.pdf}
+    \caption{Overview of architecture of \approachname. The table is linearized (step 1) and embedded along with question through embedding layer of the underlying QA LLM (step 2). The embedded sequence is passed to the unsupervised relevance scorer that assigns a relevance score to each table token (step3). In parallel, the parsing statement generator describes the criteria for rows and columns relevant to deriving the answer (step 4) that is used to identify corresponding cells and assign a cell-based relevance score (step 5). The unsupervised and cell-based relevance is combined (step 6) and used to weigh the table content (step 7) to the QA LLM which generates the answer (step 8).}
+    \vspace{-4mm}
+    \label{fig:overview}
+\end{figure}
+
+\vspace{-2mm}
+\subsection{Unsupervised Relevance Scorer}
+\label{sec:meth_uns_relevance}
+\vspace{-2mm}
+The unsupervised relevance scorer is used to assign a score to table content tokens. Since annotating cells of a table relevant to a given question is tedious, the relevance scorer is unsupervised and gets trained along with QA LLM through answer generation loss. Formally, consider a pair of table $\mathcal{T}$ and a question $\mathcal{Q}$ about $\mathcal{T}$. $\mathcal{Q}_{tokens}=\{q_1, q_2, ..., q_{|Q|}\}$ represents the question tokens, $\mathcal{T} = \{c_{ij} | 1 \leq i \leq \text{N}_{row}, 1 \leq j \leq \text{N}_{col} \}$, where $\text{N}_{row}$ and $\text{N}_{col}$ indicate number of rows and columns in $\mathcal{T}$ respectively, and $c_{ij}$ represents string in cell in the $i^{th}$ row and $j^{th}$ column. To make $\mathcal{T}$ suitable to be fed as input to a transformer-based LLM, we follow the commonly used linearising scheme~\citep{liu2022tapex} where table is flattened as (step 1 in Fig.~\ref{fig:overview}):
+
+\begin{equation}
+\label{eq:table_flattening}
+\small
+    \mathcal{T}_{flattened} = [HEAD]:\ c_{11}\ |\ c_{12}\ | \cdots |\ c_{1N_{col}}\ |\ [ROW] 1: c_{21}\ | \cdots |\ c_{2N_{col}}\ |\ [ROW] 2: \cdots 
+\end{equation}
+
+$[HEAD]$ and $[ROW]k$ indicate start of column header row and $k^{th}$ data row respectively. We separate special tokens and cell content using pipe symbol `$|$'. The string in Equation~\ref{eq:table_flattening} is tokenized using the tokenizer of underlying QA LLM to obtain table tokens $\mathcal{T}_{tokens}=\{t_1, t_2, ..., t_{|\mathcal{T}_{tokens}|}\}$. $\mathcal{T}_{tokens}$ is concatenated to ${Q}_{tokens}$ to obtain $\mathcal{I}_{tokens} = (\mathcal{Q}_{tokens};\mathcal{T}_{tokens})$ which is given as input (steps 2 and 3 in Fig.~\ref{fig:overview}) to Unsupervised Relevance Scorer (URS) comprising a transformer encoder $TE_{URS}$. The contextualized representation $h_p \in \mathcal{R}^{d}$ of the $p^{th}$ token is estimated as:
+\vspace{-1mm}
+\begin{align}
+    \vspace{-7pt}
+    e_1^{URS}, e_2^{URS}, \cdots, &e_{|\mathcal{I}_{tokens}|}^{URS} =\ Embedding_{URS}(\mathcal{I}_{tokens}) \\
+    h_1, \cdots, h_p, \cdots, h_{|\mathcal{I}_{tokens}|} &= TE_{URS}(e_1^{URS}, e_2^{URS}, \cdots, e_{|\mathcal{I}_{tokens}|}^{URS})
+\end{align}
+
+\vspace{-2mm}
+We aim to predict relevance score for each table token, however, since annotations for relevant table parts are unavailable, token relevance is not explicitly observable and we consider it as a latent variable. Further, we hypothesize that the representation space of table tokens can be structured better for modeling relevance by clustering their encodings into two categories - relevant and non-relevant. Variational Inference (VI) has been commonly used to estimate latent variable probability and group data points on the basis of latent topics~\citep{srivastava2017autoencoding}. Hence, we estimate relevance $\eta_{p}^{uns}$ of table token $t_p$ ($|\mathcal{Q}_{tokens}| + 1 \leq p \leq |\mathcal{Q}_{tokens}| + |\mathcal{T}_{tokens}|$) as (step 3 in Fig.~\ref{fig:overview}):
+\vspace{-1mm}
+\begin{align}
+    \vspace{-10pt}
+        \mu_p &= \phi_\mu(h_p);\ \  \sigma_p = \phi_\sigma (h_p) \\
+        \eta_{p}^{uns}  &= sigmoid(z_p);\ \ z_p = \mu_p +  s*\sigma_p
+\end{align}
+
+\vspace{-3mm}
+$s$ is sampled from standard normal distribution, $\phi_\mu$ and $\phi_\sigma$ are FC layers with weights $W_\mu \in \mathcal{R}^{d \times 1}$ and $W_\sigma \in \mathcal{R}^{d \times 1}$, $sigmoid$ is applied to normalize the relevance score in the range 0 to 1. To enable the relevance scorer to assign appropriate scores, we structure the latent space of $TE_{URS}$ by clustering table tokens into relevant and non-relevant. We use the method of \citet{JMLR:v9:vandermaaten08a} (details in appendix \ref{sec:cluster}) which performs clustering in a trainable manner using clustering loss $\mathcal{L}_{clu}$ . We apply $\mathcal{L}_{clu}$ over latent representation $h_p$ of tokens which enables us to tune $TE_{URS}$ for clustering. During experiments, we observed that unit vectors for cluster centroids $\mu_{relevant}^{clu}$ and $\mu_{irrelevant}^{clu}$ are not well separated. To mitigate this, we enforce a separation loss $\mathcal{L}_{sep}$ that increases the distance between unit vectors representing cluster centroids: 
+\begin{equation}
+    \vspace{-10pt}
+    \mathcal{L}_{sep} = 2 - \Big|\Big| \mu_{relevant}^{clu} - \mu_{irrelevant}^{clu} \Big|\Big|^2
+    \label{eqn:sep_loss}
+\end{equation}
+
+Further, it is desirable that relevance scores for tokens in one cluster (corresponding to irrelevant tokens) are low. To achieve this, we apply a sparsification loss $\mathcal{L}_{sparse}$ where the score logit $z_p$ is exponentiated with a negative coefficient to push logit values for relevant and irrelevant clusters to $\infty$ and $-\infty$ respectively that enables final score (after applying $sigmoid$) to be close to 1 and 0:
+\vspace{-3mm}
+
+\begin{equation}
+    \vspace{-10pt}
+    \mathcal{L}_{sparse} = \frac{1}{|\mathcal{T}_{tokens}|} \sum_p \mathrm{e}^{-z_{p}^2} ;\ |\mathcal{Q}_{tokens}|+1 \leq p \leq |\mathcal{Q}_{tokens}|+|\mathcal{T}_{tokens}| 
+\end{equation}
+
+At the time of providing question and table as input to transformer encoder $TE_{QA}$ of the QA LLM, embedding ($e_p^{'}$) corresponding to question tokens is used as is while embedding of each table token is multiplied by its corresponding relevance score (steps 7 and 8 in Fig.~\ref{fig:overview}):
+\begin{align}
+    \vspace{-10pt}
+    e_1, e_2, \cdots, e_{|\mathcal{I}_{tokens}|} =\ &Embedding_{QA}(\mathcal{I}_{tokens}) \\
+    \label{eq:final_rel_score}
+    e_p^{'} =\ \eta_{p} \odot e_p;\ \ |\mathcal{Q}_{tokens}|+&1\leq p \leq |\mathcal{Q}_{tokens}| + |\mathcal{T}_{tokens}| \\
+    h_1^{'}, \cdots, h_{|\mathcal{I}_{tokens}|}^{'} &= TE_{QA}(e_1^{'}, e_2^{'}, \cdots, e_{|\mathcal{I}_{tokens}|}^{'}) \\ 
+    a_1, a_2, \cdots, a_N &= TD_{QA}(h_1^{'}, \cdots, h_{|\mathcal{I}_{tokens}|}^{'}) 
+\end{align}
+
+\vspace{-3mm}
+`$\odot$' indicates scalar multiplication with vector operation, $TD_{QA}$ represents the transformer decoder of the QA LLM that generates the answer tokens $a_n$ sequentially. $TE_{URS}$, $TE_{QA}$ and $TD_{QA}$ are trained in an end-to-end manner through cross-entropy loss $\mathcal{L}_{CE}$ between the generated and ground-truth answer tokens. Thus, the total loss $\mathcal{L}$ becomes:
+\begin{equation}
+    \mathcal{L} = \mathcal{L}_{CE} + \lambda_{clu}*\mathcal{L}_{clu} + \lambda_{sep}*\mathcal{L}_{sep} + \lambda_{sparse}*\mathcal{L}_{sparse}
+\end{equation}
+
+\vspace{-2mm}
+The answer generation loss acts as an indirect training signal for relevance scorer. To aid unsupervised scorer, we propose a weakly-supervised module (trained separately from URS and QA LLM) that highlights relevant cells (discussed in next subsection). Table tokens for highlighted cells are assigned cell-based score $\eta_p^{cell}$ that is combined with unsupervised relevance score $\eta_{p}^{uns}$ through linear combination (step 6 in Fig.~\ref{fig:overview}). Thus, final relevance score $\eta_p$ used in Eq.~\ref{eq:final_rel_score} is:
+\vspace{-1mm}
+\begin{equation}
+\label{eq:lin_comb_eta}
+    \vspace{-7pt}
+    \eta_p = \lambda_{uns}*\eta_p^{uns} + \lambda_{cell}*\eta_p^{cell}
+\end{equation}
+
+\subsection{Relevant Cell Predictor through Table Parsing}
+\label{sec:highlight}
+
+As discussed above, we train a separate module to highlight table cells relevant to a given question in a weakly-supervised manner. Since there is no Table QA dataset that contains annotations for table cells useful to answer a given question, we adopt a two-stage approach where we first train a \textit{Parsing Statement Generator} (step 4 in Fig.~\ref{fig:overview}) to generate a natural language text describing criteria for rows and columns relevant to the given question. Subsequently, we train another model that takes the parsing statement and table as input to identify the cells matching the criteria (step 5 in Fig.~\ref{fig:overview}).
+
+\textbf{Parsing Statement Generator (PSG)} comprises a pre-trained LLM - Flan T5-xl~\citep{chung2022scaling} that is fine-tuned to take the question and table as input ($\mathcal{I}_{tokens}$) to generate a parsing statement $text_{parse}$ (step 4 in Fig.~\ref{fig:overview}). The statement describes criteria stating which rows and columns are useful to derive the answer. To bootstrap training of PSG, we manually annotate very few ($\sim$300) question-table pairs with parsing statement. For instance, for table and question shown in Figure~\ref{fig:overview}, we annotate parsing statement as `\textit{To derive answer, note the values of higher score in rows with result as loss}'. To circumvent annotating samples for each table QA dataset, we choose WikiTableQuestions (WikiTQ) dataset~\citep{DBLP:journals/corr/PasupatL15} to select the samples for annotation since it is the most complex QA dataset containing a variety of samples. We sample diverse set of questions for annotation (please refer appendix \ref{sec:ques_cluster} for details and examples). The sampled question along with its table are manually annotated with parsing statement which is used to fine-tune PSG. The trained PSG model is then used to generate parsing statement for any question-table pair from datasets studied for experiments. We release the dataset of manually annotated parsing statements.
+
+\textbf{Cell Highlighting based on Parsing Statement:} To identify table cells for the criteria described in the parsing statement $text_{parse}$, we need a way to map the statement to corresponding cells. To this end, we use ToTTo dataset~\citep{parikh-etal-2020-totto} that contains samples of (table, list of highlighted cell coordinates) pairs. Each pair is accompanied by a text description summarising the content of the corresponding list of cells. We fine-tune a cell highlighting model $Cell\_Highlighter_{LLM}$ comprising of Flan T5-xl on ToTTo dataset where the table and summarising text are given as input to generate the content of corresponding highlighted cells. Once $Cell\_Highlighter_{LLM}$ is trained, we provide the table and $text_{parse}$ as input to identify and generate content of corresponding cells. For instance, consider example in Figure~\ref{fig:overview}, given the parsing statement shown in figure as input, the cell predictor generates $'38-12\ \|\ loss\ \|\ 45-0\ \|\ loss\ \| ...'$ (step 5). More formally,
+\begin{align}
+    \vspace{-10pt}
+  c_{1}^{highlighted} \ ||\ \cdots\ ||\ c_{M}^{highlighted} = Cell\_Highlighter_{LLM}(\mathcal{T}, text_{parse})
+      \vspace{-10pt}
+\end{align}
+$c_{r}^{highlighted}$ represents the string of $r^{th}$ highlighted cell predicted based on parsing statement. $M$ is a variable number, `$||$' is a delimiter to separate cell content. For $1 \leq r \leq M$, if $c_{r}^{highlighted}$ exactly matches with the content of some cell in $\mathcal{T}$, then the tokens $t_p$ of matching cell is assigned a cell relevance score ($\eta_p^{cell}$) of 1. $\eta_p^{cell}$ is set to 0 for table tokens belonging to cells in $\mathcal{T}$ whose content does not match with any $c_{r}^{highlighted}$. $\eta_p^{cell}$ is then combined with unsupervised relevance score $\eta_p^{uns}$ as in Eq.~\ref{eq:lin_comb_eta}. We now discuss experiments performed to validate the efficacy of our approach.
+
+\section{Experiments and Evaluation}
+\label{sec:exp_and_eval}
+\vspace{-2mm}
+
+\noindent
+\textbf{Implementation Details:} For the encoder ($TE_{QA}$) and decoder ($TD_{QA}$) of the QA LLM, we employ the OmniTab~\citep{jiang-etal-2022-omnitab} backbone (pre-trained for table understanding) comprising of BART-Large~\citep{lewis-etal-2020-bart}. The embeddings of unsupervised relevance scorer (URS), $Embedding_{URS}$, and QA model, $Embedding_{QA}$, are shared. URS encoder ($TE_{URS}$) is initialized with the architecture and weights of QA LLM encoder ($TE_{QA}$), though they do not share weights during QA training. Consequently, the hidden dimension $d$ of $TE_{URS}$ is 1024. We train \approachname\ and baselines (wherever needed) for 30 epochs on an effective batch size (BS) of 128 using 8 80GB A100 GPUs (BS of 8/GPU with gradient accumulation 2) using a learning rate of $1e^{-5}$ with cosine annealing~\citep{loshchilov2017sgdr} through AdamW optimizer~\citep{loshchilov2018decoupled}.
+
+\noindent
+\textbf{Datasets and Evaluation Metrics:} We evaluate \approachname\ on three commonly used datasets --
+\textit{(i)} \textbf{WikiTableQuestion (WikiTQ)}~\citep{DBLP:journals/corr/PasupatL15} which is one of the most commonly used and highly complex datasets consisting of about $2100$ HTML tables from Wikipedia and about $22,033$ questions that require complex operations such as comparison, aggregation, and arithmetic operations to arrive at the answer;  
+\textit{(ii)} \textbf{FeTaQA}~\citep{nan-etal-2022-fetaqa}, a challenging dataset consisting of about $10,000$ questions that have a long-form natural language answer ($18$ words on average) such that it requires fetching multiple entities from the table, aggregating and reasoning over these entities, and structuring the inferred information to produce a coherent answer; 
+and \textit{(iii)} \textbf{WikiSQL}~\citep{zhongSeq2SQL2017} that comprises roughly $80,654$ questions over $24,241$ Wikipedia tables. It also provides the equivalent SQL query for each question to obtain the correct answer. While we do not generate SQL (or other implicit logical forms) and only use the natural language questions and answers from this dataset, it serves as a useful benchmark to compare \approachname\ with table understanding methods that generate explicit logical forms to extract relevant answers from table. 
+The ground-truth answers in both WikiTQ and WikiSQL datasets are short (1-2 words). Hence, we use exact-match accuracy (Acc.) to compare various methods. For FetaQA dataset, ground-truth answers being long-form ($\approx 18$ words on average), we employ commonly used overlap-based metric Sacre-BLEU (S-BLEU)~\citep{post-2018-call}. We report performance on test split for all datasets.
+
+\subsection{Performance of \approachname\ on Table QA}
+\label{sec:main_res}
+
+\begin{wraptable}{R}{0.45\linewidth}
+    \centering
+    \small
+    \vspace{-10pt}
+    \caption{Comparison of \approachname\ with different baselines on WikiTQ. \approachname\ achieves significantly better accuracy.}
+    \resizebox{\linewidth}{!}{%
+    \begin{tabular}{@{}lcc@{}}
+    \toprule
+        \textbf{Method} & \textbf{Acc.} & \textbf{\# params}\\
+        \midrule
+        \textbf{Fine-tuning Table-specific LLMs} & & \\
+        TAPAS~\citep{herzig-etal-2020-tapas} & 48.8 & 345 M\\
+        TaBERT~\citep{yin-etal-2020-tabert} & 52.3 & 345 M\\
+        MATE~\citep{eisenschlos-etal-2021-mate} & 51.5 & 340 M\\
+        GraPPa~\citep{yu2021grappa} & 52.7 & 355 M\\
+        DoT~\citep{krichene-etal-2021-dot} & 54.0 & 299 M\\
+        TableFormer~\citep{yang-etal-2022-tableformer} & 52.6 & 345 M\\
+        TAPEX~\citep{liu2022tapex} & 55.5 & 405 M\\
+        ReasTAP~\citep{zhao-etal-2022-reastap} & 58.6 & 406 M\\
+        TaCube~\citep{zhou-etal-2022-tacube} & 60.8 & 406 M\\
+        OmniTab~\citep{jiang-etal-2022-omnitab} & 62.7 & 406 M\\
+        & \\
+        \textbf{Fine-tuning text-based LLMs} & & \\
+        T5-3b~\citep{xie-etal-2022-unifiedskg}) & 49.3 & 2.9 B\\
+        FlanT5-xl~\citep{chung2022scaling} & 64.4 & 2.9 B\\
+        & & \\
+        \textbf{Few/zero shot Prompting of LLMs} & & \\
+        Codex~\citep{10.1145/3539618.3591708} & 47.6 & 175 B\\
+        Codex-COT~\citep{chen-2023-large} & 48.8 & 175 B \\
+        Binder~\citep{cheng2023binding} & 64.6 & 175 B\\
+        LEVER~\citep{ni2023lever} & 65.8 & 175 B\\
+        DATER~\citep{10.1145/3539618.3591708} & 65.9 & 175 B\\
+        ChatGPT~\citep{jiang2023structgpt} & 43.3 & 175 B\\
+        StructGPT~\citep{jiang2023structgpt} & 48.4 & 175 B\\
+        \\
+        \midrule
+        \textbf{\approachname\ (Ours)} & \textbf{69.1} & 560 M\\
+        \bottomrule
+    \end{tabular}}
+    \vspace{-10pt}
+    \label{tab:da_wikitq}
+\end{wraptable}
+
+We present a detailed comparative analysis of results achieved by \approachname\ with a variety of baselines. We consider three different categories of methods -- \textit{(i)} LLMs specifically pre-trained for table understanding and fine-tuned for QA, such as TAPEX~\citep{liu2022tapex}, ReasTAP~\citep{zhao-etal-2022-reastap} and OmniTab~\citep{jiang-etal-2022-omnitab};  \textit{(ii)} fine-tuning LLMs (pre-trained on text only) such as T5-3b~\citep{JMLR:v21:20-074} and Flan T5-xl~\citep{flan-t5}; and \textit{(iii)} {few or zero shot prompting} of LLMs like StructGPT~\citep{jiang2023structgpt} and approaches that employ such LLMs for in-context learning like LEVER~\citep{ni2023lever}, BINDER~\citep{cheng2023binding} and DATER~\citep{10.1145/3539618.3591708}.% since we use the Flan model to generate the parsing statement and corresponding cells in our approach.
+
+Table~\ref{tab:da_wikitq} presents the performance of various methods on the WikiTQ dataset, and we can observe \approachname\ with an accuracy of $\mathbf{69.1\%}$ outperforms the best-performing baselines in each of the three categories and establishes new state-of-the-art. Specifically, \approachname\ outperforms OmniTab, DATER, and fine-tuned Flan T5-xl by $6.4\%$, $3.2\%$ and $4.7\%$, in absolute terms, respectively. Also, note that simple prompting of ChatGPT does not work well for Table QA. We want to highlight that \approachname\ performs much better than GPT-3 and Codex-based SoTA in-context learning methods despite containing orders of magnitude fewer parameters.
+
+Similar observations hold for FeTaQA (Table~\ref{tab:sb_fetaqa}) and WikiSQL (Table~\ref{tab:da_wikisql}) datasets where \approachname\ achieves new SoTA performance. For generating long descriptive answers for questions in FeTaQA, \approachname\ achieves SoTA S-BLEU of $\mathbf{40.5}$ outperforming OmniTab, fine-tuned Flan T5-xl and DATER by a margin of $5.6$, $4.3$ and $9.6$ absolute percentage points, respectively. We report performance only for baselines that have explored the dataset in their work (except for T5 and Flan T5). We use their code/API for evaluation if available or else specify performance as reported in their paper. Similarly, for WikiSQL dataset, \approachname\  pushes the SoTA by $0.7\%$ on already high performance of ReasTAP (current SoTA). Since best performance on WikiSQL is already high, the absolute performance gains of $0.7\%$ should be interpreted as a proportion of scope of further improvement possible, i.e., $0.7/(100-88.8)$, which is $\approx6\%$.
+
+\begin{table}[t]
+    \begin{minipage}{.49\textwidth}
+    \centering
+    \small
+     \caption{Comparison with different categories \\ of baselines on FeTaQA. \approachname\ achieves \\ significantly better Sacre-BLEU (S-BLEU).}
+    \label{tab:sb_fetaqa}
+    \resizebox{\textwidth}{!}{%
+        \begin{tabular}{@{}lcc@{}}
+    \toprule
+        \textbf{Method} & \textbf{S-BLEU} & \textbf{\# params}\\
+        \midrule
+        \textbf{Fine-tuning Table-specific LLMs} & & \\
+        PeaQA~\citep{pal-etal-2022-parameter} & 33.5 & 406 M \\
+        TAPEX~\citep{liu2022tapex} & 34.7 & 406 M\\
+        OmniTab~\citep{jiang-etal-2022-omnitab} & 34.9 & 406 M\\
+        & & \\
+        
+        \textbf{Fine-tuning text-based LLMs} && \\
+        T5-small~\citep{nan-etal-2022-fetaqa} & 21.6 & 60 M\\
+        T5-base~\citep{nan-etal-2022-fetaqa} & 28.1 & 222 M\\
+        T5-large~\citep{nan-etal-2022-fetaqa} & 30.5 & 738 M\\
+        T5-3b~\citep{xie-etal-2022-unifiedskg} & 33.4 & 2.9 B\\
+        FlanT5-xl & 36.2 & 2.9 B\\
+        & & \\
+        
+        \textbf{Few/zero shot Prompting of LLMs} & & \\
+        Codex-COT ~\citep{chen-2023-large} & 27.0 & 175 B \\
+        Codex~\citep{10.1145/3539618.3591708} & 27.9 & 175 B\\
+        DATER~\citep{10.1145/3539618.3591708} & 30.9 & 175 B\\
+        \midrule
+        \textbf{\approachname\ (Ours)} & \textbf{40.5} & 560 M\\
+        \bottomrule
+    \end{tabular}}
+    \end{minipage} 
+    \hfill
+    \begin{minipage}{0.49\textwidth}
+    \centering
+    \small
+    \caption{Comparison with different categories of baselines on WikiSQL. \approachname\ achieves better Accuracy (Acc.).}
+        \label{tab:da_wikisql}
+      \resizebox{0.93\textwidth}{!}{%
+        \begin{tabular}{@{}lcc@{}}
+        \toprule
+        \textbf{Method} & \textbf{Acc.} & \textbf{\# params}\\
+        \midrule
+        \textbf{Fine-tuning Table-specific LLMs} & & \\
+        TAPAS~\citep{herzig-etal-2020-tapas} & 86.4 & 345 M\\
+        GraPPa~\citep{yu2021grappa} & 84.7 & 355 M\\
+        DoT~\citep{krichene-etal-2021-dot} & 85.5 & 299 M\\
+        TAPEX~\citep{liu2022tapex} & 86.4 & 406 M\\
+        OmniTab~\citep{jiang-etal-2022-omnitab} & 87.9 & 406 M\\
+        UTP~\citep{chen2023bridge} & 88.1 & 345 M \\
+        ReasTAP~\citep{zhao-etal-2022-reastap} & 88.8 & 406 M\\
+        & & \\
+
+        \textbf{Fine-tuning text-based LLMs} & & \\
+        T5-3b~\citep{xie-etal-2022-unifiedskg} & 85.9 & 2.9 B\\
+        FlanT5-xl & 87.8 & 2.9 B\\
+        & & \\
+        
+        \textbf{Few/zero shot Prompting of LLMs} & & \\
+        ChatGPT~\citep{jiang2023structgpt} & 51.6 & 175 B\\
+        StructGPT~\citep{jiang2023structgpt} & 54.4 & 175 B\\
+        \midrule
+        \textbf{\approachname\ (Ours)} & \textbf{89.5} & 560 M\\
+        \bottomrule
+    \end{tabular}}
+    \end{minipage}
+\end{table}
+
+\subsection{How Robust is \approachname\ to Noise and Irrelevant Information?}
+\label{sec:robustness}
+Despite the remarkable success of transformer-based models on table understanding, they are sensitive to noise and perturbations to the tabular data~\citep{pi-etal-2022-towards,yang-etal-2022-tableformer,robut}. We examine the robustness and sensitivity of  \approachname\  towards noise while performing Table QA. We introduce noise by perturbing tables in test split and report the relative percentage drop in performance. We perform four types of perturbations: \textbf{1) Row Addition (RA):} insert noise into a table by adding rows from another table that contains same number of columns; \textbf{2) Row Permutation (RP):} randomly permute ordering of rows~\citep{pi-etal-2022-towards}; \textbf{3) Column Permutation (CP):} randomly permute column ordering; and \textbf{(4) Cell Replacement (CR):} replace content of certain cells with content from some other table. We perform each perturbation separately to obtain four perturbed test splits for each dataset. Please see appendix \ref{sec:table_perturb_details} for further details about the procedure.
+
+Figure~\ref{fig:perturbation} summarizes the relative drop in performance of \approachname\ and the dataset-specific best baseline for the three datasets. Note that for all the perturbation categories, \approachname\ leads to significantly less drop in performance when compared with the corresponding baseline, highlighting the robustness and ability of \approachname\ to identify the relevant portions of the underlying table. Specifically, \approachname\ is significantly less sensitive to row and column permutations (RP and CP), indicating that relevance scoring of tokens helps the QA LLM to focus more on relevant information and reduces the potential ordering biases commonly observed in models pre-trained on tabular data~\citep{yang-etal-2022-tableformer}. For the cell replacement (CR) and row addition (RA) perturbations, where extraneous information is explicitly added to the table, the drop in performance suffered by \approachname\ is significantly less compared to the baselines owing to the superior ability of \approachname\ to identify relevant information. For instance, in the case of WikiTQ, the relative drop in performance for RA is $\approx19\%$ for OmniTab,  almost $40\%$ higher than \approachname\ ($\approx11.5\%$). This consistent trend holds for FeTaQA and WikiSQL datasets as well.
+
+        
+        
+
+        
+
+\begin{figure}[t]
+     \centering
+     \begin{subfigure}[b]{0.32\textwidth}
+         \centering
+         \includegraphics[width=\textwidth]{figs/perturb_wikitq.pdf}%{figs/wikitq_perturb_no_deletion.pdf}
+         \caption{WikiTQ}
+         \label{fig:wikitq_perturb}
+     \end{subfigure}
+     \hfill
+     \begin{subfigure}[b]{0.32\textwidth}
+         \centering
+         \includegraphics[width=\textwidth]{figs/perturb_fetaqa.pdf}%{figs/fetaqa_perturb_no_deletion.pdf}
+          \caption{FeTaQA}
+         \label{fig:fetaqa_perturb}
+     \end{subfigure}
+     \hfill
+     \begin{subfigure}[b]{0.32\textwidth}
+         \centering
+         \includegraphics[width=\textwidth]{figs/perturb_wikisql.pdf}%{figs/wikisql_perturb_reastap.pdf}
+          \caption{WikiSQL}
+         \label{fig:wikisql_perturb}
+     \end{subfigure}
+    \caption{Relative performance drop (\%) with perturbations (RA - Row Addition, RP - Row Permutation, CP - Column Permutation, CR - Cell Replacement). We compare \approachname\ (green) with OmniTab (red) on WikiTQ and FeTaQA ; and against ReasTAP (red) on WikiSQL. \approachname\ is more robust to addition of noise to table and shuffling of row and column ordering.}
+    \label{fig:perturbation}
+\end{figure}
+
+\begin{figure}[t]
+     \centering
+     \begin{subfigure}{0.32\textwidth}
+         \centering
+         \includegraphics[width=\textwidth]{figs/size_wikitq.pdf}%{figs/wikitq_size_perf.png}
+          \caption{WikiTQ}
+         \label{fig:wikitq_size_perf}
+     \end{subfigure}
+     \hfill
+     \begin{subfigure}[b]{0.32\textwidth}
+         \centering
+         \includegraphics[width=\textwidth]{figs/size_fetaqa.pdf}%{figs/feta_size_perf.png}
+         \caption{FeTaQA}
+         \label{fig:feta_size_perf}
+     \end{subfigure}
+     \hfill
+     \begin{subfigure}[b]{0.32\textwidth}
+         \centering
+         \includegraphics[width=\textwidth]{figs/size_wikisql.pdf}%{figs/wikisql_size_perf.png}
+         \caption{WikiSQL}
+         \label{fig:wikisql_size_perf}
+     \end{subfigure}
+    \caption{Variation in performance with table size (\# cells). We compare \approachname\ (green) with OmniTab (red) on WikiTQ (left) and FeTaQA (middle), and against ReasTAP (red) for WikiSQL (right). It can be seen that \approachname\ performs much better than the baselines on larger tables.}
+    \vspace{-14pt}
+    \label{fig:perf_vs_size}
+\end{figure}
+
+\subsection{Impact of Table Size on Performance}
+\label{subsec:size_abl}
+\vspace{-1mm}
+We now study how \approachname\ performs with tables of different sizes. Tables typically comprise a large amount of data, so the entire information is usually not required to answer a given question and acts as \textit{distracting information}~\citep{neeraja-etal-2021-incorporating}. This noise or irrelevant data poses a severe challenge for table understanding models and leads to poor generalization for larger tables~\citep{kumar-etal-2023-multi, chen-2023-large}. We consider the number of cells in the table as a proxy for its size and bin all the questions in the three datasets into six categories based on the number of cells (Figure~\ref{fig:perf_vs_size}) and compare the performance of \approachname\ with dataset-specific best-performing baseline. We note that for all the datasets, while model performance drops with increasing table size, \approachname\ consistently and significantly outperforms the baseline methods across all table size categories. Moreover, the differences become starker for larger tables. For instance, for the largest tables in FeTaQA, \approachname\ achieves double the S-BLEU scores compared to OmniTab ($36$ vs. $18$). Similarly, for the other two datasets, \approachname\ achieves significantly high performance for the largest tables ($>500$ cells) compared to the baselines -- accuracy of $38$ vs. OmniTab's $28$ for WikiTQ  and $79$ vs. ReasTAP's $70$ for WikiSQL. These empirical observations provide further evidence for \approachname's ability to identify relevant content, making the QA LLM relatively robust to table size.
+
+\vspace{-2mm}
+\subsection{Discussion on the impact of different Design Choices for \approachname}
+\label{sec:abl_exp_design}
+\vspace{-1mm}
+\begin{table}[t]
+    \begin{minipage}{.47\textwidth}
+    \centering
+    \small
+        \caption{Effect of applying clustering ($\mathcal{L}_{clu}$), centroid separation ($\mathcal{L}_{sep}$) and relevance score sparsification loss ($\mathcal{L}_{sparse}$). Clustering table tokens by enforcing sparsity in relevance scores and distance between cluster centroids improves performance.}
+    \label{tab:loss_contri}
+    \resizebox{\linewidth}{!}{%
+       \resizebox{\linewidth}{!}{\begin{tabular}{@{}ccc|ccc@{}}
+        \toprule
+        $\mathcal{L}_{clu}$  & $\mathcal{L}_{sep}$ & $\mathcal{L}_{sparse}$
+        & \textbf{WikiTQ} & \textbf{FeTaQA}  & \textbf{WikiSQL} \\
+        \midrule
+         \xmark  & \xmark & \xmark & 60.8  & 35.1 & 86.2 \\
+         \xmark  & \xmark & \cmark & 60.9  & 35.1 & 86.3 \\
+         \cmark  & \xmark & \xmark & 62.7  & 35.0 & 88.9 \\ 
+         \cmark  & \xmark & \cmark & 61.0 & 35.0  & \textbf{89.5} \\ 
+         \cmark  & \cmark & \xmark & 61.0  & 35.1 & 89.1 \\ 
+         \cmark  & \cmark & \cmark & \textbf{65.6} & \textbf{35.8} & 89.3 \\ 
+        \bottomrule
+    \end{tabular}}
+    }
+    \vspace{-10pt}
+    \end{minipage} 
+    \hfill
+    \begin{minipage}{0.49\textwidth}
+    \centering
+    \small
+            \caption{Impact of combining unsupervised relevance score (weight $\lambda_{uns}$) and weakly-supervised cell-based relevance score (weight $\lambda_{cell}$). Fusing the relevance from both components gives optimal performance.}
+    \label{tab:rel_weight}
+      \resizebox{0.95\linewidth}{!}{%
+        \begin{tabular}{@{}cc|ccc@{}}
+        \toprule
+         \textbf{$\lambda_{uns}$} &  \textbf{$\lambda_{cell}$} & \textbf{WikiTQ}  & \textbf{FeTaQA}, & \textbf{WikiSQL}\\
+         \midrule
+         1 & 0 & 65.6 & 35.8 & \textbf{89.2} \\
+         0.7 & 0.3 & \textbf{69.1} & \textbf{40.5} & \textbf{89.2} \\
+         0.5 & 0.5 & 68.6 & \textbf{40.5} & 88.9 \\
+         0.3 & 0.7 & 67.0 & 38.9 & 88.8 \\
+         0 & 1 & 37.6 & 24.2 & 34.1  \\
+         \bottomrule
+    \end{tabular}}
+    \end{minipage}
+\end{table}
+
+\textbf{Effect of Clustering Table Tokens:} We study the impact of clustering the table tokens using their latent representations (discussed in Section~\ref{sec:meth_uns_relevance}). To do so, we toggle the clustering loss ($\mathcal{L}_{clu}$), cluster centroids separation loss ($\mathcal{L}_{sep}$), and score sparsification loss ($\mathcal{L}_{sparse}$) by setting their weight ($\lambda_{clu}$, $\lambda_{sep}$, $\lambda_{sparse}$) to 0 or 1. For this study, we only use unsupervised relevance scorer by turning off weakly supervised cell predictor to eliminate other influencing factors. Results are summarized in Table~\ref{tab:loss_contri} where we can observe that applying all three losses yields the best performance (row 6). Specifically, for WikiSQL, clustering improves performance when score sparsification loss is applied (row 4 vs. row 3) which is due to the fact that sparsification enables categorizing scores into low and high. For WikiTQ and FeTaQA, adding the cluster centroids separation loss further increases the efficacy of clustering and sparsification yielding the best results.
+
+\textbf{Combining Unsupervised Relevance Scorer with Cell Predictor:} We vary the relative importance given to relevance score predicted by unsupervised relevance scorer and weakly-supervised cell predictor by varying $\lambda_{uns}$ and $\lambda_{cell}$ in Eq.~\ref{eq:lin_comb_eta}. Table~\ref{tab:rel_weight} shows that combining the two modules yields much better accuracy for WikiTQ and FeTaQA compared to just using unsupervised relevance scorer (row 1 vs. row 2). This highlights that the weakly-supervised cell predictor complements unsupervised scorer by identifying further relevant table content (Figure~\ref{fig:cluster_vis} depicts qualitative visualisation for the same). For WikiSQL, same performance is observed with and without the cell predictor. Further it is observed that using only the cell predictor (last row) achieves significantly low performance due to the fact that the number of cells highlighted by the cell predictor is much lesser resulting in assigning a score of zero to most table content in cases where it misses to identify important cells.
+
+We show that \approachname\ can be used with TAPEX backbone (instead of OmniTab) to improve TAPEX performance showing the generality of our framework (Appendix~\ref{sec:tapex_cabinet}). We show that giving parsing statement as input to QA LLM, replacing URS with off-the-shelf BERT based similarity metric for relevance scoring, and using question directly instead of parsing statement to generate highlighted cells gives sub-optimal performance compared to \approachname, hence, justifying our design choice (Appendix~\ref{app:reason_as_input}). Further, we show a case study to justify the rationale behind how clustering losses interact to yield improvements in Appendix~\ref{app:case_study}.
+
+ 
+
+\begin{figure}[t]
+    \centering
+    \includegraphics[width = \textwidth]{figs/clustering_vis.pdf}
+    \caption{Visualisation depicting that Unsupervised Relevance Scorer (URS) assigns higher score to table parts relevant to the question (rows where ``two and a half men" either won or got nominated for an award). Further, the weakly-supervised parsing statement based relevant cell predictor identifies the cells for the row missed by URS (year 2006, golden icon award best actor - comedy series)}
+    \vspace{-10pt}
+    \label{fig:cluster_vis}
+\end{figure}
+
+\section{Conclusions}
+\vspace{-2mm}
+We studied the problem of question-answering over tables and focused on identifying the relevant portions of the table to derive the answer. Generally, only a small subset of the tabular data is required to answer the question, and owing to the vulnerability of LLMs to noise, the extraneous information leads to sub-optimal performance. This problem is further exacerbated in the case of large tables. Our proposed framework, \approachname\, addresses this issue by weighing the table content based on its relevance to the question, identifying the relevant rows and columns, and highlighting the content of the relevant cells. \approachname\ establishes new SoTA on three commonly used challenging benchmarks, outperforming table-specific models, as well as methods that employ in-context learning with much larger GPT-3 scale models. We show empirically that \approachname\ is more robust to noise and generalizes well for larger tables, indicating its efficacy in mitigating noise and overcoming table structural biases typically learned during training.
+
+ 
+
+\section{Ethics and Reproducibility Statement}
+We use publicly available datasets and LLMs (which are commonly used) to conduct the study in our work. The only data that we annotate is $\sim$ 300 samples of table-question pairs with parsing statement describing rows and columns relevant to question. The parsing statement were written keeping in mind the safety and ethics guidelines without any potential concerns. To encourage reproducibility, we release our code and datasets (including manually written parsing statements) at this anonymous \href{https://anonymous.4open.science/r/CABINET/}{link}. We describe the details of the datasets in \S~\ref{sec:exp_and_eval} (under `Datasets and Evaluation Metrics') and the LLMs used in \S~\ref{sec:exp_and_eval} (under `Implementation Details') and \S~\ref{sec:highlight}. Further, we provide the implementation details of our method in \S~\ref{sec:exp_and_eval} (under `Implementation Details') and discuss baselines used for comparison in \S~\ref{sec:main_res}. Finally, we elaborate further details of our method in Appendix - Trainable clustering over latent rerpesentation of table tokens (\ref{sec:cluster}), Details of parsing statement annotation procedure (\ref{sec:ques_cluster}) and Further details on table perturbation procedure (\ref{sec:table_perturb_details}).
+
+\end{document}

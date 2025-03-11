@@ -1,0 +1,1494 @@
+\title{\icon GLM-130B: An Open Bilingual Pre-Trained Model}
+
+\begin{document}
+
+\doparttoc
+\faketableofcontents
+
+\maketitle
+
+\renewcommand{\thefootnote}{\fnsymbol{footnote}}
+    \footnotetext[1]{The two lead authors AZ and XL contributed equally (\texttt{\{zengaohan,shawliu9\}@gmail.com})}
+    \footnotetext[2]{Work partially done when AZ, XL, and ZD interned at Zhipu.AI.}
+    \footnotetext[3]{Team leads: YD and JT. Corresponding author: JT (\texttt{jietang@tsinghua.edu.cn})}
+\renewcommand{\thefootnote}{\arabic{footnote}}
+
+\begin{abstract}
+
+We introduce \glm, a bilingual (English and Chinese) pre-trained language model with 130 billion parameters. 
+It is an attempt to open-source a 100B-scale model at least as good as 
+GPT-3 (davinci) and unveil how models of such a scale can be successfully pre-trained. 
+Over the course of this effort, we face numerous unexpected technical and engineering challenges, particularly on loss spikes and divergence. 
+In this paper, we introduce the training process of \glm including its design choices, training strategies for both efficiency and stability, and engineering efforts. 
+The resultant \glm model offers significant outperformance over GPT-3 175B (davinci) on a wide range of popular English benchmarks while the performance advantage is not observed in OPT-175B and BLOOM-176B. 
+It also consistently and significantly outperforms ERNIE TITAN 3.0 260B---the largest Chinese language model---across related benchmarks. 
+Finally, we leverage a unique scaling property of \glm to reach INT4 quantization without post training, with almost no performance loss, making it the first among 100B-scale models and more importantly, allowing its effective inference on 4$\times$RTX 3090 (24G) or 8$\times$RTX 2080 Ti (11G) GPUs, the most affordable GPUs required for using 100B-scale models. 
+The \glm model weights are publicly accessible and its code, training logs, related toolkit, and lessons learned are open-sourced at \url{https://github.com/THUDM/GLM-130B/}.
+\blfootnote{For detailed author contributions, please refer to Appendix~\ref{app:contribution}.}
+\end{abstract}
+
+\hide{%%%%%%%%%%%%%%%%%%%%
+
+\vspace{-8mm}
+\begin{abstract}
+We introduce \glm, an open and inclusive 130-billion parameters bilingual large language model (LLM).
+As an initial attempt from academia, we commit to promoting ``LLM Inclusivity'', which aims at offering highly accessible, usable, and transparent LLMs to all researchers and 
+individual developers.
+We share a series of 
+real lessons on architecture design, training strategies choice, and inference algorithm from our 8-month trajectory for developing an LLM.
+All these insights result in \glm, which achieves 
+better 
+performance than other LLMs including GPT-3 175B, OPT 175B, BLOOM 176B, and ERNIE Titan 3.0 on a number of English and Chinese benchmarks.
+In addition to its quality, GLM's special architecture and the scaling makes \glm the first LLM to be quantized into INT4 precision, which allows it to perform inference on popularized GPUs such as 4 $\times$ RTX 3090 (24G) or 8 $\times$ RTX 2080 Ti (11G).
+Together with our speeding up efforts, \glm can be up to 8.4$\times$ faster than BLOOM 176B's official implementation, making \glm a real inclusive LLM for everyone.
+The model weights and code are open-sourced at \url{https://anonymous.4open.science/r/GLM-130B/}.
+\end{abstract}
+
+}%%%%%%%%%%%%%%%%%%%%%%%
+
+\section{Introduction}
+Large language models (LLMs), particularly those with over 100 billion (100B) parameters~\citep{brown2020language,thoppilan2022lamda,rae2021scaling,chowdhery2022palm,wang2021ernie}, have presented attractive % but mysterious
+scaling laws~\citep{wei2022emergent}, where emergent zero-shot and few-shot capabilities suddenly arose.
+Among them, GPT-3~\citep{brown2020language} with 175B parameters pioneers the study of 100B-scale LLMs by strikingly generating better performance with 32 labeled examples than the fully-supervised BERT-Large model on a variety of benchmarks. 
+However, both GPT-3 (and many other closed-sourced 100B-scale ones)---the model itself---and how it can be trained, have been thus far intransparent to the public. 
+It is of critical value to train a high-quality LLM of such scale with both the model and training process shared with everyone.  %certainly with ethical concerns in mind. 
+
+We thus \textit{aim to pre-train an open and highly-accurate 100B-scale model} with ethical concerns in mind. 
+Over the course of our attempt, we have come to realize that pre-training a dense LLM at such a scale raises numerous unexpected technical and engineering challenges compared to training 10B-scale models, in terms of pre-training efficiency, stability, and convergence.  
+Similar difficulties have also been concurrently observed in training OPT-175B~\citep{zhang2022opt} and BLOOM-176B~\citep{scao2022what}, further demonstrating the significance of GPT-3 as a pioneer study. 
+
+\begin{figure}[t]
+    \centering
+    \vspace{-4mm}
+    \includegraphics[width=0.98\linewidth]{figures/intro.pdf}
+    \vspace{-4mm}
+    \caption{A summary of the performance evaluation 
+    and ethical studies.}
+    \label{fig:intro}
+    \vspace{-4mm}
+\end{figure}
+
+\begin{table}[t]
+\centering
+\footnotesize
+\renewcommand\tabcolsep{2.5pt}
+\renewcommand\arraystretch{0.9}
+
+\caption{A comparison between \glm and other 100B-scale LLMs and PaLM 540B. 
+(LN: layer norm.; 
+FPF: floating-point format; 
+MIP: multi-task instruction pre-training; 
+CN : Chinese)}
+\vspace{-4mm}
+\scalebox{0.9}{
+\begin{tabular}{@{}lcccccccc@{}}
+\toprule[1.2pt]
+                        &                                                                          & \multicolumn{3}{c}{Architecture \& Data}                                                                                                                                                                               & \multicolumn{2}{c}{Training}                                               & \multicolumn{2}{c}{Inference}                                                                                                                                \\ \cmidrule(l){3-5} \cmidrule(l){6-7} \cmidrule(l){8-9} 
+\multirow{-2}{*}{Model} & \multirow{-2}{*}{\begin{tabular}[c]{@{}c@{}}Open-\\ source\end{tabular}} & Objective                                                                                      & LN                                                   & Major Lang.                                                    & FPF  & Stabilization                                                       & Quantization                                        & GPU Needed                                                                                             \\ \midrule
+GPT-3 175B              & $\times$                                                                 &                                                                                                &                                                      & English                                                        & FP16 & {\color[HTML]{9B9B9B} \textit{\small{undisclosed}}}                 & {\color[HTML]{9B9B9B} \textit{\small{undisclosed}}} & {\color[HTML]{9B9B9B} \textit{\small{undisclosed}}}                                                    \\
+OPT-175B                & $\checkmark$                                                             &                                                                                                &                                                      & English                                                        & FP16 & Manual Adjusting                                                    & INT8                                                & 8 $\times$ 3090                                                                                        \\
+BLOOM-176B              & $\checkmark$                                                             & \multirow{-3}{*}{GPT}                                                                          & \multirow{-3}{*}{Pre-LN}                             & Multi-lingual                                                  & BF16 & Embedding Norm                                                      & INT8                                                & 8 $\times$ 3090                                                                                        \\ \midrule
+PaLM 540B               & $\times$                                                                 & GPT                                                                                            & Pre-LN                                               & English                                                        & BF16 & Manual Adjusting                                                    & {\color[HTML]{9B9B9B} \textit{\small{undisclosed}}} & {\color[HTML]{9B9B9B} \textit{\small{undisclosed}}}                                                    \\ \midrule
+\glm                    & $\checkmark$                                                             & {\color[HTML]{CB0000} \begin{tabular}[c]{@{}c@{}}GLM (Blank \\ Infilling \& MIP)\end{tabular}} & \begin{tabular}[c]{@{}c@{}}Deep-\\ Norm\end{tabular} & \begin{tabular}[c]{@{}c@{}}Bilingual\\ (EN \& CN)\end{tabular} & FP16 & \begin{tabular}[c]{@{}c@{}}Embedding\\ Gradient Shrink\end{tabular} & INT4                                                & {\color[HTML]{CB0000} \begin{tabular}[c]{@{}c@{}}4 $\times$ 3090 or\\ 8 $\times$ 1080 Ti\end{tabular}} \\ \bottomrule[1.2pt]
+\end{tabular}
+}
+\vspace{-6mm}
+\label{tab:intro}
+\end{table}
+
+In this work, we introduce the pre-training of a 100B-scale model---\glm, in terms of engineering efforts, model design choices, training strategies for efficiency and stability, and quantization for affordable inference. 
+As it has been widely realized that it is computationally unaffordable to empirically enumerate all possible designs for training 100B-scale LLMs, we present not only the successful part for training \glm but also many of the failed options and lessons learned. 
+Particularly, the training stability is {the} decisive factor in the success of training models of such a scale. 
+Different from practices such as manually adjusting learning rates in OPT-175B and using embedding norm in the sacrifice of performance in BLOOM-176B, we experiment with various options and find the strategy of embedding gradient shrink can significantly stabilize the training of \glm.  
+
+Specifically, \glm is a bilingual (English and Chinese) bidirectional dense model with 130 billion parameters, pre-trained over 400 billion tokens 
+on a cluster of 96 NVIDIA DGX-A100 (8$\times$40G) GPU nodes 
+between May 6 and July 3, 2022. 
+Instead of using the GPT-style architecture, we adopt the  General Language Model (GLM) algorithm~\citep{du2022glm} to leverage its bidirectional attention advantage and autoregressive blank infilling objective. 
+Table~\ref{tab:intro} summarizes the comparison between \glm, GPT-3 and another two open-source efforts---OPT-175B and BLOOM-176B, as well as PaLM 540B~\citep{chowdhery2022palm}---a 4$\times$ larger model---as a reference. 
+
+Altogether, the conceptual uniqueness and engineering efforts enable \glm to exhibit performance that surpasses the level of GPT-3 on a wide range of benchmarks (in total 112 tasks) and also outperforms PaLM 540B in many cases, while outperformance over GPT-3 has not been observed in OPT-175B and BLOOM-176B (Cf. Figure ~\ref{fig:intro} left). 
+For zero-shot performance, \glm is better than GPT-3 175B (+5.0\%), OPT-175B (+6.5\%), and BLOOM-176B (+13.0\%) on LAMBADA~\citep{paperno2016lambada}, and achieves 3$\times$ better performance than GPT-3 on Big-bench-lite~\citep{srivastava2022beyond}. 
+For the 5-shot MMLU~\citep{hendrycks2021measuring} tasks, it is  better than GPT-3 175B (+0.9\%) and BLOOM-176B (+12.7\%). 
+As a bilingual LLM also in Chinese, it offers significantly better results than ERNIE TITAN 3.0 260B~\citep{wang2021ernie}---the largest Chinese LLM---on 7 zero-shot CLUE~\citep{xu2020clue} datasets (+24.26\%) and 5 zero-shot FewCLUE~\citep{xu2021fewclue} ones (+12.75\%). 
+Importantly, as summarized in Figure~\ref{fig:intro} right, \glm as an open model is associated with \textit{significantly less bias and generation toxicity than its 100B-scale counterparts}. 
+
+Finally, we design \glm to empower as many people as possible to conduct 100B-scale LLM studies. 
+First, instead of using 175B+ parameters as OPT and BLOOM, the 130B size is decided because such a size supports inference on a single A100 (8$\times$40G) server. 
+Second, to further lower the GPU requirements, we quantize \glm into INT4 precision without post training  while OPT and BLOOM can only reach INT8. 
+Due to a unique property of the GLM architecture, \glm's INT4 quantization introduces negligible performance degradation, e.g., -0.74\% on LAMBADA and even +0.05\% on MMLU, making it still better than the uncompressed GPT-3. 
+This enables \glm's fast inference with performance guarantee on a server of 4$\times$RTX 3090 (24G) or 8$\times$RTX 2080 Ti (11G), \textit{the most affordable GPU required for using 100B-scale LLMs to date. }
+
+We open-source the model checkpoints, code, training logs, related toolkits, and lessons learned. 
+
+\hide{%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+\section{Introduction}
+Large Language Models (LLMs), which refers to transformer-based~\citep{vaswani2017attention} statistical language models with an enormous quantity of parameters trained on web-scale text contents, have experienced a surge in the past few years.
+Particularly, those who exceed 100 billion parameters, to which we use ``LLMs'' to refer to in a narrow sense~\citep{brown2020language,thoppilan2022lamda,rae2021scaling,chowdhery2022palm,wang2021ernie},  have presented attractive but mysterious scaling laws, where emergent zero-shot and few-shot capabilities suddenly arise~\citep{wei2022emergent}.
+Despite much controversy on whether merely scaling LLMs leads to general machine intelligence, now it is generally accepted that we shall look into LLMs.
+
+Nevertheless, academic  researchers and individual developers have been suffered from limited access and poor usability of LLMs.
+For accessibility, most LLMs are unavailable to public and a few of them~\citep{brown2020language,lieber2021jurassic} provide intransparent limited APIs with fees.
+For usability, even if these LLMs are open-sourced, most individuals and academic institutions can hardly afford the outrageous cost for inference, let alone further tuning.
+``LLM Monopoly'' does no good to LLM's development, as it requires the whole community's exertion, including big companies, academia, and individuals, to push LLM's boundary and realize its promised welfare to people.
+
+In this work, we introduce \glm as an initial step to fulfill our commitment of ``LLM Inclusivity''.
+It is a GLM~\citep{du2022glm} language model possessing 130 billion parameters and is pre-trained over both English and Chinese corpora for 400 billion tokens.
+\glm's effort is in concurrence with recent OPT-175B~\citep{zhang2022opt} and BLOOM-176B~\citep{scao2022what} to open-source and popularize the research and use of LLMs.
+However, compared to them \glm is uniquely focusing on offering our community a powerful and high-usability LLM, from the very beginning of its conception and design.
+Specifically, our elaboration covers the four main aspects concerning an LLM's architecture, objective, training, and inference. For the first time, 
+\begin{itemize}[leftmargin=*,itemsep=0pt,parsep=0.2em,topsep=0.0em,partopsep=0.0em]
+    \item \textbf{Architecture}: we adopt bidirectional GLM instead of unidirectional GPT in an LLM and demonstrate its superiority in downstream evaluation. Other necessary components are also identified.
+    \item \textbf{Objective}: we include Multitask Instruction Pre-training (MIP), along with the autoregressive blank infilling objective of GLM, as the LLM's objective.
+    \item \textbf{Training Strategy}: we unveil part of hidden reasons behind the extreme instability in LLM's pre-training, and propose effective strategies to stabilize its training without harming performance.
+    \item \textbf{Inference}: we quantize \glm, a 130B LLM, into INT4 precision with little performance loss to allow its fast inference on even 4 $\times$ RTX 3090 Ti (24G) or 8 $\times$ RTX 2080 Ti (11G).
+\end{itemize}
+
+In the end, it turns out that our design and training enable \glm, a bilingual language model, to outperform similar-sized LLMs such as GPT-3 175B~\citep{brown2020language}, BLOOM-176B~\citep{scao2022what}, and ERNIE Titan 3.0 (260B)~\citep{wang2021ernie} over a wide range of zero-shot and few-shot benchmarks, including language modeling~\citep{paperno2016lambada,marcinkiewicz1994building}, multiple-choice question answering~\citep{hendrycks2021measuring}, and versatile reasoning challenges~\citep{srivastava2022beyond} and Chinese language tasks~\citep{xu2020clue,xu2021fewclue}.
+It even outstrips PaLM-540B~\citep{chowdhery2022palm}, a 4$\times$ larger language model, on zero-shot language modeling dataset LAMBADA~\citep{paperno2016lambada} and zero-shot BIG-bench-lite~\citep{srivastava2022beyond} to set up new records.
+
+To sum up, we introduce our following contributions regarding LLMs and \glm in this work 
+\begin{itemize}[leftmargin=*,itemsep=0pt,parsep=0.2em,topsep=0.0em,partopsep=0.0em]
+    \item We demonstrate our long-term commitment towards ``LLM Inclusivity'' technically and economically. It cares about the participation of all community members in LLMs' research and application. We appeal to all individuals and organizations in this field for joint efforts in this commission.
+    \item We introduce \glm, an open and inclusive bilingual LLM. It is fully optimized for high quality and popularization on its architecture, training and inference strategies. Our experiments on extensive zero-shot and few-shot benchmarks shows that \glm can be competent and even better than its counterparts such as GPT-3 175B, OPT-175B, and BLOOM 176B.
+    \item We open-source model checkpoints, code, training logs, and toolkit related to \glm. Based on which people can easily reproduce all our evaluation, and do fast offline inference on their own machines with hardwares as popularized as 4 $\times$ RTX 3090 (24G) or 8 $\times$ RTX 2080 Ti (11G).
+\end{itemize}
+
+}%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%% \clearpage
+
+\vspace{-3mm}
+\section{The Design Choices of \glm}
+\vspace{-2mm}
+The architecture of a machine learning model defines its inductive bias. %, which matters to its scaling efficiency~\citep{tay2022scaling}. 
+However, it has been realized that it is computationally unaffordable to explore various architectural designs for LLMs.
+We introduce and explain the unique design choices of \glm. 
+
+\vspace{-2mm}
+\subsection{\glm's Architecture} \label{sec:glm-arch}
+\vspace{-2mm}
+
+\vvpara{GLM as  Backbone.}
+Most recent 100B-scale LLMs, such as GPT-3, PaLM, OPT, and BLOOM, follow the traditional GPT-style~\citep{radford2019language} architecture of decoder-only autoregressive language modeling. %, likely due to the arduously expensive cost of stably training with a new architecture. 
+In \glm, we instead make an attempt to explore the potential of a bidirectional GLM---General Language Model~\citep{du2022glm}---as its backbone.
+
+GLM is a transformer-based language model that leverages autoregressive blank infilling as its training objective.
+Briefly, for a text sequence $\boldsymbol{x}=[x_1,\cdots,x_n]$, text spans $\{\boldsymbol{s}_1,\cdots,\boldsymbol{s}_m\}$ are sampled from it, each of which $\boldsymbol{s}_i$ denotes a span of consecutive tokens $[s_{i,1},\cdots,s_{i,l_i}]$ and is replaced (i.e., corrupted) with a single mask token to form $\boldsymbol{x}_{\text{corrupt}}$. 
+The model is asked to recover them autoregressively.
+To allow interactions between corrupted spans, their visibility to each other is decided by a randomly sampled permutation on their order. 
+
+GLM's bidirectional attention over unmasked (i.e., uncorrupted) contexts distinguishes \glm from GPT-style LLMs in which the unidirectional attention is used. 
+To support both understanding and generation, it mixes two corruption objectives, each indicated by a special mask token:
+\begin{itemize}[leftmargin=*,itemsep=0pt,parsep=0.2em,topsep=0.0em,partopsep=0.0em]
+    \item \textbf{[MASK]}: short blanks in sentences whose lengths add up to a certain portion of the input.
+    \item \textbf{[gMASK]}: random-length long blanks at the end of sentences with prefix contexts provided.
+\end{itemize}
+
+\begin{wrapfigure}{r}{6cm}
+    \small
+    \vspace{-6mm}
+    \centering
+    \includegraphics[width=1.0\linewidth]{figures/architecture.pdf}
+    \vspace{-6mm}
+    \caption{\glm and LLMs of similar scale on zero-shot LAMBADA language modeling. 
+    Details on GLM's bidirectional attention are provided in \citet{du2022glm}.}
+    \label{fig:lambada}
+    \vspace{-8mm}
+\end{wrapfigure}
+
+Conceptually, the blank infilling objective with bidirectional attention enables a more effective comprehension of contexts than GPT-style models: 
+when using [MASK], \glm behaves as BERT~\citep{devlin2019bert} and T5~\citep{raffel2020exploring}; 
+when using [gMASK], \glm behaves similarly to PrefixLM~\citep{liu2018generating,dong2019unified}.
+
+Empirically, 
+\glm %with bidirectional attention 
+offers a record-high accuracy of 80.2\% on zero-shot LAMBADA  by outperforming both GPT-3 and PaLM 540B in Figure \ref{fig:lambada}. 
+By setting the attention mask, \glm's  unidirectional variant is comparable to GPT-3 and OPT-175B. 
+Our observations are in line with existing findings~\citep{liu2018generating,dong2019unified}. 
+
+\begin{figure}[t]
+    \centering
+    \includegraphics[width=.92\linewidth]{figures/layernorm.pdf}
+    \vspace{-2mm}
+    \caption{Trials on different LayerNorms for \glm training. It turns out that DeepNorm is the most stable one, as it has small gradient norm and does not spike in the early stage training.}
+    \vspace{-6mm}
+    \label{fig:layernorm}
+\end{figure}
+
+\vvpara{Layer Normalization (LN,~\cite{ba2016layer}).}
+Training instability is one major challenge for training LLMs~\citep{zhang2022opt,scao2022what,chowdhery2022palm} (Cf. Figure ~\ref{fig:collapse} in Appendix for  collapses in training several 100B-scale models). 
+A proper choice of LNs can help stabilize the training of LLMs. %, such as Pre-LN~\citep{xiong2020layer} for GPT-3, OPT-175B, BLOOM-176B, and Sandwich-LN in CogView~\citep{ding2021cogview} and NormFormers~\citep{shleifer2021normformer}.
+We experiment with existing practices, e.g., Pre-LN~\citep{xiong2020layer}, Post-LN~\citep{ba2016layer}, %\yuxiao{xxx}
+Sandwich-LN~\citep{ding2021cogview}, which are unfortunately incapable of stabilizing our \glm test runs (Cf. Figure~\ref{fig:layernorm} (a) and Appendix~\ref{app:ln} for details). 
+
+Our search is later focused on Post-LN due to its favorable downstream results in preliminary experiments though it does not stabilize \glm. 
+Fortunately, one of the attempts on Post-LN initialized with the newly-proposed DeepNorm~\citep{wang2022deepnet} generates promising training stability. 
+Specifically, given the number of \glm's layers $N$, 
+    we adopt $\textrm{DeepNorm}(\boldsymbol{x}) = \textrm{LayerNorm}(\alpha\cdot \boldsymbol{x} + \textrm{Network}(\boldsymbol{x}))$, where $\alpha=(2N)^\frac{1}{2}$, 
+    and 
+   apply the Xavier normal initialization with the scaling factor of $(2N)^{-\frac{1}{2}}$ to \texttt{ffn}, \texttt{v\_proj} and \texttt{out\_proj}. Additionally, all bias terms are initialized to zero.
+Figure~\ref{fig:layernorm} shows it significantly benefits the training stability of \glm. 
+
+\vvpara{Positional Encoding and FFNs.}
+We empirically test different options for positional encoding (PE) and FFN improvements in terms of both training stability and downstream performance (Cf. Appendix \ref{app:pe-ffn} for details).  
+For PEs in \glm, we adopt Rotary Positional Encoding (RoPE, \cite{su2021roformer}) rather than  ALiBi~\citep{press2021train}. 
+To improve FFNs in Transformer, we pick GLU with the GeLU~\citep{hendrycks2016gaussian} activation as the replacement.
+
+\vspace{-2mm}
+\subsection{\glm's Pre-Training Setup} \label{sec:training_objective}
+\vspace{-2mm}
+
+Inspired by recent works~\citep{aribandi2022ext5,wei2022finetuned,sanh2022multitask}, the \glm pre-training objective includes not only the self-supervised GLM autoregressive blank infilling) but also multi-task learning for a small portion of tokens. 
+This is expected to help boost its downstream zero-shot performance. 
+
+\vvpara{Self-Supervised Blank Infilling (95\% tokens).}
+Recall that \glm uses both [MASK] and [gMASK] for this task. 
+Each training sequence is applied with one of them independently at a time.
+Specifically, [MASK] is used to mask consecutive spans in 30\% of training sequences for blank infilling. The lengths of spans follow a Poisson distribution ($\lambda=3$) and add up to 15\% of the input. 
+For the other 70\% sequences, the prefix of each sequence is kept as context and [gMASK] is used to mask the rest of it. 
+The masked length is sampled from the Uniform distribution.
+
+The pre-training data includes 1.2T Pile (train split)~\citep{gao2020pile} English, 1.0T Chinese WudaoCorpora~\citep{yuan2021wudaocorpora}, %\todo{to exclude or not?},
+and 250G Chinese corpora (including online forums, encyclopedia, and QA) we crawl from the web, which form a balanced composition of English and Chinese contents.
+
+\vvpara{Multi-Task Instruction Pre-Training (MIP, 5\% tokens).}
+T5~\citep{raffel2020exploring} and ExT5~\citep{aribandi2022ext5} suggest that multi-task learning in pre-training can be more helpful than fine-tuning, we thus propose to include a variety of instruction prompted datasets including language understanding, generation, and information extraction in \glm's pre-training.
+
+Compared to recent works~\citep{wei2022finetuned,sanh2022multitask} that leverage multi-task prompted fine-tuning to improve zero-shot task transfer, MIP only accounts for 5\% tokens and is set in the pre-training stage to prevent spoiling LLMs' other general ability, e.g., unconditional free generation.
+Specifically, we include 74 prompted datasets from ~\citep{sanh2022multitask,wang2022deepstruct}, listed in Appendix~\ref{app:data} and Table~\ref{tab:mip}. 
+\glm users are suggested to {avoid evaluating its zero-shot and few-shot capabilities on these datasets} according to the criterion illustrated in Section~\ref{sec:results}.
+
+\hide{%====start of hide =========================================================================
+
+\section{Algorithm Designs}
+In this section, we introduce the algorithm designs concerning \glm's architectural thoughts and the pre-training objectives.
+Compared to most existing LLMs such as GPT-3~\citep{brown2020language}, PaLM-540B~\citep{chowdhery2022palm}, OPT~\citep{zhang2022opt}, and BLOOM~\citep{scao2022what}, \glm is not a GPT architecture language model, but a bidirectional General Language Model (GLM, \cite{du2022glm}) trained to fill in the blanks. 
+The design introduces significant advantages, as well as emerged challenges.
+In this section, we explain the reasons to adopt the GLM and the solutions for conquering the challenges in scaling it up to 130 billion parameters.
+
+\subsection{\glm's Architecture} \label{sec:glm-arch}
+Architectures define the inductive bias for machine learning models, which matters to their scaling efficiency~\citep{tay2022scaling}.
+However, due to the outrageous computing costs of LLMs, it is unaffordable to exploit various architectural designs.
+In \glm, based on real experiments we present several key insights on architectural designs for the goal of inclusive LLMs.
+
+\vvpara{Backbone Architecture.}
+In the past few years, the community has witnessed the surge of a series of different language model architectures~\citep{radford2019language,devlin2019bert,yang2019xlnet,raffel2020exploring}.
+Nevertheless, existing LLMs mostly follow the traditional GPT-style~\citep{radford2019language} architecture of decoder-only autoregressive language modeling.
+It is probably because LLMs can be extremely unstable in training and are thus too expensive to test new ideas once failed.
+However, it is questionable that GPT-style architecture would be the best option for LLMs.
+
+In \glm, we take an audacious step to adopt a new architecture---GLM~\citep{du2022glm}---for pre-training a 130-billion LLM.
+In brief, GLM is transformer-based language model which leverages autoregressive blank infilling as its basic training objective.
+For a text sequence $\boldsymbol{x}=[x_1,\cdots,x_n]$, text spans $\{\boldsymbol{s}_1,\cdots,\boldsymbol{s}_m\}$ are sampled from it, each of which denotes a span of consecutive tokens $[s_{i,1},\cdots,s_{i,l_i}]$.
+They are replaced (i.e., corrupted) with a single mask token respectively to form $\boldsymbol{x}_{\text{corrupt}}$ and the model is asked to recover them autoregressively.
+To allow interactions between corrupted spans, their visibility to each other are decided by a randomly sampled permutation on their order.
+Then, we can define the pre-training objective for \glm as
+\begin{equation}
+    \mathcal{L}_{\text \glm} 
+    = \max_\theta \E_{\boldsymbol{z}\sim Z_m}\left[\sum_{i=1}^m\log \prod_{j=1}^{l_i} p(s_{i,j}|\boldsymbol{x}_{\text{corrupt}},\boldsymbol{s}_{\boldsymbol{z}_{<i}},\boldsymbol{s}_{i,<j}) \right]
+    \label{eqn:objective}
+\end{equation}
+\noindent where $Z_m$ denotes the set of the sequence's all permutations and $\boldsymbol{s}_{\boldsymbol{z}_{<i}}$ denotes $[\boldsymbol{s}_{z_1},\cdots,\boldsymbol{s}_{z_{i-1}}]$.
+
+\glm's bidirectional attention over unmasked (i.e., uncorrupted) contexts distinguishes itself from other GPT-style LLMs' unidirectional attention. 
+It mixes two corruption objectives to allow strong performance on both understanding and generation, each indicated with a special mask token:
+\begin{itemize}[leftmargin=*,itemsep=0pt,parsep=0.2em,topsep=0.0em,partopsep=0.0em]
+    \item \textbf{[MASK]}: short consecutive blanks in sentences whose lengths add up to 15\% of the input.
+    \item \textbf{[gMASK]}: random-length long blanks at the end of sentences with prefix contexts provided.
+\end{itemize}
+
+\begin{wrapfigure}{r}{6cm}
+    \small
+    \vspace{-6mm}
+    \centering
+    \includegraphics[width=1.0\linewidth]{figures/architecture.pdf}
+    \caption{\glm and other LLMs on zero-shot LAMBADA language modeling. More explanations on GLM's bidirectional attention are provided in \citet{du2022glm}.}
+    \label{fig:lambada}
+    \vspace{-6mm}
+\end{wrapfigure}
+
+The blanking infilling objective with bidirectional attention contributes to a more effective comprehension of the context information than GPT-style models: when using [MASK], \glm behaves as BERT~\citep{devlin2019bert} and T5~\citep{raffel2020exploring}; when using [gMASK], \glm behaves similarly to PrefixLM~\citep{liu2018generating,dong2019unified}.
+
+As an example, we show its results on LAMBADA~\citep{paperno2016lambada} zero-shot language modeling.
+We follow the evaluation method used in GPT-2~\citep{radford2019language} and GPT-3~\citep{brown2020language}.
+We observe that \glm with bidirectional attention over context set up a new record of 80.2\% accuracy, even outperforming the 4$\times$ larger PaLM-540B~\citep{chowdhery2022palm}.
+On the contrary, \glm's ablated unidirectional variant (by setting the attention mask) reports 75.3\% on LAMBADA, comparable to other similar-sized GPT-style models including GPT-3 and OPT-175B~\cite{zhang2022opt}.
+Our observations also accord with findings in~\citep{liu2018generating,dong2019unified}.
+
+\begin{insight}
+\rm Bidirectional-attention GLM can be stronger than unidirectional GPT at large scale.
+\end{insight}
+
+\vvpara{Layer Normalization.}
+Layer normalization (or LN, \cite{ba2016layer}) stabilizes the transformer training and has a significant impact on models' quality and downstream performance.
+A proper choice of LNs becomes more critical for LLMs as models scale up, where the challenge of training instability significantly exaggerates. %\todo{do we need figures here?}
+There have been several successful LN variants including vanilla Post-LN~\citep{vaswani2017attention}, Pre-LN~\citep{xiong2020layer}, and Sandwich-LN~\citep{ding2021cogview}. 
+However, in our extensive experiments, we verify that none of their performance on \glm is satisfying (Cf. Appendix~\ref{app:ln} for our detailed study).
+
+We commit to finding a Post-LN variant that can stabilize \glm's training, and finally targeting on DeepNorm~\citep{wang2022deepnet}, a new initialization approach for Post-LN.
+It is reported to stabilize the training of a 1000-layer transformer.
+Given the number of \glm's layers $N$
+
+\begin{itemize}[leftmargin=*,itemsep=0pt,parsep=0.2em,topsep=0.0em,partopsep=0.0em]
+    \item We adopt $\textrm{DeepNorm}(\boldsymbol{x}) = \textrm{LayerNorm}(\alpha\cdot \boldsymbol{x} + \textrm{Network}(\boldsymbol{x}))$, where $\alpha=(2N)^\frac{1}{2}$.
+    \item We apply Xavier normal initialization with the scaling factor of $(2N)^{-\frac{1}{2}}$ to \texttt{ffn}, \texttt{v\_proj} and \texttt{out\_proj}. Additionally, all bias terms are initialized to zero.
+\end{itemize}
+
+\begin{wrapfigure}{r}{6cm}
+    \small
+    \vspace{-4mm}
+    \centering
+    \includegraphics[width=1.0\linewidth]{figures/layernorm.pdf}
+    \vspace{-5mm}
+    \caption{Different LNs' gradient norm along \glm's early training steps.}
+    \label{fig:layernorm}
+    \vspace{-6mm}
+\end{wrapfigure}
+
+Though \glm only possesses 70 layers, the strategy significantly benefits the training stability.
+In Figure~\ref{fig:layernorm}, along the early pre-training steps of \glm, we plot gradient norm (i.e., the gradients' $l^2$-norm) of Sandwich-LN and Post-LN with DeepNorm initialization, which reflects how drastic a model is updated at a certain step.
+We observe that \glm with Sandwich-LN has several magnitude larger gradient norms than that of Post-LN with DeepNorm, and it finally collapses at around 2.5k steps; while Post-LN with DeepNorm helps \glm to be stably trained.
+
+\begin{insight}
+\rm It is a counter-stereotype that the Post-LN initialized with DeepNorm would be the only feasible layer normalization to stabilize \glm's pre-training. 
+\end{insight}
+
+\vvpara{Rotary Positional Encoding (RoPE, \cite{su2021roformer}).}
+Vanilla transformer adopts absolute (or sinuous) PE, and is later evolved into relative PE~\citep{dai2019transformer}.
+Two recent popular relative PE variants are RoPE adopted by PaLM-540B~\citep{chowdhery2022palm} and GPT-J~\cite{gpt-j}, and ALiBi~\citep{press2021train} adopted by BLOOM-176B~\citep{scao2022what}.
+In our testing, we find RoPE to be a better option for \glm, 
+likely because its bidirectional attention makes ALiBi relatively inefficient for both engineering implementation and training convergence.
+
+And in \glm, different from the two-dimensional positional encoding used in vanilla GLM, we turn back to conventional one-dimensional positional encoding.
+At the time when we designed \glm, unfortunately we did not figure out how to implement two-dimensional RoPE\footnote{It was not until recently that we found a blog by RoPE's author on suggestions for two-dimensional RoPE.}.
+As a substitute plan, in \glm we simply remove the second dimension used in original GLM as we find that the unidirectional attention mask sub-matrices for [MASK] generation indicate the token order as well.
+For long generation with [gMASK] (which is always at the end of the context), generated tokens will just prolong the first-dimensional positional encoding from the last context token.
+More details on \glm's positional encoding formulation are presented in Appendix~\ref{app:pe}.
+
+\vvpara{Gated Linear Units (GLU, \cite{dauphin2017language}).}
+Some recent efforts on transformer has been on improving the FFNs.
+We have noticed the GLU adopted in PaLM-540B and its new variant Gated Attention Unit (GAU, \cite{hua2022transformer}), and test them in our experiments by pre-training GLM-base (110M) over a random 50G Chinese and English mixed corpus. 
+It turns out that both GLU and GAU can improve upon the vanilla FFN, while GLU can be better and more stable in training.
+Consequently in \glm we adopt GLU with GeLU~\citep{hendrycks2016gaussian} activation
+\begin{equation}
+\operatorname{FFN}_{\mathrm{GeGLU}}\left(\boldsymbol{x}; \boldsymbol{W}_1, \boldsymbol{V}, \boldsymbol{W}_{2}\right)=\left(\mathrm{GeLU}(\boldsymbol{x} \boldsymbol{W}_1) \otimes \boldsymbol{x} \boldsymbol{V}\right) \boldsymbol{W}_{2}
+\end{equation}
+
+In order to keep the same parameter as the vanilla FFN, the feed-forward size $d_{\mathrm{ffn}}$ (which is usually $4 d_{\mathrm{H}}$, where $d_{\mathrm{H}}$ is the hidden dimension) is reduced to $\frac 8 3 d_{\mathrm{H}}$ as the $\boldsymbol{V}$ is additionally introduced.
+
+\subsection{\glm's Pre-training Objectives and Data}
+In \glm, instead of mere self-supervised autoregressive blank infilling, we refer to recent works~\citep{aribandi2022ext5,wei2022finetuned,sanh2022multitask} to include a small portion of multi-task learning in the pre-training to boost its downstream zero-shot learning capability. 
+
+\vvpara{Self-supervised Pre-training (95\% tokens).}
+In the \glm's implementation, for 30\% training tokens, we use [MASK] to mask consecutive spans whose lengths conform to the Poisson distribution ($\lambda=3$) and they add up to 15\% of the input sequences.
+For the other 70\% tokens, we provide the prefix of a sequence as context and use [gMASK] to mask the rest tokens for \glm to predict; the masked length is sampled from the Uniform distribution.
+The setting endows \glm with strong capability on both natural language understanding (using [MASK] similar to BERT) and natural language generation (using [gMASK] similar to GPT) with proper prompts.
+
+The pre-training data include 1.2T Pile~\citep{gao2020pile} English corpus, 1.0T Chinese WudaoCorpora~\citep{yuan2021wudaocorpora} \todo{to exclude or not?}, and around 250G several Chinese corpora we crawl from the web, which finally forms a balanced composition of English and Chinese corpora.
+
+\vvpara{Multi-task Instruction Pre-training (MIP, 5\% tokens).}
+Recent work such as FLAN~\citep{wei2022finetuned} and T0~\citep{sanh2022multitask} shows that LLMs fine-tuned on multi-task instruction datasets can be better at zero-shot learning.
+Instead of doing it in fine-tuning, following conclusion in T5~\citep{raffel2020exploring} and ExT5~\citep{aribandi2022ext5} that multi-task learning in pre-training can be even helpful than fine-tuning, we propose to include a variety of instruction prompted datasets including language understanding, generation, and information extraction in \glm's pre-training.
+
+We originally planed to only include training datasets' training splits of T0~\citep{sanh2022multitask} and DeepStruct~\citep{wang2022deepstruct}.
+All prompts for T0 datasets are from PromptSource~\citep{bach2022promptsource} and prompts for DeepStruct datasets are newly created.
+but by a mistake at first we include the training and evaluation datasets' training splits and exclude DeepStruct datasets. 
+We fixed the mistake at around 23k steps and shifted back to the correct version. 
+All 74 datasets, corresponding prompts used, and the data preprocess details in MIP are listed in Appendix \ref{app:data}.
+We suggest that users should not evaluating \glm's zero-shot and few-shot capabilities on these datasets.
+
+}%====end of hide =========================================================================
+
+\subsection{Platform-Aware Parallel Strategies and Model Configurations} \label{sec:parallel_strategy}
+
+\glm is trained on a cluster of 96 DGX-A100 GPU (8$\times$40G) servers with a 60-day access.  
+The goal is to pass through as many tokens as possible, as a recent study~\citep{hoffmann2022training} suggests that most existing LLMs are largely under-trained. 
+
+\vvpara{The 3D Parallel Strategy.}
+The data parallelism~\citep{valiant1990bridging} and tensor model parallelism~\citep{shoeybi2019megatron} are the de facto practices for training billion-scale models~\citep{gpt-j,du2022glm}. 
+To further handle
+the huge GPU memory requirement and the decrease in overall GPU utilization resulted from applying tensor parallel between nodes---as 40G rather than 80G A100s are used for training \glm, we combine the pipeline model parallelism with the other two strategies to form a 3D parallel strategy. 
+
+The pipeline parallelism divides the model into sequential stages for each parallel group, and to further minimize bubbles introduced by pipeline, we leverage the PipeDream-Flush~\citep{narayanan2021memory} implementation from DeepSpeed~\citep{rasley2020deepspeed} to train \glm with a relative big global batch size (4,224) to reduce time and GPU memory wasting. 
+Through both numerical and empirical examinations, we adopt 4-way tensor parallelism and 8-way pipeline parallelism (Cf. Appendix~\ref{app:pipeline} for details). Following the calculation in~\citep{chowdhery2022palm}, we report hardware FLOPs utilization (HFU) of 43.3\% and model FLOPs utilization (MFU) of 32.5\% due to re-materialization.
+
+\vvpara{\glm Configurations.}
+We aim to enable our 100B-scale LLM to run a single DGX-A100 (40G) node in FP16 precision. 
+Based on the hidden state dimension of 12,288 we adopt from GPT-3, the resultant model size has to be no more than 130B parameters, thus \glm.
+To maximize GPU utilization, we configure the model based on the platform and its corresponding parallel strategy. 
+To avoid insufficient memory utilization in the middle stages
+due to the additional word embedding at both ends, we balance the pipeline partition by removing one layer from them, making 9$\times$8-2=70 transformer layers in \glm.
+
+During the 60-day access to the cluster, we manage to train \glm for 400 billion tokens (roughly 200 billion each for Chinese and English) with a fixed sequence length of 2,048 per sample. 
+For the [gMASK] training objective, we use a context window of 2,048 tokens. 
+For the [MASK] and multi-task objectives, we use a context window of 512 and concatenate four samples together to cater the 2,048-sequence-length. 
+We warm-up the batch size from 192 to 4224 over the first 2.5\% samples. 
+We use AdamW~\citep{loshchilov2017decoupled} as our optimizer with $\beta_1$ and $\beta_2$ set to 0.9 and 0.95, and a weight decay value of 0.1. 
+We warm up the learning rate from $10^{-7}$ to $8\times 10^{-5}$ over the first 0.5\% samples, then decay it by a $10\times$ cosine schedule. 
+We use a dropout rate of 0.1 and clip gradients using a clipping value of 1.0 (Cf. Table~\ref{tab:config} for the full configurations).
+
+\hide{%start of hide %%%%%%%%%%%%%=====================================================================
+
+\subsection{Parallel Strategies} \label{sec:parallel_strategy}
+Training LLMs can be outrageously expensive.
+It is said that GPT-3~\citep{brown2020language} was trained over 10,000 NVIDIA V100 GPUs for months at substantial expenses.
+However, recent study~\citep{hoffmann2022training} shows that existing LLMs are largely under-trained; what matters in the first place to LLMs' performance is the number of trained tokens.
+Thus for Inclusive LLM, an optimized framework that fully exploits computing potential is never overemphasized.
+
+Here we introduce \glm's framework-level insights, including the 3D parallel strategy (Cf. Figure~\ref{fig:3d-parallelism} in Appendix), LLM configuration principles, and computation graph optimization.
+They in all contribute \todo{} speeding up to pre-training, making a crucial improvement to \glm's quality.
+
+\vvpara{3D Parallel Strategy.}
+\aohan{I think this section should be downplayed as more details can be found in the appendix}
+Parallel strategies, including data parallelism~\citep{valiant1990bridging} and tensor model parallelism~\citep{shoeybi2019megatron}, are de facto practices for training billion-scale language models. 
+However, when models continue to scale up to over 100B, the scaling up of a tensor parallelism group become insufficient.
+On one hand, as the computation per layer is evenly distributed in a group, a single node's computational granularity would decrease when group sizes grow up, causing a performance drop of matrix multiplication operator \texttt{GEMM} and a decrease in overall utilization.
+On the other hand, if group size exceeds certain threshold (e.g., number of GPUs per node), the \texttt{All-Reduce} operation becomes a bottleneck due to the expensive cross-node communication.
+
+Therefore, in \glm we combine another parallel strategy---pipeline model parallelism---with two established practices to form the 3D parallel strategy.
+The pipeline parallelism divides the model into sequential stages for each parallel group, and to minimize bubbles introduced by pipeline, we refer to Gpipe~\citep{huang2019gpipe} and PipeDream-Flush~\citep{narayanan2021memory} implementation from DeepSpeed~\citep{rasley2020deepspeed} to reduce time and GPU memory wasting (Cf. Appendix~\ref{app:pipeline}).
+
+We analyze the bubble ratio in \glm's pre-training. Given the number of pipeline stages $p$, the number of micro-batches in a parallel group $m$, and the time for forward and backward per micro-batch $t_f$ and $t_b$. 
+In ideal case without pipeline, forward and backward take $t_{\mathrm{ideal}} = m(t_f + t_b)$. 
+But with pipeline, the splitting causes $p - 1$ forward and backward bubbles respectively for a total time of $t_{\mathrm{bubble}} = (p - 1)( t_f + t_b)$.
+If there are $n$ GPUs in a parallel group, in practice we assign each GPU only with one tensor parallel split (group size $t$) from one pipeline parallel stage (altogether $p$ stages), which results in $n=t\times p$.
+Then we have
+\begin{equation}
+    \begin{split}
+        \text{bubble-ratio} = \frac {t_{\mathrm{bubble}}} {t_{\mathrm{ideal}} + t_{\mathrm{bubble}}} = \frac {p - 1} {m + p - 1} = \frac {n/t - 1} {m + n/t - 1} 
+    \end{split}
+\end{equation}
+\noindent where increasing tensor parallel splits $t$ and the number of micro-batches $m$ could reduce the bubble ratios.
+But $t$ should not exceed the number of GPUs per node and a too large $m$ is known to harm language models' performance~\citep{you2020large}.
+After testing on our 96 DGX-A100 nodes, we adopt $t=4$, $m=176$, and $p=8$, which leads to a bubble ratio of only 3.8\% and a utilization of 135 TFLOP/s per GPU in pre-training.
+
+\vvpara{Principles for LLM Configuration.}
+Compared to ordinary-sized language models, configurations of LLMs should be based on the computing platforms to exploit training efficiency.
+In \glm, these peculiarly platform-dependent configurations include:
+\begin{itemize}[leftmargin=*,itemsep=0pt,parsep=0.2em,topsep=0.0em,partopsep=0.0em]
+    \item \textbf{Total size}: one of our commission for inclusivity is that \glm should be able to inference on a single DGX-A100 (40G) node in FP16 precision. Based on 12,288 hidden state dimension we adopt following~\citep{brown2020language}, it leads to not more than 130B parameters in our LLM and each parallel group contains not more than 9 layers. 
+    \item \textbf{Number of layers}: as the pipeline parallel stages in both ends in LLMs store additional word embeddings' parameters, to avoid insufficient memory utilization on the middle stages, they should contain one less layer than others. Given an $l$-layer \glm stage contains $k$ layers, we find the the most balanced partition being $l=kp - 2$, resulting in $9\times8 - 2=70$ transformer layers in \glm.
+\end{itemize}
+
+\yuxiao{how about move the configuration to sec 2.2?}
+
+\begin{insight}
+\rm Configure your LLMs based on the computing cluster and parallel strategy. Squeezing hardware potential is always a top priority for LLM pre-training out of big companies.
+\end{insight}
+
+\vvpara{Computation Graph Optimization.}
+GPU operators, including compute-intensive and memory-intensive, manage the computation of modern neural networks in GPUs. 
+In Transformer, there is another time-consuming access-intensive element-wise operators in large quantities. 
+We may consider operator fusion for them in computational graphs to reduce memory access for acceleration. 
+Specifically, we use the JIT method provided by the PyTorch framework to implement operator fusion on the operator combinations of \texttt{bias+dropout+add}, \texttt{bias+gelu}, and the rotary position encoding (\cite{su2021roformer}, Cf. Section~\ref{sec:glm-arch}) used in \glm. 
+We also implement a customized CUDA kernel function from Megatron-LM for the \texttt{scale+mask+softmax} operation. 
+\yuxiao{possible to have a number to show off the optimization effort?, otherwise, we may have to remove this para or move it to appendix}
+
+}%end of hide %%%%%%%%%%%%%=====================================================================
+
+\hide{
+\subsection{mixed precision training strategy}
+
+Existing exascale pre-trained language models are often trained in BF16 half-precision format to save memory and speed up computation \cite{rae2021scaling, chowdhery2022palm}. BF16 format has the same representation range as single-precision, which can reduce the overflow up and down during the training of exascale language models. However, the efficient computation of BF16 format is only supported by a few high-end gas pedals (e.g., Nvidia's A100, 3090, etc.), and the parameters of models trained in BF16 format cannot be converted to FP16 format due to the difference in representation range, and regressing to single-precision for use will lead to a great waste of time and memory. Therefore, pre-trained language models in BF16 format greatly increase the threshold for researchers to use. Our work is devoted to exploring mixed precision training strategies using FP16 format in the training of very large scale language models.
+
+The \ref{sec:mixed-precision-training} section of this paper introduces a number of mixed-precision strategies commonly used in training deep neural networks, including techniques such as preserving single-precision parameter copies and dynamic scaling of the loss function, which have successfully accelerated the training process for a range of models. However, in our experiments, we observed that the direct application of these strategies to the training of very large scale language models at the scale of tens and hundreds of billions in FP16 half-precision format still results in training non-convergence. It is not surprising that the pre-training model OPT \cite{zhang2022opt} with 100 billion parameters using FP16 precision also experienced multiple divergences during training, which implies that we need to propose targeted mixed-precision strategies for the training of very large scale language models.
+
+Each attention head in the multi-headed attention layer of the Transformer model is computed as follows
+\begin{equation}
+    \operatorname{Attention}\left(\boldsymbol{Q}_i, \boldsymbol{K}_i, \boldsymbol{V}_i\right) = \operatorname{softmax}\left(\frac{\ boldsymbol{Q}_i\boldsymbol{K}_i^{\top}}{\sqrt{d}}\right) \boldsymbol{V}_i
+\end{equation}
+
+We observed that, especially in the case of large sizes of individual attention heads in large-scale language models, the elements in the fraction matrix $\boldsymbol{Q}_i\boldsymbol{K}_i^{\top}\left/\sqrt{d}\right.$ may be much larger than the input and overflow. Subsequent researchers have explored this problem, and Ming Ding et al. found that the fraction matrix inside each head in multihead attention has the property of small variance but large bias when training a multimodal model with billions of parameters, and targeted the PB-Relax method \cite{ding2021cogview}, which uses the Softmax function translation invariant property eliminates the bias in the fractional matrix, thus alleviating the overflow problem. Its core formula is as follows.
+\vspace{0.5em}
+\begin{equation}
+   \operatorname{softmax}\left(\frac{\boldsymbol{Q}_i\boldsymbol{K}_i^{\top}}{\sqrt{d}}\right) =
+   \operatorname{softmax}\left(\left(\frac{\boldsymbol{Q}_i\boldsymbol{K}_i^{\top}}{alpha\sqrt{d}} - \max\left(\frac{\boldsymbol{Q}_i\ boldsymbol{K}_i^{\top}}{\alpha\sqrt{d}}\right)\right)\times\alpha\right) 
+\end{equation}
+
+Our experimental results show that the PB-Relax method can solve the training non-convergence problem for models with tens of billions of parameters, however, the training scattering phenomenon still occurs when the number of parameters is expanded by tens and hundreds of billions. Numerically, the PB-Relax method still cannot avoid the overflow phenomenon when the variance within the fraction matrix is relatively large, so we propose a hybrid precision-based calculation method of
+\vspace{0.5em}
+\begin{equation}
+   \operatorname{softmax}\left(\frac{\boldsymbol{Q}_i\boldsymbol{K}_i^{\top}}{\sqrt{d}}\right) =
+   \operatorname{FP16}\left(\operatorname{softmax}\left(\operatorname{FP32}\left(\frac{\boldsymbol{Q}_i\boldsymbol{K}_i^{\top}}{\ alpha\sqrt{d}}\right)\times\alpha\right)\right)
+\end{equation}
+
+In this method, the more computationally intensive $\boldsymbol{Q}_i\boldsymbol{K}_i^{\top}\left/\sqrt{d}\right.$ is still computed in half-precision to ensure efficiency, and $\alpha$ is pre-divided to avoid overflow. the Softmax operation is computed in single precision, and the The softmax operation is computed in single precision, and the single-precision fraction matrix is multiplied back to $\alpha$ before computation to ensure that the result remains unchanged. $\alpha$ is a data- and model-dependent hyperparameter, and in our experiments, taking $\alpha$ equal to the number of layers in the network avoids overflow. In terms of efficiency, the only cost of this mixed-precision strategy is the computation of the single-precision Softmax function, however, we find that matrix multiplication is the absolute dominant model computation in the pre-training of very large models. Compared to computing the Softmax function at half precision, the overall computational efficiency is only about 1\% loss. We were surprised to find that computing Softmax with half-precision and using the PB-Relax method to mitigate the overflow instead reduced the training efficiency by 8\%, which may be due to the reduction in efficiency caused by too intensive manipulation of the fractional matrix with large shapes in the multi-headed attention.
+}
+
+\section{The Training Stability of \glm}
+
+The training stability is the decisive factor in \glm's quality, which is also largely impacted by the number of tokens it passes through~\citep{hoffmann2022training}. 
+Thus, given the computing usage constraint, there has to be a trade-off between efficiency and stability with regard to floating-point (FP) formats: 
+low-precision FP formats (e.g., 16-bit precision---FP16) improve computing efficiency but are prone to overflow and underflow errors, resulting in training collapses. 
+
+ \begin{wrapfigure}{r}{4.3cm}
+    \centering
+    \vspace{-3mm}
+    \includegraphics[width=\linewidth]{figures/shrink-small.pdf}
+    \vspace{-7mm}
+    \caption{EGS reduces gradient scale and variance to stabilize LLMs' pre-training.}
+    \label{fig:shrink}
+    \vspace{-8mm}
+\end{wrapfigure}
+
+\vvpara{Mixed-Precision.}
+We follow the common practice of a mixed-precision~\citep{micikevicius2018mixed} strategy (Apex O2), i.e., FP16 for forwards and backwards and FP32 for optimizer states and master weights, to reduce the GPU memory usage and improve training efficiency. 
+Similar to OPT-175B and BLOOM-176B (C.f. Figure~\ref{fig:collapse} in Appendix), the training of \glm faces frequent loss spikes resulted from this choice, which tends to become increasingly frequent as the training goes on. 
+The precision related spikes are often without clear reasons: % or at least not due to bad data as suggested by PaLM: 
+some recover on their own; others come with a portent of suddenly soaring gradient norm and eventually a spike or even NaN in loss. 
+OPT-175B attempted to fix by manually skipping data and adjusting hyper-parameters; BLOOM-176B did so via the embedding norm technique~\citep{dettmers20218}. %\yuxiao{xxxxx}
+We spent months to empirically investigate the spikes and realize that a few issues emerge when transformers scale up: 
+
+First, the transformer main branch's value scale can be extremely large in deeper layers if using Pre-LN. 
+This is addressed in \glm by using DeepNorm based Post-LN (Cf.  Section ~\ref{sec:glm-arch}), which makes the value scale always bounded. 
+
+Second, the attention scores grow so large that they exceed FP16's range, as the model scales up. 
+There are a few options to overcome this issue in LLMs. 
+In CogView~\citep{ding2021cogview}, PB-Relax is proposed to remove bias terms and deduct extremum value in attention computation to avoid the problem, which unfortunately does not help avoid disconvergence in \glm. 
+In BLOOM-176B, the BF16 format is used instead of FP16, due to its wide range of values on NVIDIA Ampere GPUs (i.e., A100). 
+However, BF16 consumes $\sim$15\% more run-time GPU memory than FP16 in our experiments due to its conversion to FP32 in gradient accumulation, and more importantly it is not supported on other GPU platforms (e.g., NVIDIA Tesla V100), limiting the accessibility of produced LLMs. 
+Another option from BLOOM-176B is to apply embedding norm with BF16, but in sacrifice of a significant penalty on model performance, as they notice that embedding norm can harm model's zero-shot learning (Cf. Section 4.3 in~\citep{scao2022what}). %\yuxiao{ the embedding norm based technique, which  xxxx xxx}
+
+\vvpara{Embedding Layer Gradient Shrink (EGS).}
+Our empirical search identifies that the gradient norm can serve as an informative indicator of training collapses. %, which was also discovered in vision transformers~\citep{chen2021empirical} as we later realized. 
+Specifically, we find that 
+a training collapse usually lags behind a ``spike'' in gradient norm by a few training steps. %\todo{do we need evidence here, or delete it?}
+Such spikes are usually caused by the embedding layer's abnormal gradients, as we observe that its gradient norm is often several magnitude larger that those of other layers in \glm's early stage training (Cf. Figure~\ref{fig:shrink} (a)). 
+In addition, it tends to fluctuate dramatically in the early training. 
+The problem is handled in vision models~\citep{chen2021empirical} via freezing the patch projection layer. 
+Unfortunately, we cannot freeze the training of the embedding layer in language models.
+
+Finally, we find the gradient shrink on embedding layers could overcome loss spikes and thus stabilize \glm's training. 
+It is first used in the multi-modal transformer CogView~\citep{ding2021cogview}. 
+Let $\alpha$ be the shrinking factor, the strategy can be easily implemented via
+  $  \mathsf{word\_embedding} = \mathsf{word\_embedding} * \alpha + \mathsf{word\_embedding.detach()} * (1 - \alpha)$. 
+Figure~\ref{fig:shrink} (b) suggests that empirically, setting $\alpha=0.1$ wipes out most spikes we would have met, with negligible latency. 
+
+In fact, the final \glm training run only experiences three late-stage loss divergence cases, though it fails numerous times due to hardware failures. 
+For the three unexpected spikes, it turns out further shrinking the embedding gradient can still help stabilize the \glm training. 
+See the training notes and Tensorboard logs in our code repository
+for details. 
+
+\hide{%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\section{Training Strategy}
+
+The root cause of  is that there is a trade-off between training efficiency and stability with regard to floating-point (FP) formats:
+\begin{itemize}[leftmargin=*,itemsep=0pt,parsep=0.2em,topsep=0.0em,partopsep=0.0em]
+\item \textbf{Efficiency}: low-precision FP formats (e.g., FP16) reduce memory and computation costs
+\item \textbf{Stability}: low-precision FP formats are prone to overflow and underflow, resulting in collapses
+\end{itemize}
+
+\subsection{Platform-Aware Parallel Strategies and Model Configurations} \label{sec:parallel_strategy}
+
+\glm is trained on a cluster of 96 DGX-A100 GPU (8$\times$40G) servers with a 60-day access.  
+The goal is to pass through as many tokens as possible, as a recent study~\citep{hoffmann2022training} suggests that most existing LLMs are largely under-trained. 
+
+\vvpara{The 3D Parallel Strategy.}
+The data parallelism~\citep{valiant1990bridging} and tensor model parallelism~\citep{shoeybi2019megatron} are the de facto practices for training billion-scale models~\citep{gpt-j,du2022glm}. 
+To further handle
+the huge GPU memory requirement and the decrease in overall GPU utilization resulted from applying tensor parallel between nodes---as 40G rather than 80G A100s are used for training \glm, we combine the pipeline model parallelism with the other two strategies to form a 3D parallel strategy. 
+
+The pipeline parallelism divides the model into sequential stages for each parallel group, and to further minimize bubbles introduced by pipeline, we leverage the PipeDream-Flush~\citep{narayanan2021memory} implementation from DeepSpeed~\citep{rasley2020deepspeed} to train \glm with a relative big global batch size (4,224) to reduce time and GPU memory wasting. 
+Through both numerical and empirical examinations, we adopt 4-way tensor parallelism and 8-way pipeline parallelism (Cf. Appendix~\ref{app:pipeline} for details). Following the calculation in~\citep{chowdhery2022palm}, we report hardware FLOPs utilization (HFU) of 43.3\% and model FLOPs utilization (MFU) of 32.5\% due to re-materialization.
+
+\vvpara{\glm Configurations.}
+We aim to enable our 100B-scale LLM to run a single DGX-A100 (40G) node in FP16 precision. 
+Based on the hidden state dimension of 12,288 we adopt from GPT-3, the resultant model size has to be no more than 130B parameters, thus \glm.
+To maximize GPU utilization, we configure the model based on the platform and its corresponding parallel strategy. 
+To avoid insufficient memory utilization in the middle stages
+due to the additional word embedding at both ends, we balance the pipeline partition by removing one layer from them, making 9$\times$8-2=70 transformer layers in \glm.
+
+During the 60-day access to the cluster, we manage to train \glm for 400 billion tokens (roughly 200 billion each for Chinese and English) with a fixed sequence length of 2,048 per sample. 
+For the [gMASK] training objective, we use a context window of 2,048 tokens. 
+For the [MASK] and multi-task objectives, we use a context window of 512 and concatenate four samples together to cater the 2,048-sequence-length. 
+We warm-up the batch size from 192 to 4224 over the first 2.5\% samples. 
+We use AdamW~\citep{loshchilov2017decoupled} as our optimizer with $\beta_1$ and $\beta_2$ set to 0.9 and 0.95, and a weight decay value of 0.1. 
+We warm up the learning rate from $10^{-7}$ to $8\times 10^{-5}$ over the first 0.5\% samples, then decay it by a $10\times$ cosine schedule. 
+We use a dropout rate of 0.1 and clip gradients using a clipping value of 1.0 (Cf. Table~\ref{tab:config} for the full configurations).
+
+\hide{%start of hide %%%%%%%%%%%%%=====================================================================
+
+\subsection{Parallel Strategies} \label{sec:parallel_strategy}
+Training LLMs can be outrageously expensive.
+It is said that GPT-3~\citep{brown2020language} was trained over 10,000 NVIDIA V100 GPUs for months at substantial expenses.
+However, recent study~\citep{hoffmann2022training} shows that existing LLMs are largely under-trained; what matters in the first place to LLMs' performance is the number of trained tokens.
+Thus for Inclusive LLM, an optimized framework that fully exploits computing potential is never overemphasized.
+
+Here we introduce \glm's framework-level insights, including the 3D parallel strategy (Cf. Figure~\ref{fig:3d-parallelism} in Appendix), LLM configuration principles, and computation graph optimization.
+They in all contribute \todo{} speeding up to pre-training, making a crucial improvement to \glm's quality.
+
+\vvpara{3D Parallel Strategy.}
+\aohan{I think this section should be downplayed as more details can be found in the appendix}
+Parallel strategies, including data parallelism~\citep{valiant1990bridging} and tensor model parallelism~\citep{shoeybi2019megatron}, are de facto practices for training billion-scale language models. 
+However, when models continue to scale up to over 100B, the scaling up of a tensor parallelism group become insufficient.
+On one hand, as the computation per layer is evenly distributed in a group, a single node's computational granularity would decrease when group sizes grow up, causing a performance drop of matrix multiplication operator \texttt{GEMM} and a decrease in overall utilization.
+On the other hand, if group size exceeds certain threshold (e.g., number of GPUs per node), the \texttt{All-Reduce} operation becomes a bottleneck due to the expensive cross-node communication.
+
+Therefore, in \glm we combine another parallel strategy---pipeline model parallelism---with two established practices to form the 3D parallel strategy.
+The pipeline parallelism divides the model into sequential stages for each parallel group, and to minimize bubbles introduced by pipeline, we refer to Gpipe~\citep{huang2019gpipe} and PipeDream-Flush~\citep{narayanan2021memory} implementation from DeepSpeed~\citep{rasley2020deepspeed} to reduce time and GPU memory wasting (Cf. Appendix~\ref{app:pipeline}).
+
+We analyze the bubble ratio in \glm's pre-training. Given the number of pipeline stages $p$, the number of micro-batches in a parallel group $m$, and the time for forward and backward per micro-batch $t_f$ and $t_b$. 
+In ideal case without pipeline, forward and backward take $t_{\mathrm{ideal}} = m(t_f + t_b)$. 
+But with pipeline, the splitting causes $p - 1$ forward and backward bubbles respectively for a total time of $t_{\mathrm{bubble}} = (p - 1)( t_f + t_b)$.
+If there are $n$ GPUs in a parallel group, in practice we assign each GPU only with one tensor parallel split (group size $t$) from one pipeline parallel stage (altogether $p$ stages), which results in $n=t\times p$.
+Then we have
+\begin{equation}
+    \begin{split}
+        \text{bubble-ratio} = \frac {t_{\mathrm{bubble}}} {t_{\mathrm{ideal}} + t_{\mathrm{bubble}}} = \frac {p - 1} {m + p - 1} = \frac {n/t - 1} {m + n/t - 1} 
+    \end{split}
+\end{equation}
+\noindent where increasing tensor parallel splits $t$ and the number of micro-batches $m$ could reduce the bubble ratios.
+But $t$ should not exceed the number of GPUs per node and a too large $m$ is known to harm language models' performance~\citep{you2020large}.
+After testing on our 96 DGX-A100 nodes, we adopt $t=4$, $m=176$, and $p=8$, which leads to a bubble ratio of only 3.8\% and a utilization of 135 TFLOP/s per GPU in pre-training.
+
+\vvpara{Principles for LLM Configuration.}
+Compared to ordinary-sized language models, configurations of LLMs should be based on the computing platforms to exploit training efficiency.
+In \glm, these peculiarly platform-dependent configurations include:
+\begin{itemize}[leftmargin=*,itemsep=0pt,parsep=0.2em,topsep=0.0em,partopsep=0.0em]
+    \item \textbf{Total size}: one of our commission for inclusivity is that \glm should be able to inference on a single DGX-A100 (40G) node in FP16 precision. Based on 12,288 hidden state dimension we adopt following~\citep{brown2020language}, it leads to not more than 130B parameters in our LLM and each parallel group contains not more than 9 layers. 
+    \item \textbf{Number of layers}: as the pipeline parallel stages in both ends in LLMs store additional word embeddings' parameters, to avoid insufficient memory utilization on the middle stages, they should contain one less layer than others. Given an $l$-layer \glm stage contains $k$ layers, we find the the most balanced partition being $l=kp - 2$, resulting in $9\times8 - 2=70$ transformer layers in \glm.
+\end{itemize}
+
+\yuxiao{how about move the configuration to sec 2.2?}
+
+\begin{insight}
+\rm Configure your LLMs based on the computing cluster and parallel strategy. Squeezing hardware potential is always a top priority for LLM pre-training out of big companies.
+\end{insight}
+
+\vvpara{Computation Graph Optimization.}
+GPU operators, including compute-intensive and memory-intensive, manage the computation of modern neural networks in GPUs. 
+In Transformer, there is another time-consuming access-intensive element-wise operators in large quantities. 
+We may consider operator fusion for them in computational graphs to reduce memory access for acceleration. 
+Specifically, we use the JIT method provided by the PyTorch framework to implement operator fusion on the operator combinations of \texttt{bias+dropout+add}, \texttt{bias+gelu}, and the rotary position encoding (\cite{su2021roformer}, Cf. Section~\ref{sec:glm-arch}) used in \glm. 
+We also implement a customized CUDA kernel function from Megatron-LM for the \texttt{scale+mask+softmax} operation. 
+\yuxiao{possible to have a number to show off the optimization effort?, otherwise, we may have to remove this para or move it to appendix}
+
+}%end of hide %%%%%%%%%%%%%=====================================================================
+
+\hide{
+\subsection{mixed precision training strategy}
+
+Existing exascale pre-trained language models are often trained in BF16 half-precision format to save memory and speed up computation \cite{rae2021scaling, chowdhery2022palm}. BF16 format has the same representation range as single-precision, which can reduce the overflow up and down during the training of exascale language models. However, the efficient computation of BF16 format is only supported by a few high-end gas pedals (e.g., Nvidia's A100, 3090, etc.), and the parameters of models trained in BF16 format cannot be converted to FP16 format due to the difference in representation range, and regressing to single-precision for use will lead to a great waste of time and memory. Therefore, pre-trained language models in BF16 format greatly increase the threshold for researchers to use. Our work is devoted to exploring mixed precision training strategies using FP16 format in the training of very large scale language models.
+
+The \ref{sec:mixed-precision-training} section of this paper introduces a number of mixed-precision strategies commonly used in training deep neural networks, including techniques such as preserving single-precision parameter copies and dynamic scaling of the loss function, which have successfully accelerated the training process for a range of models. However, in our experiments, we observed that the direct application of these strategies to the training of very large scale language models at the scale of tens and hundreds of billions in FP16 half-precision format still results in training non-convergence. It is not surprising that the pre-training model OPT \cite{zhang2022opt} with 100 billion parameters using FP16 precision also experienced multiple divergences during training, which implies that we need to propose targeted mixed-precision strategies for the training of very large scale language models.
+
+Each attention head in the multi-headed attention layer of the Transformer model is computed as follows
+\begin{equation}
+    \operatorname{Attention}\left(\boldsymbol{Q}_i, \boldsymbol{K}_i, \boldsymbol{V}_i\right) = \operatorname{softmax}\left(\frac{\ boldsymbol{Q}_i\boldsymbol{K}_i^{\top}}{\sqrt{d}}\right) \boldsymbol{V}_i
+\end{equation}
+
+We observed that, especially in the case of large sizes of individual attention heads in large-scale language models, the elements in the fraction matrix $\boldsymbol{Q}_i\boldsymbol{K}_i^{\top}\left/\sqrt{d}\right.$ may be much larger than the input and overflow. Subsequent researchers have explored this problem, and Ming Ding et al. found that the fraction matrix inside each head in multihead attention has the property of small variance but large bias when training a multimodal model with billions of parameters, and targeted the PB-Relax method \cite{ding2021cogview}, which uses the Softmax function translation invariant property eliminates the bias in the fractional matrix, thus alleviating the overflow problem. Its core formula is as follows.
+\vspace{0.5em}
+\begin{equation}
+   \operatorname{softmax}\left(\frac{\boldsymbol{Q}_i\boldsymbol{K}_i^{\top}}{\sqrt{d}}\right) =
+   \operatorname{softmax}\left(\left(\frac{\boldsymbol{Q}_i\boldsymbol{K}_i^{\top}}{alpha\sqrt{d}} - \max\left(\frac{\boldsymbol{Q}_i\ boldsymbol{K}_i^{\top}}{\alpha\sqrt{d}}\right)\right)\times\alpha\right) 
+\end{equation}
+
+Our experimental results show that the PB-Relax method can solve the training non-convergence problem for models with tens of billions of parameters, however, the training scattering phenomenon still occurs when the number of parameters is expanded by tens and hundreds of billions. Numerically, the PB-Relax method still cannot avoid the overflow phenomenon when the variance within the fraction matrix is relatively large, so we propose a hybrid precision-based calculation method of
+\vspace{0.5em}
+\begin{equation}
+   \operatorname{softmax}\left(\frac{\boldsymbol{Q}_i\boldsymbol{K}_i^{\top}}{\sqrt{d}}\right) =
+   \operatorname{FP16}\left(\operatorname{softmax}\left(\operatorname{FP32}\left(\frac{\boldsymbol{Q}_i\boldsymbol{K}_i^{\top}}{\ alpha\sqrt{d}}\right)\times\alpha\right)\right)
+\end{equation}
+
+In this method, the more computationally intensive $\boldsymbol{Q}_i\boldsymbol{K}_i^{\top}\left/\sqrt{d}\right.$ is still computed in half-precision to ensure efficiency, and $\alpha$ is pre-divided to avoid overflow. the Softmax operation is computed in single precision, and the The softmax operation is computed in single precision, and the single-precision fraction matrix is multiplied back to $\alpha$ before computation to ensure that the result remains unchanged. $\alpha$ is a data- and model-dependent hyperparameter, and in our experiments, taking $\alpha$ equal to the number of layers in the network avoids overflow. In terms of efficiency, the only cost of this mixed-precision strategy is the computation of the single-precision Softmax function, however, we find that matrix multiplication is the absolute dominant model computation in the pre-training of very large models. Compared to computing the Softmax function at half precision, the overall computational efficiency is only about 1\% loss. We were surprised to find that computing Softmax with half-precision and using the PB-Relax method to mitigate the overflow instead reduced the training efficiency by 8\%, which may be due to the reduction in efficiency caused by too intensive manipulation of the fractional matrix with large shapes in the multi-headed attention.
+}
+\subsection{Stability: Systematic and Numerical Challenges}
+
+ Modern computing devices such as NVIDIA A100s and TPUs support 16-bit precision computation with much higher throughput compared to 32-bit precision. 
+Therefore, it has become a de facto practice to train language models with mixed-precision~\citep{micikevicius2018mixed} to reduce GPU memory usage and improve computation efficiency without hurting performance. 
+However, as far as we have observed, LLMs are far more vulnerable to loss spikes in the mixed-precision setup than smaller ones, which is well-aligned with other LLMs' observations (C.f. Figure~\ref{fig:collapse} in Appendix) such as OPT-175B~\citep{zhang2022opt} and BLOOM-176B~\citep{scao2022what}.
+
+Handling these unexpected spikes has been the most challenging part in \glm's training. 
+We empirically ascribe them into structural and numerical instability:
+
+\begin{itemize}[leftmargin=*,itemsep=0pt,parsep=0.2em,topsep=0.0em,partopsep=0.0em]
+\item \textbf{Systematic Instability}:
+which tends to appear in the early stage of training. 
+Its appearance is often accompanied with a gradual but steady rise in gradient norm. 
+Skipping data or adjusting hyper-parameters do not eliminate, but only make it happen at other random neighboring steps. 
+
+\item \textbf{Numerical Instability}:
+which instead tends to occur in the late stage of training and becomes increasingly frequent as the training goes on. 
+Its resultant spikes are often without clear reasons: some recover on their own; others come with a portent of suddenly soaring gradient norm and eventually a spike or even NaN in loss, as the model has been optimized by the abnormal gradients. 
+\end{itemize}
+
+We refer to the first type of instability as \emph{systematic}, since regardless of its optimization configuration, a model just cannot converge ideally owing to its current setup (i.e., model architectures and mixed-precision training strategies). 
+To eliminate consequent disconvergence, a more stable model architecture and proper mixed-precision strategies are necessary.
+
+The second type of instability is referred to as \emph{numerical}, since we believe it is likely to derive from some unknown numerical reasons in 16-bit precision training.
+Its related spikes can be mitigated via re-loading the model from a checkpoint 100 to 200 iterations ahead with data skipping, or changing hyper-parameters such as the learning rate.
+Such instability may not arise from bad data samples as is previously assumed, because changing the learning rate also allows the model to go through them.
+Authors of~\citep{chowdhery2022palm} also report that no bad patterns have been observed from data causing training spikes in their examination.
+Thus, numerical spikes are likely to occur only when a certain model goes through certain data, and can be avoided by applying some perturbation to the training process.
+
+Due to the large cost of LLM training, conquering these spikes are crucial: it would be a tragedy if the training diverged on the half road and turned out unrecoverable. 
+We conduct plenitude of experiments spanning few months to find several effective strategies to stabilize \glm's training.
+
+\begin{insight}
+\rm It is both systematic and numerical instabilities that LLMs suffer from in training, which takes us months to identify and conquer from scratch in \glm.
+\end{insight}
+
+\vvpara{Mixed-precision strategy.} 
+Mixed-precision~\citep{micikevicius2018mixed} training with FP16 has become a default in mainstream frameworks such as DeepSpeed~\citep{rasley2020deepspeed}.
+A common mixed-precision training strategy (Apex O2) is as follows: forward and backward are calculated in pure 16-bit precision (FP16), but the optimizer states and master weights are FP32 are used in the optimization.
+However, such a strategy is prone to meet severe numerical instability in a conventional transformer architecture when a model scales up, due to its two main bottlenecks:
+\begin{itemize}[leftmargin=*,itemsep=0pt,parsep=0.2em,topsep=0.0em,partopsep=0.0em]
+    \item Under Pre-LN, the transformer main branch's value scale can be extremely large in deeper layers.
+    \item As a model scales up, attention scores grow so large that they exceed FP16's representation scope.
+\end{itemize}
+
+For the first bottleneck, our use of DeepNorm (a variant of Post-LN) servers as LayerNorm in the main branch, so the value scale is always bounded. 
+For the second bottleneck, CogView~\citep{ding2021cogview} proposes PB-Relax to remove bias terms in attention's linear projection and deduct the largest attention score from each attention score matrix to avoid the problem. 
+Nevertheless, the technique does not eliminate disconvergence in \glm, probably due to its gigantic size.
+ 
+As a remedy for fp16's narrow representation range, NVIDIA Ampere GPUs provide BF16 floating-point format (adopted by BLOOM 176B) to mitigate the problem. 
+Nevertheless, BF16's dissupport on other computing platforms (e.g., NVIDIA Tesla V100) has significantly hampered its wider applications.
+In practice, we also notice that compared to FP16, BF16 requires around 15\% additional run-time GPU memory due to its necessary conversion to FP32 in gradient accumulation.
+
+To support as many researchers and developers as possible, \glm thus chooses FP16 as its training floating-point format. 
+On the other hand, it means our model is faced with more stability challenges, as is also reported in another FP16 LLM OPT-175B. 
+Fortunately, after great struggle, we successfully get it through via a set new techniques derived from some following insights.
+
+\begin{insight}
+\rm FP16 is a challenging but rewarding decision: it suffers from more instability, but is a must for enabling LLMs to train and inference on inclusive ranges of platforms.
+\end{insight}
+
+\vvpara{Gradient Shrink on the Embedding Layer.}
+Besides explicit precision issues caused by attention scores, there are implicit problems arouses by random noisy samples appearing along the training.
+For example, in our observation these samples might consist bunches of semantically plausible repeating lines, which can be hardly cleaned in rule-guided preprocesses.
+We find LLMs are so vulnerable to these noises, which likely results in unrecoverable unexpected training collapses.
+
+\begin{figure}[t]
+    \centering
+    \includegraphics[width=\linewidth]{figures/shrink.pdf}
+    \vspace{-6mm}
+    \caption{Gradient shrink on embedding layer stabilizes \glm's training. (a) Preliminary experiments on GLM-base show that gradient norm for embedding layer can be much larger; (b) 40B-scale testing shows that embedding gradient shrink is necessary for LLM training.}
+    \label{fig:shrink}
+    \vspace{-6mm}
+\end{figure}
+
+For such instability, we notice that the gradient norm serves as an effective indicator, which accords with observations from vision transformers~\citep{chen2021empirical,ding2021cogview}: the happening of a training collapse usually lags behind a ``spike'' in gradient norm by few training steps. %\todo{do we need evidence here, or delete it?}
+Such spikes are usually caused by embedding layer's abnormal gradient, as we observe a remarkably larger gradient norm from it than other layers---often several magnitudes larger---in \glm's early stage training (Cf. Figure~\ref{fig:shrink} (a)).
+It also tends to fluctuate dramatically in the early stage training of GLM compared to other layers.
+The issue is handled in~\citep{chen2021empirical} via freezing the patch projection layer; however, a language model cannot freeze the training of its embedding layer.
+
+Alternatively, we find the strategy of gradient shrink over embedding layer can overcome the problem in LLM's training, which is similarly applied in text-to-image transformer CogView~\citep{ding2021cogview}.
+Let $\alpha$ be the shrinking factor, the strategy can be easily implemented via
+\begin{equation}
+    \mathsf{word\_embedding} = \mathsf{word\_embedding} * \alpha + \mathsf{word\_embedding.detach()} * (1 - \alpha)
+\end{equation}
+Specifically, we shrink to $\alpha=0.1$ and discover that it wipes out most spikes we would have met, with negligible speed loss (Cf. Figure~\ref{fig:shrink} (b)).
+Actually, in our late stage training, we observe that further shrinking embedding gradient still works when unexpected spikes take place.
+
+\begin{insight}
+\rm Shrinking embedding layer's gradient to its 0.1 can solve most instability problems.
+\end{insight}
+
+We train \glm for 400 billion tokens (roughly 200 billion each for Chinese and English) with a fixed sequence length of 2,048 per sample. 
+For the [gMASK] training objective, we use a context window of 2,048 tokens. 
+For the [MASK] and multi-task training objectives, we use context windows of length 512 and concatenate four samples together to cater the 2,048-sequence-length. 
+We warm-up the batch size from 192 to 4224 over the first 2.5\% samples. 
+We use AdamW~\citep{loshchilov2017decoupled} as our optimizer with $\beta_1$ and $\beta_2$ set to 0.9 and 0.95, and a weight decay value of 0.1. 
+We warm-up the learning rate from $10^{-7}$ to $8\times 10^{-5}$ over the first 0.5\% samples, then decay it by a $10\times$ cosine schedule. 
+We use a dropout rate of 0.1 and clip gradients using a clipping value of 1.0.
+
+\glm's pre-training lasts 60 days and it takes up 96 NVIDIA DGX-A100 (40G) nodes with 400G bandwidth IB network, which would cost equivalently 4.9 million dollars based on the GPU pricing on public cloud services in the same period.
+On top of the basic training setup, during the long training we have experienced several crises and failures.
+We successfully managed to recover the training via slight adjustments over some of configuration above (mostly about learning rate and shrinking factor), which are reported in our released training notes and Tensorboard logs\footnote{\url{https://github.com/THUDM/GLM-130B/tree/main/logs}}.
+
+}%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%% \clearpage
+\section{\glm Inference on RTX 2080 Ti}
+
+One of the major goals of \glm is to lower the hardware requirements for accessing 100B-scale LLMs without efficiency and effectiveness disadvantages. 
+
+As mentioned, the model size of 130B is determined for running the full \glm model on a single A100 (40G$\times$8) server, rather than the high-end A100 (80G$\times$8) machine required by OPT-175B and BLOOM-176B. 
+To accelerate \glm inference, we also leverage FasterTransformer~\citep{timonin2022accelerated}
+to implement \glm in C++.  
+Compared to the PyTorch implementation of BLOOM-176B in Huggingface, \glm's decoding inference is 7-8.4$\times$ faster on the same single A100 server. (Cf. Appendix~\ref{app:inference_acceleration} for details).
+
+\vvpara{INT4 Quantization for RTX 3090s/2080s.}
+To further support popularized GPUs,
+we attempt to compress \glm as much as possible while maintaining performance superiority, particularly via  quantization~\citep{zafrir2019q8bert,shen2020q,tao2022compression}, which introduces little task-agnostic performance drops for generative language models. 
+
+\begin{wrapfigure}{r}{6cm}
+    \small
+    \vspace{-6mm}
+    \centering
+    \includegraphics[width=1.0\linewidth]{figures/quantization-scaling-law.png}
+    \vspace{-4mm}
+    \caption{(Left) \texttt{attn-dense} and \texttt{w2}'s weight distributions; (Right) \glm's INT4 weight quantization scaling law.}
+    \label{fig:scaling_law}
+    \vspace{-5mm}
+\end{wrapfigure}
+
+Typically, the practice is to quantize both model weights and activations to INT8.
+However, our analysis in Appendix~\ref{app:activation_analysis} suggests that LLMs' activations may contain extreme outliers. 
+Concurrently, the emergent outliers in OPT-175B and BLOOM-176B are also discovered~\citep{dettmers2022llm}, which influence only about 0.1\% feature dimensions and are thus solved by matrix multiplication decomposition for the outlying dimensions.
+Differently, there exist about 30\% outliers in GLM-130B's activations, making the technique above far less efficient. % due to the slow high-precision computation.
+Thus, we decide to focus on the quantization of model weights (i.e., mostly linear layers) while keeping the FP16 precision for activations.  
+The quantized model is dynamically converted to FP16 precision at runtime, introducing a small computational overhead but greatly reducing the GPU memory usage for storing model weights. 
+
+Excitingly, we manage to reach the INT4 weight quantization for \glm while existing successes have thus far only come to the INT8. 
+Memory-wise, by comparing to INT8, the INT4 version helps additionally save half of the required GPU memory to 70GB, thus allowing \glm inference on 4 $\times$ RTX 3090 Ti (24G) or 8 $\times$ RTX 2080 Ti (11G). 
+Performance-wise, Table~\ref{tab:quantization} left indicates that without post-training at all, the INT4-version \glm experiences almost no performance degradation, thus maintaining the performance advantages over GPT-3 on common benchmarks. 
+
+\vvpara{GLM's INT4 Weight Quantization Scaling Law.}
+We examine the underlying mechanism of this unique INT4 weight quantization scaling law exhibited in Figure~\ref{fig:scaling_law} right. %, while it does not apply to GPT-based BLOOM-176B.  
+We plot the weight value distributions in  Figure~\ref{fig:scaling_law} left, which turns out to directly impact the quantization quality.
+Specifically, a wider-distributed linear layer needs to be quantized with larger bins, leading to more precision loss.
+Thus the wide-distributed \texttt{attn-dense} and \texttt{w2} matrices explain the INT4 quantization failure for GPT-style BLOOM.
+Conversely, GLMs tend to have much narrower distributions than those of similar-sized GPTs, and the gap between INT4 and FP16 versions keeps further decreasing as the GLM model size scales up (Cf.  Figure~\ref{fig:quantization_appendix} in Appendix for details).
+
+\begin{table*}[t]
+\footnotesize
+\centering
+\caption{Left: Quantized \glm's performance on several benchmarks; Right: INT4 quantized \glm's inference speed (encode and decode) with FasterTransformer.}
+\vspace{-2mm}
+\begin{subtable}
+    \centering
+    \begin{threeparttable}
+    \centering
+    \renewcommand\tabcolsep{3pt}
+    \renewcommand\arraystretch{0.75}
+    \begin{tabular}{@{}llccc@{}}
+    \toprule[1.2pt]
+    \multirow{2}{*}{Model Precision} & \multicolumn{3}{c}{\glm} & GPT-3 \\ \cmidrule(l){2-4} \cmidrule(l){5-5} 
+                                     & FP16   & INT8   & INT4   & FP16  \\ \midrule
+    MMLU (acc, $\uparrow$)           & 44.75  & 44.71  & 44.80  & 43.9  \\
+    LAMBADA (acc, $\uparrow$)        & 80.21  & 80.21  & 79.47  & 76.2  \\
+    Pile (a part, BPB, $\downarrow$) & 0.634  & 0.638  & 0.641  & 0.74  \\ \bottomrule[1.2pt] %PTB ($\downarrow$)
+    \end{tabular}
+    \end{threeparttable}
+\end{subtable}%
+\hspace{.02\linewidth}%
+\begin{subtable}
+    \centering
+    \begin{threeparttable}
+    \centering
+    \renewcommand\tabcolsep{2pt}
+    \renewcommand\arraystretch{0.95}
+    \begin{tabular}{@{}lcccc@{}}
+    \toprule[1.2pt]
+    GPU Type                     & \multicolumn{2}{c}{128 Enc./Dec.} & \multicolumn{2}{c}{512 Enc./Dec,} \\ \midrule
+    8 $\times$ A100 (40G)        & 0.15s           & 4.29s           & 0.18s           & 17.7s           \\
+    8 $\times$ V100 (32G)        & 0.31s           & 6.97s           & 0.67s           & 28.1s           \\
+    4 $\times$ RTX 3090 (24G)    & 0.37s           & 8.16s           & 1.30s           & 32.3s           \\
+    8 $\times$ RTX 2080 Ti (11G) & 0.39s           & 6.77s           & 1.04s           & 27.3s           \\ \bottomrule[1.2pt]
+    \end{tabular}
+    \end{threeparttable}
+    \end{subtable}
+    \vspace{-4mm}
+\label{tab:quantization}
+\end{table*}
+
+\hide{%%%%%%%% hide start %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+\section{Inference for Inclusivity}
+In terms of LLM inclusivity, we think its scope should not be limited to accessibility, but also usability.
+It is particularly a fact that, even with released LLM checkpoints such as OPT-175B~\citep{zhang2022opt} and BLOOM-176B~\citep{scao2022what}, individuals and academic researchers can hardly afford the cost for inference, which have been reported to depend on an 8 $\times$ A100 (80G) server.
+Thus, a considerable amount of sweat we spend in \glm has been on supporting its high usability and fast inference speed on popularized GPUs, such as NVIDIA RTX 3090 Ti (24G).
+
+Interestingly, such efforts actually deeply associate with our \textit{algorithm designs}, rather than mere engineering undertakings.
+We will show that GLM series presents \textit{a unique scaling law to allow INT4 quantization}, while other existing public LLMs (OPT and BLOOM series) would fail.
+
+\vvpara{Inference Acceleration.}
+A model's plain PyTorch implementation is easy to read and run; but it can be intolerably slow for LLMs. 
+Based on NVIDIA's FasterTransformer\footnote{\url{https://github.com/NVIDIA/FasterTransformer}} we spend two months \aohan{no need to mention?} implementing \glm into C++ to speed up its inference (Cf. Appendix~\ref{app:inference_acceleration} for details).
+Compared to a naive implementation (e.g., BLOOM-176B by Huggingface Transformers), \glm's decoding inference on the same-length sequences can be up to $\times$8.4 faster.
+
+\vvpara{GLM's INT4 Weight Quantization Scaling Law.}
+Notwithstanding \glm's accelerated inference speed, its demand for at least a DGX-A100 (40G) server can still discourage individual users.
+In light of the situation, we endeavor to compress \glm to fit into 4 $\times$ RTX 3090 Ti (24G)'s capacity, particularly via the quantization~\citep{zafrir2019q8bert,shen2020q,tao2022compression}, which presents little task-agnostic performance drop for generative language models.
+
+\begin{table*}[t]
+\footnotesize
+\centering
+\caption{Left: Quantized \glm's performance on several benchmarks; Right: INT4 quantized \glm's inference speed (encode and decode) with FasterTransformer.}
+\vspace{-2mm}
+\begin{subtable}
+    \centering
+    \begin{threeparttable}
+    \centering
+    \renewcommand\tabcolsep{3pt}
+    \renewcommand\arraystretch{0.75}
+    \begin{tabular}{@{}llccc@{}}
+    \toprule[1.2pt]
+    \multirow{2}{*}{Model Precision} & \multicolumn{3}{c}{\glm} & GPT-3 \\ \cmidrule(l){2-4} \cmidrule(l){5-5} 
+                                     & FP16   & INT8   & INT4   & FP16  \\ \midrule
+    MMLU (acc, $\uparrow$)           & 44.75  & 44.71  & 44.80  & 43.9  \\
+    LAMBADA (acc, $\uparrow$)        & 80.21  & 80.21  & 79.47  & 76.2  \\
+    Pile (a part, BPB, $\downarrow$) & 0.634  & 0.638  & 0.641  & 0.74  \\ \bottomrule[1.2pt] %PTB ($\downarrow$)
+    \end{tabular}
+    \end{threeparttable}
+\end{subtable}%
+\hspace{.02\linewidth}%
+\begin{subtable}
+    \centering
+    \begin{threeparttable}
+    \centering
+    \renewcommand\tabcolsep{2pt}
+    \renewcommand\arraystretch{0.95}
+    \begin{tabular}{@{}lcccc@{}}
+    \toprule[1.2pt]
+    GPU Type                     & \multicolumn{2}{c}{128 Enc./Dec.} & \multicolumn{2}{c}{512 Enc./Dec,} \\ \midrule
+    8 $\times$ A100 (40G)        & 0.15s           & 4.29s           & 0.18s           & 17.7s           \\
+    8 $\times$ V100 (32G)        & 0.31s           & 6.97s           & 0.67s           & 28.1s           \\
+    4 $\times$ RTX 3090 (24G)    & 0.37s           & 8.16s           & 1.30s           & 32.3s           \\
+    8 $\times$ RTX 2080 Ti (11G) & 0.39s           & 6.77s           & 1.04s           & 27.3s           \\ \bottomrule[1.2pt]
+    \end{tabular}
+    \end{threeparttable}
+    \end{subtable}
+    \vspace{-4mm}
+\label{tab:quantization}
+\end{table*}
+\begin{wrapfigure}{r}{4.5cm}
+    \small
+    \vspace{-5mm}
+    \centering
+    \includegraphics[width=1.0\linewidth]{figures/quantization_scaling_law.pdf}
+    \vspace{-4mm}
+    \caption{\glm's INT4 weight quantization scaling law.}
+    \label{fig:scaling_law}
+    \vspace{-8mm}
+\end{wrapfigure}
+
+Typical methods quantize both model weights and activation to INT8.%, enabling the INT8 matrix multiplication kernel for efficiency. 
+But in our analysis, we find LLMs' activations may contain extreme outliers (Cf. Appendix~\ref{app:activation_analysis}).
+Concurrent to our efforts, \citep{dettmers2022llm} also discovers the emergent outliers in OPT-175B and BLOOM-176B, which influence only about 0.1\% feature dimensions and are thus solved by matrix multiplication decomposition for outlying dimensions.
+However, we find substantial outliers (30\%) in GLM-130B's activations, making it far less efficient to apply due to the slow high-precision computation.
+
+After a few weeks of trial, we finally decide to keep activations' FP16 precision and only consider the symmetric quantization of model weights (majorly consist of linear layers). 
+The quantized model is dynamically converted to FP16 precision at runtime, introducing a small computational overhead but greatly reducing GPU memory usage for storing model weights.
+
+Surprisingly we notice \glm's unusual talent for INT4 weight quantization, which saves half of required GPU memory to 70GB compared to INT8 and thus allows \glm's inference on even 4 $\times$ RTX 3090 Ti (24G) or 8 $\times$ RTX 2080 Ti (11G).
+More surprising, it requires no post-training at all and shows little quality degradation (Cf. Table~\ref{tab:quantization}).
+However, such a nice property does not apply to BLOOM-176B and OPT series models (Cf. Figure~\ref{fig:scaling_law}).
+To understand it deeper, we dive into LLMs' weight value distribution (Cf. Figure~\ref{fig:weight_dist},~\ref{fig:quantization_appendix}), which directly impact the quantization quality.
+We find language models' skewed \texttt{w2} matrix is the major cause for INT4 quantization failure, especially for GPTs.
+On the contrary, GLMs usually present more symmetrical \texttt{w2} value distributions than similar-sized GPTs, and it seems to keep improving as they scale up.
+We summarize the discovery as \textbf{GLM's Scaling Law for INT4 Weight Quantization}, which demonstrates GLM's unique advantage to be quantized into INT4 precision as the architecture scales up.
+
+\begin{figure}[t]
+    \centering
+    \includegraphics[width=\linewidth]{figures/quantization.pdf}
+    \caption{Weight value distribution of \texttt{w2} from BLOOM-176B and \glm's first-8 layers' FFN (or GLU). A more skewed distribution with outliers is likely to suffer from more quantization loss.}
+    \label{fig:weight_dist}
+    \vspace{-5mm}
+\end{figure}
+
+\section{Inference for Inclusivity}
+In terms of LLM inclusivity, we think its scope should not be limited to accessibility, but also usability.
+It is particularly a fact that, even with released LLM checkpoints such as OPT-175B~\citep{zhang2022opt} and BLOOM-176B~\citep{scao2022what}, individuals and academic researchers can hardly afford the cost for inference, which have been reported to depend on an 8 $\times$ A100 (80G) server.
+Thus, a considerable amount of sweat we spend in \glm has been on supporting its high usability and fast inference speed on popularized GPUs, such as NVIDIA RTX 3090 Ti (24G).
+
+Interestingly, such efforts actually deeply associate with our \textit{algorithm designs}, rather than mere engineering undertakings.
+We will show in the following part that \glm is the only LLM so far being able to be quantized into INT4 precision, while other existing public LLMs (OPT-175B, BLOOM-176B, and even those 10B-scale smaller language models) would fail.
+
+\subsection{Inference Acceleration.}
+\du{This section can be mostly moved to appendix, leaving only the resutls.}
+A model's plain Pytorch implementation is easy to read and run; but it can be intolerably slow for LLMs. 
+Based on NVIDIA's FasterTransformer\footnote{\url{https://github.com/NVIDIA/FasterTransformer}} we spend two months implementing \glm into C++ to speed up inference, including the following main optimizations: 
+\begin{itemize}[leftmargin=*,itemsep=0pt,parsep=0.2em,topsep=0.0em,partopsep=0.0em]
+    \item Optimize time-costing operations such as GeGLU, Layer Normalization and SoftMax.
+    \item Reduce number of GPU kernel calls (e.g., fuse MultiheadAttention into one computation kernel).
+    \item Specify the algorithm of the best performance when calling cuBLAS.
+    \item Improve the computing efficiency by transposing the model parameters in advance.
+    \item Use half2 in FP16 computation to double the half's access bandwidth and computing throughput.
+\end{itemize}
+
+We currently pack up the full FasterTransformer implementation for \glm into a plug-and-play docker image for users' convenience, and we are still working on adapting it to our Pytorch implementation
+by only changing one line of code.
+A comparison between our speeding up \glm implementation and the so far default available BLOOM-176B implementation in Huggingface Transformers\footnote{\url{https://huggingface.co/docs/transformers/model_doc/bloom}} is shown in Table~\ref{tab:fastertransformer}.
+Our implementation for \glm can be 7.0 to 8.4 times faster than BLOOM-176B's Pytorch implementation.
+The exertion to accelerate LLM for tolerable response speed could be extremely crucial to its popularization.
+
+\begin{table*}[t]
+\footnotesize
+\centering
+\caption{Left: Quantized \glm's performance on several benchmarks; Right: INT4 quantized \glm's inference speed (encode and decode) with FasterTransformer.}
+\vspace{-2mm}
+\begin{subtable}
+    \centering
+    \begin{threeparttable}
+    \centering
+    \renewcommand\tabcolsep{3pt}
+    \renewcommand\arraystretch{0.75}
+    \begin{tabular}{@{}llccc@{}}
+    \toprule[1.2pt]
+    \multirow{2}{*}{Model Precision} & \multicolumn{3}{c}{\glm} & GPT-3 \\ \cmidrule(l){2-4} \cmidrule(l){5-5} 
+                                     & FP16   & INT8   & INT4   & FP16  \\ \midrule
+    MMLU (acc, $\uparrow$)           & 44.75  & 44.71  & 44.80  & 43.9  \\
+    LAMBADA (acc, $\uparrow$)        & 80.21  & 80.21  & 79.47  & 76.2  \\
+    Pile (a part, BPB, $\downarrow$) & 0.634  & 0.638  & 0.641  & 0.74  \\ \bottomrule[1.2pt] %PTB ($\downarrow$)
+    \end{tabular}
+    \end{threeparttable}
+\end{subtable}%
+\hspace{.02\linewidth}%
+\begin{subtable}
+    \centering
+    \begin{threeparttable}
+    \centering
+    \renewcommand\tabcolsep{2pt}
+    \renewcommand\arraystretch{0.95}
+    \begin{tabular}{@{}lcccc@{}}
+    \toprule[1.2pt]
+    GPU Type                     & \multicolumn{2}{c}{128 Enc./Dec.} & \multicolumn{2}{c}{512 Enc./Dec,} \\ \midrule
+    8 $\times$ A100 (40G)        & 0.15s           & 4.29s           & 0.18s           & 17.7s           \\
+    8 $\times$ V100 (32G)        & 0.31s           & 6.97s           & 0.67s           & 28.1s           \\
+    4 $\times$ RTX 3090 (24G)    & 0.37s           & 8.16s           & 1.30s           & 32.3s           \\
+    8 $\times$ RTX 2080 Ti (11G) & 0.39s           & 6.77s           & 1.04s           & 27.3s           \\ \bottomrule[1.2pt]
+    \end{tabular}
+    \end{threeparttable}
+    \end{subtable}
+    \vspace{-4mm}
+\label{tab:quantization}
+\end{table*}
+\subsection{Compression via Quantization}
+We have improved \glm's inference speed substantially, but its demand for at least a DGX-A100 (40G) server can still discourage individual developers and researchers.
+In light of the situation, we endeavor to compress \glm to fit into 4 $\times$ RTX 3090 Ti (24G)'s capacity, particularly via the quantization~\citep{zafrir2019q8bert,shen2020q,tao2022compression}, which presents little task-agnostic performance drop for generative language models.
+
+\vvpara{INT4 Weight Quantization.}
+Typical methods quantize both model weights and activation to INT8, enabling the INT8 matrix multiplication kernel for efficiency. 
+However, we find substantial outliers in GLM-130B's activations, making it hard for precision reduction. %to reduce the precision of activations. 
+Concurrent to our efforts and observations in \glm, researchers~\citep{dettmers2022llm} also discover the issue of emergent outliers in LLMs. 
+In their in-depth analysis on OPT-175B and BLOOM-176B, they find the outliers make up only about 0.1\% of all feature dimensions.
+Therefore, they propose to decompose the matrix multiplication for high-precision multiplication in outlying dimensions.
+
+But our detailed analysis demonstrates that the outliers in GLM-130B can sometimes make up at most 30\% of the feature dimension, which is different from GPT-based LLMs. %\todo{, possibly because we used GLU as a variant of FFN.}
+Therefore, a mixed-precision decomposition for \texttt{matmul} can be far less efficient than a single FP16 \texttt{matmul}. 
+After a few weeks of trial, we finally decide to keep the FP16 precision of activation and only consider the quantization of model weights. 
+In this case, the quantized \glm is dynamically converted to FP16 precision at runtime, introducing a small computational overhead but greatly reducing GPU memory usage for storing model weights.
+We quantize all linear layers, which take up most of the transformer parameters, via vector-wise symmetric quantization, and leave input/output embedding, layer normalization, and bias terms unchanged. 
+
+Surprisingly we note \glm's unusual talent for INT4 weight quantization.
+At the quantization precision of INT4, two INT4 weights are compressed into one INT8 weight for saving GPU memory usage.
+Thus approximately only 70GB GPU memory is required to serve INT4 \glm weights, which allow \glm's inference on even 4 $\times$ RTX 3090 Ti (24G) or 8 $\times$ RTX 2080 Ti (11G).
+More surprising, it requires no post-training at all and shows almost no quality degradation.
+On the contrary, it does not apply to BLOOM-176B in our experiments.
+
+\vvpara{Empirical Understanding.}
+Such nice property for \glm is fascinating but mysterious.
+We try our best to understand it and empirically demonstrate that the INT4 weight quantization for \glm may be a compound result of multiple factors, rather than a single one.
+
+In terms of whether a model can be properly quantized, the most fundamental reason lies in the skewness of its weight distribution.
+Since existing methods on weight mostly rely on symmetrical quantization, if weight distributions in certain linear layers are too skewed, the quantization would lose much precision.
+\begin{itemize}[leftmargin=*,itemsep=0pt,parsep=0.2em,topsep=0.0em,partopsep=0.0em]
+    \item \textbf{GLM pre-training objective}: 
+    \item \textbf{Gated Linear Unit (GLU)}:
+    \item \textbf{Scaling}:
+\end{itemize}
+
+\begin{insight}
+\rm Backbone architecture matters in LLMs' post quantization. While GLM scaled up to \glm can be quantized to as low as INT4, other LLMs only support INT8.
+\end{insight}
+
+} 
+
+\section{The Results}
+\label{sec:results}
+
+We follow the common settings in LLMs such as GPT-3 and PaLM to evaluate \glm for English~\footnote{\small Results in OPT-175B's paper are reported as applications to access it have not been approved for months.}. 
+As a bilingual LLM with Chinese, \glm is also evaluated on Chinese benchmarks. 
+
+\vvpara{Discussion on the Scope of Zero-Shot Learning in \glm.} %\label{sec:zero-shot-criterion}
+Since \glm has been trained with MIP, here we clarify its scope of zero-shot evaluation.
+In fact, ``zero-shot'' seems to have controversial interpretations without a consensus in the community. 
+We follow one of the influential related surveys~\citep{xian2018zero}, which says 
+\textit{``At test time, in zero-shot learning setting, the aim is to assign a test image to an unseen class label''}
+where involving unseen class labels is a key. 
+Therefore, we derive our criterion to pick \glm's zero-shot (and few-shot) datasets as:
+\begin{itemize}[leftmargin=*,itemsep=0pt,parsep=0.2em,topsep=0.0em,partopsep=0.0em]
+    \item \textbf{English}: 1) For tasks with fixed labels (e.g., \textit{natural language inference}): no datasets in such tasks should be evaluated on; 2) For tasks without fixed labels (e.g., \textit{(multiple-choice) QA, topic classification}): only datasets with an obvious domain transfer from those in MIP should be considered. % different
+    \item \textbf{Chinese}: All datasets can be evaluated as there exists a zero-shot cross-lingual transfer.
+\end{itemize}
+
+\vvpara{Filtering Test Datasets.}
+Following prior practices~\citep{brown2020language,rae2021scaling} and our criterion mentioned above, we filter and refrain to report potentially contaminated datasets' evaluation results.
+For LAMBADA and CLUE, we find minimal overlap under the 13-gram setting.
+Pile, MMLU, and BIG-bench are either held-out or released later than the crawling of corpora.
+
+\subsection{Language Modeling} \label{sec:language_modeling}
+
+\vvpara{LAMBADA.}
+LAMBADA~\citep{paperno2016lambada} is a dataset to test the last word language modeling capability.
+The results previously shown in Figure~\ref{fig:lambada} suggest \glm achieves a zero-shot accuracy of 80.2 with its bidirectional attention, setting up a new record on LAMBADA.
+
+\begin{wraptable}{r}{5.5cm}
+	\centering
+	\footnotesize
+	\vspace{-6mm}
+    \renewcommand\tabcolsep{2pt}
+\renewcommand\arraystretch{1}
+	\caption{\glm's average BPB on Pile evaluation (18 sub-datasets).}
+	\vspace{-3mm}
+	\scalebox{0.97}{
+	\begin{tabular}{@{}lccc@{}}
+    \toprule[1.2pt]
+                       & Jurassic-1     & GPT-3          & \glm           \\ \midrule
+    Avg. BPB      & 0.650          & 0.742          & \textbf{0.634} \\ \bottomrule[1.2pt]
+    \end{tabular}
+    }
+    \vspace{-4mm}
+\end{wraptable}
+
+\vvpara{Pile.} 
+The Pile test-set~\citep{gao2020pile} includes a series of benchmarks for language modeling.
+On average, \glm performs the best on its 18 shared test sets in terms of weighted BPB when compared to GPT-3 and Jurassic-1~\citep{lieber2021jurassic} whose results are directly adopted from the latter, demonstrating its strong language capability (Cf. Appendix~\ref{app:pile} for details).
+
+\subsection{Massive Multitask Language Understanding (MMLU)} \label{sec:mmlu}
+
+MMLU~\citep{hendrycks2021measuring} is a diverse benchmark including 57 multi-choice question answering tasks concerning human knowledge ranging from high-school-level to expert-level. 
+It is released after the crawling of Pile and serves as an ideal test-bed for LLMs' few-shot learning.
+The GPT-3 result is adopted from MMLU and BLOOM-176B is tested by using the same prompts as \glm's 
+(Cf. Appendix~\ref{app:mmlu} and Table~\ref{tab:mmlu} for details).
+
+\glm's few-shot (5-shot) performance on MMLU approaches GPT-3 (43.9) after viewing about 300B tokens in Figure~\ref{fig:mmlu}. 
+It continues moving up as the training proceeds, achieving an accuracy of 44.8 when the training has to end (i.e., viewing 400B tokens in total).  %and does not seem to saturate when training terminates.
+This aligns with the observation~\citep{hoffmann2022training} that most existing LLMs are far from adequately trained. 
+
+\subsection{Beyond the Imitation Game Benchmark (BIG-bench)} \label{sec:big-bench}
+
+\begin{figure}[t]
+\begin{minipage}{0.33\linewidth}
+    \small
+    \vspace{-5mm}
+    \centering
+    \includegraphics[width=1.0\linewidth]{figures/mmlu.pdf}
+    \vspace{-4mm}
+    \caption{\glm on MMLU (57 tasks) along training steps.}
+    \label{fig:mmlu}
+    \vspace{-6mm}
+\end{minipage}
+\hspace{.03\linewidth}%
+\begin{minipage}{0.34\linewidth}
+    \centering
+	\includegraphics[width=0.99\columnwidth]{figures/big-bench-lite_1e10.pdf}
+	\vspace{-5mm}
+	\caption{BIG-bench-lite evaluation (24 tasks) across scales.}
+	\label{fig:big-bench}
+\end{minipage}
+\hspace{.002\linewidth}%
+\begin{minipage}{0.27\linewidth}
+    \centering
+    \renewcommand\tabcolsep{1pt}
+    \renewcommand\arraystretch{1.2}
+    \scalebox{0.9}{
+    \footnotesize
+    \begin{tabular}{@{}lccc@{}}
+    \toprule[1.2pt]
+               & 0-shot         & 1-shot         & 3-shot         \\ \midrule
+    GPT-3 2.6B & 0.60           & 0.71           & 1.83           \\
+    GPT-3 6.7B & -0.06          & 2.93           & 5.40           \\
+    GPT-3 13B  & 1.77           & 5.43           & 7.95           \\
+    GPT-3 175B & 4.35           & 11.34          & 13.18          \\ \midrule
+    PaLM 540B  & 8.05           & \textbf{37.77} & -              \\ \midrule
+    \glm       & \textbf{13.31} & 14.91          & \textbf{15.12} \\ \bottomrule[1.2pt]
+    \end{tabular}}
+    \vspace{1mm}
+    \captionof{table}{Details on BIG-bench-lite (24 tasks).}
+    \label{tab:big-bench}
+\end{minipage}  
+\vspace{-5mm}
+\end{figure}
+
+BIG-bench~\citep{srivastava2022beyond} benchmarks challenging tasks concerning models' ability on reasoning, knowledge, and commonsense. 
+Given evaluating on its 150 tasks is time-consuming for LLMs, we report the BIG-bench-lite---an official 24-task sub-collection---for now.
+Observed from Figure~\ref{fig:big-bench} and Table~\ref{tab:big-bench}, 
+\glm outperforms GPT-3 175B and even PaLM 540B (4$\times$ larger) in zero-shot setting. 
+This is probably owing to \glm's bidirectional context attention and MIP, which has been proved to improve zero-shot results in unseen tasks~\citep{wei2022finetuned,sanh2022multitask}. 
+As the number of shots increases, \glm's performance keeps going up, maintaining its outperformance over GPT-3  
+(Cf. Appendix~\ref{app:big-bench} and Table~\ref{tab:big-bench-details} for details on each model and task).
+
+\vvpara{Limitations and Discussions.}
+In the experiments above, we observe that \glm's performance growth (13.31 to 15.12) with the increase of few-shot samples is not as significant as GPT-3's (4.35 to 13.18). 
+Here is our intuitive attempt to understand the phenomenon. 
+
+First, the bidirectional nature of \glm could lead to strong zero-shot performance (as is indicated in zero-shot language modeling), thus getting closer to the few-shot ``upper-bound'' for models of similar scale (i.e., 100B-scale) than unidirectional LLMs.
+Second, it may be also attributed to a deficit of existing MIP paradigms~\citep{wei2022finetuned,sanh2022multitask}, which only involve zero-shot prediction in the training and will be likely to bias \glm for stronger zero-shot learning but relatively weaker in-context few-shot performance.
+To correct the bias, a potential solution we came up with would be to employ MIP with varied shots of in-context samples rather than only zero-shot samples.% if we ever got a chance to continue pre-training \glm. 
+
+Finally, despite almost the same GPT architecture as GPT-3, PaLM 540B's relative growth with few-shot in-context learning is substantially more significant than GPT-3's. 
+We conjecture this further acceleration in performance growth is a source of PaLM's high-quality and diverse private-collected training corpora. 
+By combining our experiences with~\citep{hoffmann2022training}'s insights, we came to realize that better architectures, better data, and more training FLOPS should be further invested. 
+
+\subsection{Chinese Language Understanding Evaluation (CLUE)} \label{sec:clue}
+
+We evaluate \glm's Chinese zero-shot performance on established Chinese NLP benchmarks, CLUE~\citep{xu2020clue} and FewCLUE~\citep{xu2021fewclue}.%, which focus on language understanding tasks such as text matching and sentimental analysis. 
+Note that we do not include any Chinese downstream tasks in MIP. %, so there is only possibly a zero-shot cross-lingual transfer that contributes to \glm's zero-shot Chinese performance. 
+To date, we have finished testing on part of the two benchmarks, including 7 CLUE and 5 FewCLUE datasets (Cf. Appendix~\ref{app:clue} for details). 
+We compare GLM-130B to the largest existing Chinese monolingual language model---the 260B ERNIE Titan 3.0~\citep{wang2021ernie}. %, which possesses 260B parameters. 
+We follow its setting to report zero-shot results on dev datasets. 
+\glm consistently outperforms ERNIE Titan 3.0 across 12 tasks (Cf. Figure~\ref{fig:clue}). 
+Interestingly, \glm performs at least 260\% better than ERNIE on two abstractive MRC datasets (DRCD and CMRC2018), possibly due to \glm's pre-training objective that naturally resonates to abstractive MRC's form. 
+
+\begin{figure}[t]
+    \centering
+    \includegraphics[width=\linewidth]{figures/clue.pdf}
+    \vspace{-6mm}
+    \caption{\glm and ERNIE Titan 3.0 260B evaluated on zero-shot CLUE and FewCLUE.}
+    \label{fig:clue}
+    \vspace{-4mm}
+\end{figure}
+
+\hide{%%%%%start of hide %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+\section{Main Results}
+\label{sec:results}
+In this section, we introduce details in our experiments and evaluation settings.
+Following other works on LLMs~\citep{brown2020language,rae2021scaling,chowdhery2022palm}, we report \glm's zero-shot and few-shot performance over a number of benchmarks, domains, and tasks.
+Since \glm is a bilingual LLM proficient in both English and Chinese, we also evaluate it over popular Chinese language evaluation benchmarks in a zero-shot setting.
+
+\subsection{Discussion: Scope of Zero-shot Learning in \glm} \label{sec:zero-shot-criterion}
+As we are leveraging Multi-task Instruction Pre-Training (MIP), it is important to clarify our setting of "zero-shot".
+However, there seems to be no officially recognized definition for zero-shot learning, and many different interpretations exist in the community. 
+To our best knowledge, we refer to the definition from one of the most influential zero-shot learning surveys~\citep{xian2018zero}, which says 
+\textit{``... At test time, in zero-shot learning setting, the aim is to assign a test image to an unseen class label, ...
+''}
+where whether the evaluated task involves unseen class labels is a key. 
+Therefore, for NLP tasks we derive our criterion to select \glm zero-shot and few-shot evaluation datasets:
+\begin{itemize}[leftmargin=*,itemsep=0pt,parsep=0.2em,topsep=0.0em,partopsep=0.0em]
+    \item \textbf{English}: 1) For tasks with fixed labels (e.g., \textit{natural language inference, paraphrase identification}): no datasets in such tasks should be evaluated on; 2) For tasks without fixed labels (e.g., \textit{question answering, topic classification, multiple-choice QA}): only datasets with an obvious domain transfer and different labels from those in MIP should be considered.
+    \item \textbf{Chinese}: All datasets can be evaluated as there exists a zero-shot cross-lingual transfer.
+\end{itemize}
+
+\todo{Filtering test set}
+
+\subsection{Language Modeling}
+Language modeling is an intrinsic evaluation criterion for any language models.
+Since memorization would substantially help language modeling, for \glm, we refrain to only report \glm's performance on LAMABADA~\citep{paperno2016lambada} and Pile test-set~\citep{gao2020pile}.
+
+\vvpara{LAMBADA.}
+Following other models~\citep{black2022gpt,gpt-j} trained on Pile corpus, we report results on LAMBADA, a dataset to test last word language modeling capability.
+The results have been shown in Figure~\ref{fig:lambada}, in which \glm achieves a zero-shot accuracy of 80.2 with its superior bidirectional attention, setting up a new record on LAMBADA.
+
+\begin{wraptable}{r}{6.5cm}
+	\centering
+	\footnotesize
+	\vspace{-4mm}
+    \renewcommand\tabcolsep{2pt}
+	\caption{\glm and its similar-sized LLMs' average BPB on Pile (18 sub-datasets).}
+	\vspace{-2mm}
+	\scalebox{0.97}{
+	\begin{tabular}{@{}lccc@{}}
+    \toprule[1.2pt]
+                       & Jurassic-1     & GPT-3          & \glm           \\ \midrule
+    Weighted Avg. BPB      & 0.650          & 0.742          & \textbf{0.634} \\ \bottomrule[1.2pt]
+    \end{tabular}
+    }
+    \vspace{-2mm}
+\end{wraptable}
+
+\vvpara{Pile Evaluation.} 
+We evaluate \glm's performance on Pile test-set~\citep{gao2020pile}, which includes a series of benchmarks for language modeling.
+We compare \glm's BPB on Pile test-set with GPT-3 and Jurassic-1~\citep{lieber2021jurassic} based on results reported in~\citep{lieber2021jurassic}.
+On average, \glm performs the best on these 18 shared test sets in these three LLMs, which proves its strong language capability. Detailed analysis and results are shown in Appendix~\ref{app:pile}.
+
+\subsection{Massive Multitask Language Understanding (MMLU)} \label{sec:mmlu}
+
+\begin{wrapfigure}{r}{5.3cm}
+    \small
+    \vspace{-4mm}
+    \centering
+    \includegraphics[width=1.0\linewidth]{figures/mmlu.pdf}
+    \vspace{-4mm}
+    \caption{\glm on MMLU (57 tasks) along its training trajectory.}
+    \label{fig:mmlu}
+    \vspace{-6mm}
+\end{wrapfigure}
+
+MMLU~\citep{hendrycks2021measuring} is a diverse benchmark including 57 multi-choice question answering tasks concerning human knowledge ranging from high-school-level to expert-level. 
+It serves as an ideal test-bed for LLMs' few-shot learning and is released after the crawling of Pile.
+
+We plot \glm's few-shot (5-shot) performance along its training trajectory in Figure~\ref{fig:mmlu}. 
+It approaches GPT-3 comparable performance 43.9 after viewing about 300 billion tokens. 
+Its performance continues growing as the training proceeds, achieving 44.8 after viewing 400 billion tokens and does not seem to saturate when training terminates.
+This aligns with the observation in~\citep{hoffmann2022training} that existing LLMs are still far from adequately trained.
+GPT-3 results are from~\citep{hendrycks2021measuring} and BLOOM 176B results are tested by ourselves using the same prompts as \glm does.
+More detailed results on each discipline of MMLU can be find in Appendix~\ref{app:mmlu} and Table~\ref{tab:mmlu}.
+
+\subsection{Beyond the Imitation Game Benchmark (BIG-bench)}
+
+\begin{figure}[t]
+\begin{minipage}{0.72\linewidth}
+    \centering
+	\includegraphics[width=0.99\columnwidth]{figures/BIG-bench.pdf}
+	\vspace{-2.2mm}
+	\caption{BIG-bench-lite evaluation (24 tasks) across scales.}
+	\label{fig:big-bench}
+\end{minipage}
+\begin{minipage}{0.27\linewidth}
+\centering
+\renewcommand\tabcolsep{1pt}
+\renewcommand\arraystretch{1.4}
+\scalebox{0.9}{
+\footnotesize
+\begin{tabular}{@{}lccc@{}}
+\toprule[1.2pt]
+           & 0-shot         & 1-shot         & 3-shot         \\ \midrule
+GPT-3 2.6B & 0.60           & 0.71           & 1.83           \\
+GPT-3 6.7B & -0.06          & 2.93           & 5.40           \\
+GPT-3 13B  & 1.77           & 5.43           & 7.95           \\
+GPT-3 175B & 4.35           & 11.34          & 13.18          \\ \midrule
+PaLM 540B  & 8.05           & \textbf{37.77} & -              \\ \midrule
+\glm       & \textbf{13.31} & 14.91          & \textbf{15.12} \\ \bottomrule[1.2pt]
+\end{tabular}
+}
+\vspace{1mm}
+\captionof{table}{Details on BIG-bench-lite (24 tasks).}
+\label{tab:big-bench}
+\end{minipage}  
+\vspace{-5mm}
+\end{figure}
+
+BIG-bench~\citep{srivastava2022beyond} is a novel benchmark with many challenging tasks concerning models' ability on reasoning, world knowledge, and commonsense.
+Since the full BIG-bench covers 150 tasks, a complete evaluation can be too expensive and time-consuming for LLMs.
+Thus the BIG-bench-lite, an officially released 26-task sub-collection, is considered in \glm at first.
+
+Our results are shown in Figure~\ref{fig:big-bench} and Table~\ref{tab:big-bench}.
+With 130 billion parameters, \glm outperforms larger-sized GPT-3 175B and even PaLM-540B in zero-shot setting.
+This is probably owing to \glm's bidirectional attention over contexts and MIP training (which has been proved to encourage zero-shot learning in unseen tasks~\citep{wei2022finetuned,sanh2022multitask}).
+As the number of shots increases, \glm's performance on BIG-bench-lite also grows and outperforms GPT-3.
+More detailed results on each model for each task and evaluation can be find in Appendix~\ref{app:big-bench} and Table~\ref{tab:big-bench-details}.
+
+\vvpara{Limitations and Discussion.}
+We observe that \glm's growth when increasing few-shot samples is not as significant as GPT-3's. 
+There are some reasons that intuitively explain the phenomenon.
+First, \glm's bidirectional nature could lead to stronger zero-shot performance (as is indicated in zero-shot language modeling) and approach significantly more to its few-shot upper-bound than unidirectional LLMs.
+Second, it may be also attributed to a deficit of existing MIP paradigms~\citep{wei2022finetuned,sanh2022multitask}, which only involve zero-shot prediction in the training and will be likely to bias \glm for stronger zero-shot learning but relatively weaker in-context few-shot performance.
+We think a potential remedy would be to employ MIP with varied shots of in-context samples rather than only zero-shot samples in our continual pre-training to correct the bias.
+
+Finally, despite almost the same GPT architecture, PaLM-540B's growth with few-shot in-context learning is exceedingly substantial compared to GPT-3, which we suppose is because of its high-quality and diverse private collected corpora. 
+Combining observations from~\citep{hoffmann2022training}, we think it is high time that our community should invest more on better pre-training architecture, data, and more training FLOPS, rather than a mere larger size.
+
+\subsection{Chinese Language Understanding Evaluation (CLUE)}
+
+As GLM-130B is a bilingual language model, we also evaluate its zero-shot performance on established Chinese NLP benchmarks, CLUE~\citep{xu2020clue} and FewCLUE~\citep{xu2021fewclue}, which majorly address language understanding tasks such as text matching and sentimental analysis.
+Note that we do not include any Chinese downstream tasks in MIP, so there is only possibly a zero-shot cross-lingual transfer that contributes to \glm's zero-shot Chinese performance. 
+We currently have finished the testing on part of the two benchmarks, including 7 CLUE and 5 FewCLUE datasets.
+
+We compare GLM-130B to the largest existing Chinese monolingual language model ERNIE Titan 3.0~\citep{wang2021ernie}, which possesses 260B parameters. 
+Following its setting, we report zero-shot results on dev datasets. 
+As is shown in the Figure~\ref{fig:clue}, \glm generally outperforms ERNIE Titan 3.0.
+Interestingly, \glm performs extraordinarily well on abstractive MRC datasets DRCD and CMRC2018.
+We speculate that \glm's blank infilling objective naturally resonates to abstractive machine reading comprehension.
+More details please refer to Appendix~\ref{app:clue}.
+
+\begin{figure}[t]
+    \centering
+    \includegraphics[width=\linewidth]{figures/clue.pdf}
+    \vspace{-6mm}
+    \caption{\glm and ERNIE Titan 3.0 (260B) evaluated on zero-shot CLUE and FewCLUE.}
+    \label{fig:clue}
+    \vspace{-6mm}
+\end{figure}
+
+}%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+In this section, we review related work to \glm on topics of pre-training, transferring, and inference of pre-trained LLMs~\citep{qiu2020pre,bommasani2021opportunities}.
+
+\vvpara{Pre-Training.}
+Vanilla language modeling refers to decoder-only autoregressive models (e.g., GPT~\citep{radford2018improving}), but it also recognizes any forms of self-supervised objectives on texts. %over unlabeled corpora.%, especially with the transformer architecture.
+Recently, transformer-based~\citep{vaswani2017attention} language models present a fascinating scaling law: new abilities~\citep{wei2022emergent} arise as models scale up, from 1.5B~\citep{radford2019language}, 10B-scale language models~\citep{raffel2020exploring,shoeybi2019megatron,black2022gpt}, to 100B-scale GPT-3~\citep{brown2020language}.
+Later, despite many 100B-scale LLMs~\citep{lieber2021jurassic,thoppilan2022lamda,rae2021scaling,smith2022using,chowdhery2022palm,wu2021yuan,zeng2021pangu,wang2021ernie} in both English and Chinese, they are not available to public or only accessible via limited APIs.
+The closeness of LLMs severely stymies its development.
+\glm's efforts, along with recent ElutherAI, OPT-175B~\citep{zhang2022opt}, and BLOOM-176B~\citep{scao2022what}, aim to offer high-quality open-sourced LLMs to our community.
+
+\vvpara{Transferring.}
+Though fine-tuning has been a \textit{de facto} way for transfer learning, the evaluation for LLMs has been focused on prompting and in-context learning due to their tremendous sizes~\citep{brown2020language,liu2021pre}.
+Nevertheless, some recent attempts has been on parameter-efficient learning on language models
+~\citep{houlsby2019parameter} and prompt tuning (i.e., P-tuning, ~\cite{li2021prefix,liu2021gpt,lester2021power,liu2022p}). %,hu2022lora,zaken2022bitfit
+For now we do not focus on them and will leave the comprehensive testing of them on \glm in future study.
+
+\vvpara{Inference.}
+Most public-accessible LLMs nowadays are providing their services via limited APIs.%, as their size is not for economical GPUs.
+In this work, an important part of our endeavor has been on LLMs' efficient and fast inference.
+Related work may include distillation~\citep{sanh2019distilbert,jiao2020tinybert,wang2020minilm}, quantization~\citep{zafrir2019q8bert,shen2020q,tao2022compression}, and pruning~\citep{michel2019sixteen,fan2019reducing}.
+Very recent work~\citep{dettmers2022llm} shows that LLMs such as OPT-175B and BLOOM-176B can be quantized to 8 bit due to special distribution of outlier dimensions.
+In this work, we demonstrate GLM's scaling law for INT4 weight quantization, which allows \glm to inference on as few as 4$\times$RTX 3090 (24G) GPUs or 8$\times$RTX 2080 Ti (11G) GPUs.
+
+We introduce \glm, a bilingual pre-trained language model that aims to facilitate open and inclusive LLM research. 
+\glm's technical and engineering undertakings generate insight into LLMs' architectures, pre-training objectives, training stability and efficiency, and affordable inference. Altogether, it contributes to the high quality of \glm in terms of both language performance on 112 tasks and ethical results on bias and toxicity benchmarks. 
+Our experiences of both success and failure are condensed into the lessons for training 100B-scale LLMs, attached in the Appendix \ref{sec:lessons}.
+
+\hide{
+\begin{enumerate}[leftmargin=*,itemsep=0pt,parsep=0.2em,topsep=0.0em,partopsep=0.0em]
+    \item 
+    The bidirectional-attention GLM is a strong objective alternative, in addition to GPTs. % at large scale.
+    \item Configure LLMs based on the cluster and parallel strategy used to squeeze hardware potential.
+    \item Counter-stereotypically, DeepNorm, a type of Post-LN, is the LN option to stabilize \glm.
+    \item Training instability that LLMs suffer from arises systematically, numerically, and unexpectedly.
+     \item Though FP16 induces more instability, it enables training and inference on diverse platforms. 
+ 
+    \item Shrinking embedding layer's gradient by a factor of 10 can solve most numerical instability.
+    \item GLM has a INT4 weight quantization scaling law unobserved in GPT-style BLOOM.
+    \item To create powerful LLMs, the main focus can be on 1) more and better data, 2) better architectures and pre-training objectives, and 3) more sufficient training.
+\end{enumerate}
+}
+
+\hide{
+We introduce \glm, an open bilingual pre-trained model that aims to promote transparency and inclusivity in LLM research.
+Our engineering undertakings and unique insights into LLMs' architectures, objectives, and training process jointly contribute to its average strong language performance over 112 tasks and mitigated bias and toxicity benchmarks we evaluate.
+We condense our experiences of both success and failure into the following valuable lessons to our community:
+
+\begin{enumerate}[leftmargin=*,itemsep=0pt,parsep=0.2em,topsep=0.0em,partopsep=0.0em]
+    \item Bidirectional-attention GLM can be stronger than unidirectional GPTs at large scale.
+    \item Configure your LLMs based on your cluster and parallel strategy to squeeze hardware potential.
+    \item Counter-stereotypically, DeepNorm, a type of Post-LN, is the LN option to stabilize \glm.
+    \item Instabilities that LLMs suffer from in pre-training arouses systematically and numerically.
+    \item FP16 is a challenging but rewarding decision for \glm: it induces more systematical instability, but is a must for enabling LLMs to train and inference on inclusive ranges of platforms.
+    \item Shrinking embedding layer's gradient to its 0.1 can solve most numerical instability problems.
+    \item GLM architecture presents a unique scaling law of INT4 weight quantization unseen in BLOOM.
+    \item To create inclusive LLMs better than those of big companies', community's later focus should be on 1) more and better data, 2) better architectures and objectives, and 3) more sufficient training.
+\end{enumerate}
+
+}
+
+\section*{Acknowledgement}
+This research was supported by Natural Science Foundation of China (NSFC) 61825602, 62276148 and Zhipu.AI.
+We thank all our collaborators and partners from the Knowledge Engineering Group (KEG), Parallel Architecture \& Compiler technology of Mobile, Accelerated, and Networked systems Group (PACMAN), Natural Language Processing Group (THUNLP) at Tsinghua University, and Zhipu.AI.
+
+\section*{Ethics Statement}
+We hereby acknowledge that all of the co-authors of this work are aware of the provided ICLR Code of Ethics and honor the code of conduct.
+This work introduces an open-source Large Language Model (LLM), which could be used to generate synthetic text for harmful applications, such as telemarketing fraud, political propaganda, and personal harassment as is discussed in~\citep{weidinger2021ethical,Sheng2021SocietalBI,Dev2021HarmsOG}. 
+We do not anticipate any hazardous outputs, especially towards vulnerable and historically disadvantaged groups of peoples, after using the model.
+
+And to better collaborate with our community to prevent and ultimately eliminate the risks technically, we make the following crucial open efforts in this work:
+
+\vvpara{Open-Sourced LLMs for Ethical Risk Study.}
+While some people think that restricting the access of LLMs can prevent such harmful applications, we argue that promoting LLM inclusivity can lead to better defense against potential harms caused by LLMs. 
+Currently, only governments and large corporations can afford the considerable costs of pre-training LLMs. 
+There is no guarantee that organizations having the the substantial financial resources will not do harm using a LLM. 
+Without access to such LLMs, individuals cannot even realize the role of LLMs in the harm. 
+
+Conversely, releasing an open LLM can provide access and transparency to all the researchers and promote the research to reduce the potential harm of LLMs, like algorithms to identify the synthetic text~\cite{gehrmann2019gltr}. 
+Also, it is known that LLMs can suffer from problems in fairness, bias, privacy, and truthfulness~\cite{abs-2112-12938,lin2022truthfulqa,Liang2021SocialBias,Bender2021Danger}. 
+An open LLM can reveal the model parameters and internal states corresponding to specific inputs instead of providing APIs to black-box models. 
+In conclusion, researchers can conduct analysis of LLMs' flaws in depth and propose improved algorithms to solve the problems. 
+
+\vvpara{Ethical Evaluation and Improvements.}
+We also evaluate our model over a wide range of English ethical evaluation benchmarks, including bias measurement~\citep{nadeem2021stereoset,nangia2020crows}, hate speech detection~\citep{mollas2020ethos}, and toxic generation estimation~\citep{gehman2020realtoxicityprompts}.
+Notwithstanding their deficiency~\citep{blodgett2021stereotyping,jacobs2021measurement}, these datasets serve as a meaningful initial step towards an open quantitative evaluation LLMs.
+
+Our evaluation implies that our algorithm designs, especially the bilingual pre-training of a LLM, can significantly mitigate the biases and toxicity an LLM may present while keeping its strong language performance compared to other LLMs~\citep{brown2020language,zhang2022opt} trained with monolingual English corpora (Cf. Appendix~\ref{app:ethics} for more details).
+
+\section*{Reproducibility}
+Compared to mainstream closed-sourced LLMs including GPT-3 175B\citep{brown2020language}, PaLM 540B~\citep{chowdhery2022palm}, Gopher~\citep{rae2021scaling}, Chinchilla~\citep{hoffmann2022training}, LaMDA~\citep{thoppilan2022lamda}, FLAN~\citep{wei2022finetuned}, and many others, \glm is open-sourced and devotes to promote openness and inclusivity in LLM research from the very beginning.
+
+We have paid great effort to ensure the reproducibility of our evaluation.
+For pre-training section, despite the unaffordable costs it needs to reproduce at present, we still make our best efforts to disclose the code, details, and the whole process of \glm's pre-training. 
+Our endeavor to allow \glm inference on few popularized GPUs such as 3090/2080 Ti also aligns with the reproducibility undertaking, as it allows most academic researchers to reproduce \glm's results on their offline machines.
+We also provide free APIs for individual users to test \glm's ability.
+
+\vvpara{Pre-Training.}
+We provide the complete training notes, Tensorboard logs, and code for our pre-training in our repository (Cf. Abstract).
+The pre-training hyper-parameters and cluster configuration are provided in Section~\ref{sec:parallel_strategy} and Table~\ref{tab:config}.
+The training corpora composition and details for Multi-task Instruction Pre-training are provided in Section~\ref{sec:training_objective} and Appendix~\ref{app:mip_description} and~\ref{app:mip_dataset}. 
+
+\vvpara{Evaluation.}
+We organize all the evaluation, including language benchmarks (LAMBADA, Pile, MMLU, BIG-bench, CLUE, and FewCLUE) and ethical benchmarks (CrowS-Pairs, StereoSet, ETHOS, RealToxicPrompts), into one-command-to-run bash scripts in our code repository.
+Data processing details for language modeling benchmarks are provided in Section~\ref{sec:language_modeling} and Appendix~\ref{app:pile}, for MMLU are provided in Section~\ref{sec:mmlu} and Appendix~\ref{app:mmlu}, for BIG-bench are provided in Section~\ref{sec:big-bench} and Appendix~\ref{app:big-bench}, for CLUE and FewCLUE are provided in ~\ref{sec:clue}.
+For all ethical evaluation, please refer to Appendix~\ref{app:ethics} for details.
+
+\clearpage
+
+\end{document}

@@ -1,0 +1,286 @@
+\title{Better Alignment with Instruction Back-and-Forth Translation}
+
+\begin{document}
+
+\maketitle
+\begin{abstract}
+We propose a new method, instruction back-and-forth translation, to construct high-quality synthetic data grounded in world knowledge for aligning large language models (LLMs). Given documents from a web corpus, we generate and curate synthetic instructions using the backtranslation approach proposed by \citet{li2023self}, and rewrite the responses to improve their quality further based on the initial documents. Fine-tuning with the resulting (backtranslated instruction, rewritten response) pairs yields higher win rates on AlpacaEval than using other common instruction datasets such as Humpback, ShareGPT, Evol-Instruct, Open Orca, Alpaca-GPT4 and Self-instruct. We also demonstrate that rewriting the responses with an LLM outperforms direct distillation, and the two generated text distributions exhibit significant distinction in embedding space.
+Further analysis shows that our backtranslated instructions are of higher quality than other sources of synthetic instructions, while our responses are more diverse and complex than those obtained from distillation. Overall we find that instruction back-and-forth translation combines the best of both worlds---making use of the information diversity and quantity found on the web, while ensuring the quality of the responses which is necessary for effective alignment.
+\end{abstract}
+
+\section{Introduction}\label{intro}
+\vspace{-0.25em}
+\begin{figure*}[t]
+\centering
+\hspace{-0.1em}
+\includegraphics[trim=0 0cm 0 0,clip,width=1.01\linewidth]
+{fig1.png}
+\vskip -0.5em
+\caption{\textbf{Overview of our proposed pipeline: instruction back-and-forth translation.} (1) We first fine-tune a base model, e.g. Llama-2, on some seed examples from Open Assistant, for the task of instruction generation. We then extract initial candidate responses from a web corpus, e.g. Dolma, and use the fine-tuned model to obtain synthetic instructions that would go with the corresponding responses; (2) We separately obtain an instruction-following model by fine-tuning the same base model on the seed examples, and use it to score the quality of the (synthetic instruction, web-scraped response) pairs; (3) With the highest scoring pairs, we ask an existing aligned model (e.g. Llama-2-chat) to improve the responses further, conditioned on the generated instructions and the initial web texts. Steps (1) and (2) follow \citet{li2023self} with some modifications (i.e. using preprocessed documents from Dolma instead of parsing raw HTMLs from ClueWeb). We provide a specific data example in the bottom row.
+}
+\label{fig:main_fig}
+\vspace{-1em}
+\end{figure*}
+In recent years, it is increasingly common for large language models (LLMs) to be deployed through a chat interface to interact with users' queries. This capability is achieved by taking models that have been pre-trained on massive amounts of web-crawled text and fine-tuning them on a relatively smaller set of instruction-response pairs or preferences \cite{ouyang2022training}. Popular
+instruction-tuning corpora are often constructed by \textit{(i)} human annotation and curation \cite{kopf2024openassistant,DatabricksBlog2023DollyV2,zhou2024lima}, \textit{(ii)} converting existing texts, e.g. from other NLP tasks \cite{longpre2023flan} or web crawls \cite{li2023self,koksal2023longform} to instruction-response pairs, and \textit{(iii)} distilling knowledge from a model \cite{vicuna2023,mukherjee2023orca}. 
+
+There are benefits and disadvantages to each of these approaches. While \textit{(i)} can offer strong baselines \cite{zhou2024lima, kopf2024openassistant}, the reliance on human annotations makes scaling up these datasets difficult. %As a result, datasets from this approach remain limited in quantity.
+The success of \textit{(i)} and \textit{(ii)} is also more dependent on having an effective filtering mechanism to remove noisy data from humans and the web. On the other hand, \textit{(iii)} is more cost-effective and scalable; many current state-of-the-art instruction datasets employ distillation. However, distillation alone has also been claimed to be a ``false promise''---\citet{gudibande2023false} shows that specific capability improvements depend on the coverage of the distilled data and that the performance gains from distilling can plateau quickly. These findings suggest that less noisy and more diverse data is crucial for instruction-tuning to close the gap between open and closed LLMs.
+
+Given the knowledge breadth that can be found on the internet, generating instruction-response data with backtranslation has been shown to be a promising alternative to distillation \cite{li2023self}. In particular, the authors parse the ClueWeb corpus \cite{overwijk2022clueweb22} for self-contained text segments, train a model specifically for instruction generation on Open Assistant data \cite{kopf2024openassistant}, and generate instructions to go with the text segments. However, this approach relies on high-quality text data provided by ClueWeb, a paid-access corpus containing only the most popular web pages from search results, as well as a list of manually specified rules for parsing raw HTML files into structured responses (which are then used directly for fine-tuning). %This poses accessibility and scalability issues respectively.
+
+In this work, we also adopt the instruction backtranslation technique but make it more accessible and scalable. We make direct use of preprocessed documents from a large-scale \textit{open-source} corpus like Dolma \cite{dolma} and generate instructions via backtranslation accordingly. We find that the quality of our instructions are comparable to those backtranslated from ClueWeb. To make up for the lack of manually designed rules for structuring the response, we experiment with using an LLM to rewrite the response based on the generated instruction and the initial web text. This also allows us to avoid directly distilling and overfitting to an LLM's knowledge. An overview of our pipeline, which we call \emph{back-and-forth translation}, can be found in Figure \ref{fig:main_fig}. %We seek to leverage the quality of the response annotations produced via distillation, while still incorporating the information diversity of web-scraped texts.
+
+Given the same data quantity, fine-tuning Llama-2-70B on the instruction-response pairs from our data generation pipeline improves the AlpacaEval win rate by 3.6\% compared to using the backtranslation data from previous work \cite{li2023self}, and by at least 3.2\% compared to using other existing distillation datasets such as OpenOrca \cite{OpenOrca}, ShareGPT \cite{vicuna2023}, Evol-Instruct \cite{xu2023wizardlm}, Alpaca-GPT4 \cite{peng2023instruction} and Self-instruct \cite{wang2022self} (Section \ref{performance}). By asking a model to rewrite responses based on initial texts extracted from Dolma, we obtain a distribution of responses that interpolates between the original web text distribution and the distribution of outputs distilled from the same model. Fine-tuning on the rewritten responses in turn outperforms fine-tuning on the distilled responses corresponding to the same instructions (Section \ref{rewrite_vs_distill}). In addition, we offer some insights into how instruction backtranslation and response rewriting affect the quality of instructions and responses respectively, especially in comparison with existing data generation methods (Sections \ref{instruction_quality} and \ref{response_quality}). Overall our results suggest that back-and-forth translation offers an effective way to generate instruction-tuning data enriched with diverse information found on the web, while ensuring the quality of the response annotations by having aligned LLMs in the loop.
+\vspace{-0.25em}
+\section{Method}\label{method}
+Figure \ref{fig:main_fig} shows an overview of our pipeline. Here we describe each step in more detail.
+\vspace{-0.25em}
+\subsection{Background: instruction backtranslation}
+Our work is inspired by the backtranslation method from \citet{li2023self}. In this previous work, the authors fine-tune a base language model on some seed instruction-response pairs ${(x_s, y_s)}$ (e.g. from Open Assistant \cite{kopf2024openassistant}) to obtain a backward model $M_{yx} := p(x|y)$ that learns to generate instructions. The authors then extract candidate responses ${y_i}$ from .warc files of a web corpus, ClueWeb, using carefully constructed HTML-parsing rules, and augment the responses with corresponding instructions output by the backward model. This yields a set of candidate ${(\hat{x}_i, y_i)}$ pairs. 
+
+The authors also separately fine-tune the same base language model on the same seed data ${(x_s, y_s)}$ to obtain a forward model $M_{xy} := p(y|x)$ that can follow instructions. This model is then prompted to score candidate ${(\hat{x}_i, y_i)}$ pairs on a 5-point scale. The final instruction-tuning dataset consists of only score-5 examples. The paper provides ablations to show that this curation step is critical to achieving performance gains, especially with increasing instruction data quantity.
+
+The two steps derived from \citet{li2023self} are denoted as \texttt{(1) Backtranslation} and \texttt{(2) Filtering} in Figure \ref{fig:main_fig}.
+\vspace{-0.25em}
+\subsection{The rewriting process}
+A major limitation of previous work \cite{li2023self} 
+is the limited availability of high-quality candidate responses. The authors rely on Clueweb \cite{overwijk2022clueweb22} as the source for unlabelled responses $\{y_i\}$, using only highly linked websites visited by a search engine (e.g. Wikipedia, popular news sites) as this offers quality control over the extracted texts $\{y_i\}$. However, (i) ClueWeb requires paid access, (ii) the text segments were extracted from raw HTML format, which requires specific preprocessing and may still result in segments that are sub-optimal as responses.
+
+Our work removes the data access restrictions and preprocessing steps by using cleaned documents from an open-source corpus, Dolma \cite{dolma}, for the initial web-scraped responses. Since these documents come pre-extracted (with all HTML structures removed) and were written for various purposes, they may contain redundant information and the content presentation could also be improved (e.g. by being split into paragraphs). Consequently, we use an LLM to improve these documents to better resemble responses from AI Assistants; this step is denoted as \texttt{(3) Rewriting} in Figure \ref{fig:main_fig}. Conditioned on initial text $y_i$ from Dolma and the corresponding backtranslated instruction $\hat{x}_i$, we prompt an aligned LLM, Llama-2-70B-chat, to rewrite the response to improve its quality ($y_i'$). The full prompt can be found in Appendix \ref{app:prompt}. 
+
+By default, we apply rewriting to ${(\hat{x}_i, y_i)}$ pairs that have passed the filtering stage. However, we also experiment with skipping the filtering step, i.e. rewrite responses for \textit{any} pair even if the forward model finds some web responses and corresponding generated instructions not properly aligned. Overall we find that step \texttt{(3) Rewriting} is more effective compared to \texttt{(2) Filtering}, though using both offers complementary performance benefits. We will elaborate on this in Section \ref{performance}.
+
+\vspace{-0.25em}
+\section{Experiment setup}
+\subsection{Training details}
+\vspace{-0.25em}
+\paragraph{Data.} To source the initial web-crawled responses, we use the Common Crawl subset of Dolma v1 \cite{dolma}. This subset has been preprocessed with quality and content filters, in addition to undergoing deduplication. We additionally filter out documents whose lengths are close to exceeding the context length of Llama-2; this removes about 25\% of the Common Crawl subset. Besides, we only use data from the head split (which consists of documents with the best perplexity scores), as preliminary experiments show that this split offers better candidate responses than the middle split (see Table \ref{tab:cc_sources} in Appendix).
+
+For the seed data used to train the forward and backward models, we follow previous work \cite{li2023self} and use 3200 examples from the Open Assistant dataset \cite{kopf2024openassistant}, chosen from the first turn of each conversation tree. Note that the seed data only consists of English language responses that are considered high-quality, based on their human annotated rank (rank 0).
+\vspace{-0.25em}
+\paragraph{Model.} We fine-tune a Llama-2-70B base model \cite{touvron2023llama2} on the seed data to obtain the forward and backward models used in steps (1) and (2) of our pipeline. The rewriting step employs Llama-2-70B-chat by default. We also experiment with using a smaller model (Llama-2-7B-chat) as well as the forward model from step (2) for rewriting, but we observe that the output quality is worse (Appendix \ref{app:rewrite_ablations}).
+For performance evaluation, we fine-tune both the 7B and 70B scales of the Llama-2 base model on the resulting instruction-response pairs in a supervised manner. Specific hyperparameters can be found in Appendix \ref{app:more_train_details}.
+\vspace{-0.25em}
+\paragraph{Evaluation.} Given a fine-tuned Llama-2 model, we prompt it to respond to 805 questions from the AlpacaEval benchmark \cite{alpaca_eval} and report the model's win rate over text-davinci-003 as evaluated by GPT-4 model. We also adopt the length-controlled win rate evaluation from AlpacaEval 2.0 \cite{dubois2024length}, see Appendix \ref{app:alpaca2} for more details. Performance on other NLP tasks can be found in Appendix \ref{app:other_nlp_evals}.
+
+\subsection{Baselines}\label{baselines}
+The other fine-tuning data sources we compare to include:
+\begin{itemize}[topsep=0pt, itemsep=0pt, leftmargin=8pt, parsep=2pt]
+    \item \textbf{Open Orca} \cite{OpenOrca,mukherjee2023orca}: contains GPT-4-distilled outputs to FLAN tasks \cite{longpre2023flan}, which are converted from existing NLP datasets using manually crafted templates. The tasks have been augmented with prompting to elicit some form of reasoning during distillation.
+    \item \textbf{ShareGPT} \cite{vicuna2023}: the data comes from ShareGPT.com, where users shared their own conversation logs with ChatGPT. We only take the first instruction and first response from each conversation for fine-tuning.
+    \item \textbf{ClueWeb + filtering} \cite{li2023self}: responses are parsed from HTML files in the ClueWeb corpus \cite{overwijk2022clueweb22} and do not undergo rewriting. Instructions are generated with the backtranslation approach. After preprocessing and two rounds of curation, previous work produces 41.8K instruction-response pairs in total.
+    \item \textbf{Self-instruct} \cite{wang2022self}: the instructions, inputs and outputs are generated by GPT-3, bootstrapped from a small set of seed tasks.
+    \item \textbf{Alpaca-GPT4} \cite{peng2023instruction}: contains GPT-4-distilled responses to instructions from Alpaca dataset \cite{taori2023alpaca}. Alpaca's instruction generation seeks to improve over the Self-instruct framework by using different prompts and a more advanced model (text-davinci-003).
+    \item \textbf{Evol-Instruct} \cite{xu2023wizardlm}: starting from the Alpaca instruction set, this work uses a set of evolution prompts to rewrite the instructions to improve their complexity. This evolution process is repeated multiple times, using an eliminator in between to filter out the failed instructions. Responses are then distilled from ChatGPT.
+\end{itemize}
+We note that except for the first two, the rest of the baselines employ synthetic instructions. Besides, the majority of these datasets (other than ClueWeb) distill responses from different existing LLMs. We use these GPT-distilled datasets for research-only, non-commercial purposes (i.e. to serve as competitive baselines to compare our method against).
+
+\vspace{-0.25em}
+\section{Fine-tuning results}\label{performance}
+We validate the effectiveness of our data generation method, by examining the AlpacaEval performance of Llama-2 models fine-tuned on our data versus on other datasets, given the same instruction quantity.
+\vspace{-0.25em}
+\subsection{7B scale}
+We fix the number of samples to be 12.8K and compare fine-tuning Llama-2-7B base model on our backtranslation and rewritten data to fine-tuning on other common baselines described in Section \ref{baselines}. Results are shown in Table \ref{tab:7b_results}.
+Below we describe our different data variations in more detail:
+\begin{itemize}[topsep=0pt, itemsep=0pt, leftmargin=8pt, parsep=2pt]
+\item \textit{Dolma + filtering:} Data obtained from steps (1) and (2) of our pipeline (Figure \ref{fig:main_fig}). We gather initial responses from the Dolma corpus, generate corresponding instructions with backtranslation, and filter out instruction-response pairs that do not get a score 5 from our forward model (i.e. not well-aligned). Responses do not undergo rewriting for this baseline.
+\item \textit{Dolma + rewriting:} Data obtained from steps (1) and (3) of our pipeline (Figure \ref{fig:main_fig}). We source candidate responses from Dolma, generate instructions with backtranslation and rewrite the responses with Llama-2-70B-chat. No intermediate filtering is done in this case.
+\item \textit{Dolma + filtering + rewriting:} Data obtained from going through all the steps of our pipeline (Figure \ref{fig:main_fig}) as described in Section \ref{method}.
+\end{itemize}
+We find that at this scale, our filtered backtranslation data (\textit{Dolma + filtering}) outperforms similarly constructed data from previous work \cite{li2023self} (\textit{ClueWeb + filtering}). Our best dataset that undergoes both filtering and rewriting yields better win rate than all other baselines. It is worth noting that fine-tuning on rewritten responses from unfiltered instruction-response pairs (\textit{Dolma + rewriting}) outperforms fine-tuning on initial web-scraped responses that have passed the filtering stage but have not been rewritten (\textit{Dolma + filtering}). This signals that the rewriting step is more effective than filtering at improving the quality of instruction-tuning data.
+\begin{table}
+\centering
+\begin{adjustbox}{max width=\textwidth}
+\renewcommand{\arraystretch}{1.1}
+\small
+\hspace{-0.5em}
+\begin{tabular}{p{3.55cm}p{1.18cm}p{1.735cm}}
+    \hline
+    \textbf{Data source} &  \textbf{Data size} & \textbf{Win rate (\%)} \\
+    \hline
+    Dolma + filtering & 12.8K & 71.70 \\
+    Dolma + rewriting & 12.8K & 73.44 \\
+    Dolma + filtering + rewriting & 12.8K & \textbf{74.38} \\
+    ClueWeb + filtering & 12.8K & 70.77 \\
+    Open Orca & 12.8K & 74.20 \\
+    ShareGPT & 12.8K & 72.69 \\
+    Evol-Instruct & 12.8K & 72.32 \\
+    Alpaca-GPT4 & 12.8K & 71.17 \\
+    Self-instruct & 12.8K & 65.11 \\
+    \hline
+\end{tabular}
+\end{adjustbox}
+\vskip -0.5em
+\caption{\textbf{Performance of fine-tuning Llama-2-7B.} Given the same data quantity (12.8K), fine-tuning on the instruction-response pairs obtained from instruction back-and-forth translation outperforms fine-tuning on the backtranslated ClueWeb data from previous work \cite{li2023self}, as well as other common instruction datasets. We also find that the rewriting step is more effective than the filtering step at improving the data quality, and subsequently, the model win rate.}
+\label{tab:7b_results}
+\vspace{-1em}
+\end{table}
+\vspace{-0.25em}
+\subsection{70B scale}
+We also experiment with fine-tuning the Llama-2-70B base model on different variants of the backtranslation data described in the previous section. While the instruction-tuning data generated by previous work \cite{li2023self} is limited by the amount of high-quality text from the initial web corpus (i.e. ClueWeb), our approach overcomes this limitation with response rewriting. We generate 51.2K instruction-response pairs with our pipeline. In Table \ref{tab:70b_results}, we find that by simply doing backtranslation on Dolma texts and filtering like previous work (\textit{Dolma + filtering}), the resulting model slightly lags behind the Humpback model from \cite{li2023self} (\textit{ClueWeb + filtering}) in terms of win rate. However, after rewriting responses in the filtered subset (\textit{Dolma + filtering + rewriting}), we manage to outperform previous work by 3.6\%. Similar to the 7B scale, we also observe at the 70B scale that fine-tuning on rewritten responses from unfiltered instruction-response pairs (\textit{Dolma + rewriting}) is more effective than fine-tuning on web-scraped responses that have passed the filter but have not been rewritten (\textit{Dolma + filtering}).
+\begin{table}
+\centering
+\begin{adjustbox}{max width=\textwidth}
+\renewcommand{\arraystretch}{1.1}
+\small
+\hspace{-0.5em}
+\begin{tabular}{p{3.55cm}p{1.18cm}p{1.735cm}}
+    \hline
+    \textbf{Data source} &  \textbf{Data size} & \textbf{Win rate (\%)}\\
+    \hline
+    Dolma + filtering & 51.2K & 87.42 \\
+    Dolma + rewriting & 51.2K & 90.52 \\
+    Dolma + filtering + rewriting & 51.2K & \textbf{91.74} \\
+    ClueWeb + filtering & 41.8K & 88.18 \\
+    Open Orca & 51.2K & 87.31 \\
+    ShareGPT & 51.2K & 88.56 \\
+    Evol-Instruct & 51.2K & 86.05 \\
+    Alpaca-GPT4 & 51.2K & 86.18 \\
+    Self-instruct & 51.2K & 78.48 \\
+    \rowcolor{gray!10} Dolma + filtering + rewriting & 25.6K & 90.22 \\
+    \rowcolor{gray!10} Dolma + filtering + distilling & 25.6K & 87.58 \\
+    \hline
+\end{tabular}
+\end{adjustbox}
+\vskip -0.5em
+\caption{\textbf{Performance of fine-tuning Llama-2-70B.} While backtranslation data from previous work \cite{li2023self} is limited by the number of high-quality web pages in Clueweb, our approach relies on Dolma texts and thus has access to many more candidate responses. Similar to the 7B scale results, (i) rewriting is more effective at improving data quality than filtering, (ii) filtering backtranslated instructions and then rewriting the responses does the best and outperforms previous work. We also observe that using an aligned LLM for response rewriting yields better data, and subsequently, win rate, than using the same model for distillation.}
+\vspace{-1em}
+\label{tab:70b_results}
+\end{table}
+\vspace{-0.25em}
+\section{Understanding rewritten data quality}\label{understanding}
+Given the performance benefits of rewritten data, we analyze how the outputs obtained from rewriting are different from those obtained from distillation. We also analyze the characteristics of the instruction-response pairs resulting from our pipeline compared to other existing datasets.
+\vspace{-0.25em}
+\subsection{Rewriting versus Distilling}\label{rewrite_vs_distill}
+As rewriting involves asking Llama-2-70B-chat to improve the response quality, conditioned on an initial web-crawled response and a backtranslated instruction, a fundamental question arises: \emph{does the rewriting process leverage information in the raw text or does it simply distill knowledge stored in Llama-2-70B-chat?}
+
+Given the same set of backtranslated instructions, we use MAUVE score \cite{pillutla2021mauve} to quantify the distributional differences among three sets of responses: initial web-scraped responses (from Dolma), rewritten responses, and responses distilled from Llama-2-70B-chat. MAUVE was originally designed to measure the gap between machine- and human-generated texts. This metric computes the area under the curve of divergence frontiers in a quantized space, after embedding text samples with a language model (by default, GPT-2). MAUVE score ranges between 0 and 1; the higher it is, the more similar the text distributions are. In the first row of Table \ref{tab:mauve_score}, we sample two disjoint sets of 10K distilled responses and find that they exhibit high MAUVE score (0.960) as expected, since they are from the same distribution. Comparing 10K initial responses sourced from Dolma to 10K responses distilled from Llama-2-70B-chat, we observe that these two sets of texts differ significantly, even though they are supposedly responses to the same (backtranslated) queries (MAUVE score = 0.0338). Rewritten responses exhibit some similarity with distilled outputs but there still exists a significant gap between them (MAUVE score = 0.340). %The same applies to the gap between rewritten and raw responses. 
+This suggests that the rewriting process is sufficiently distinct from distillation. We provide some examples of rewritten and distilled responses in Appendix \ref{app:data_examples}.
+\begin{table}[]
+\centering
+\begin{adjustbox}{max width=\textwidth}
+\renewcommand{\arraystretch}{1.1}
+\small
+\begin{tabular}{p{4cm}p{2.1cm}}
+    \hline
+    \textbf{Text distributions} & \textbf{MAUVE score} \\
+    \hline
+    Distilled responses vs. \newline Distilled responses & 0.960 $\pm$ 0.002 \\
+    \rowcolor{gray!10} 
+    Distilled responses vs. \newline Rewritten responses &
+0.340 $\pm$ 0.009 \\
+    Distilled responses vs. \newline Initial web responses  & 0.0338 $\pm$ 0.0007 \\
+    \hline
+    \end{tabular}
+\end{adjustbox}
+\vskip -0.5em
+\caption{\textbf{Rewritten responses interpolate between the initial web-scraped responses and the distillation outputs from the aligned LLM used for rewriting.}
+We use MAUVE score \cite{pillutla2021mauve} to measure the distances among the three text distributions: initial responses sourced from Dolma, the rewritten responses and the distilled outputs of Llama-2-70B-chat, all in response to the same instruction set. We find that the rewritten responses appear more similar to the distilled outputs compared to the web texts, though there still exists a substantial gap between the first two distributions.
+}
+\label{tab:mauve_score}
+\vspace{-1em}
+\end{table}
+We also compare empirical performance of fine-tuning on rewritten data versus distilled data. For the latter, we feed 25.6K instructions randomly sampled from our filtered backtranslated dataset to Llama-2-70B-chat and let the model answer directly. For the former, we use the same set of 25.6K instructions and prompt Llama-2-70B-chat to rewrite the corresponding web-scraped responses. Fine-tuning a Llama-2-70B model on the distilled responses yields lower win rate compared to fine-tuning on the rewritten texts (bottom two rows of Table \ref{tab:70b_results}). This demonstrates that the rewriting process improves the quality of response data in general, beyond just extracting what an LLM already knows, possibly because rewriting incorporates the information diversity found in web-scraped texts.
+
+\vspace{-0.25em}
+\subsection{Instruction quality analysis}\label{instruction_quality}
+\paragraph{Measuring instruction quality empirically.   }
+\begin{figure}[t]
+\includegraphics[trim=0 0 0 0.4cm,clip,width=0.95\columnwidth]
+{distill_perf.png}
+\vspace{-1.5em}
+\caption{\textbf{Quality of instruction prompts from various datasets, measured by their ability to distill useful information from a fixed model.} We randomly sample 12.8K instructions from each dataset in our experiments and input them to Llama-2-70B-chat to distill its knowledge. The quality of the instructions is then measured by the performance of a model (Llama-2-7B) fine-tuned on the (instruction, distilled response) pairs. We find that backtranslated instructions surpass other synthetic instruction generation methods (e.g. Alpaca), while still underperforming human-written queries (e.g. ShareGPT). This gap is partly, but not entirely, due to ShareGPT having longer instructions.}
+\label{fig:distill_perf}
+\vspace{-1.25em}
+\end{figure}
+\begin{figure*}[t]
+\centering
+\includegraphics[trim=0 0 0 0,clip,width=0.92\linewidth]
+{trigrams.png}
+\vskip -1em
+\caption{\textbf{Diversity of instructions and responses from our backtranslation data and other common instruction datasets, as measured by the number of unique trigrams.} We find that \textit{(i)} while instructions generated in this work are more diverse than synthetic instructions from existing baselines including ClueWeb and Alpaca-GPT4, our instruction diversity still lags behind that of manually-crafted prompts, \textit{(ii)} in terms of responses, using web-crawled texts sourced from Dolma yields the most diverse responses; rewriting reduces the response diversity slightly, but still offers much more text diversity than distillation.
+}
+\label{fig:trigrams}
+\vspace{-1em}
+\end{figure*}
+We attempt to isolate the quality of instructions from different datasets by unifying the response distribution to be outputs distilled from the same model. More specifically, we randomly sample 12.8K instructions from our backtranslation data (with and without filtering) as well as from each of the baseline datasets described in Section \ref{baselines}. We discard all existing answers, and feed each set of 12.8K queries to Llama-2-70B-chat to obtain distilled responses. We then fine-tune a Llama-2-7B model on each set of (instruction, new response) pairs and evaluate the AlpacaEval win rate of the resulting model. In Figure \ref{fig:distill_perf}, we find that \textit{(i)} filtered backtranslation instructions (i.e. from Dolma or ClueWeb) outperform other synthetic instruction generation methods (i.e. Alpaca \cite{taori2023alpaca} and Self-instruct \cite{wang2022self}), \textit{(ii)} however, synthetic instructions still lag behind human-written ones, obtained via user interactions with a chat interface (ChatGPT), \textit{(iii)} instructions constructed from transforming existing NLP datasets (i.e. Open Orca \cite{OpenOrca,mukherjee2023orca}) do not yield high distillation performance, possibly due to limited and repetitive task types.
+\vspace{-0.25em}
+\paragraph{Diversity.}
+As a proxy for diversity, we measure the number of unique trigrams across different instruction sets, given the same data quantity. In Figure \ref{fig:trigrams} (left), we observe that while our instruction set (backtranslated from Dolma) is more diverse than other synthetic instruction sets---including ClueWeb, Alpaca and Self-instruct, there is still a significant gap in diversity between model-generated instructions and manually-crafted ones (e.g., Open Orca and ShareGPT).
+
+It is worth noting that the human-written instructions (e.g. during their interactions with ChatGPT) tend to be substantially longer than synthetic ones, see Table \ref{tab:average_len} in the appendix. We thus conduct an ablation study to study how much the length factor contributes to the quality of instructions. We filter out instructions in ShareGPT that exceed the maximum length of our backtranslated instructions (i.e. 514 tokens) and among the remaining datapoints, randomly sample 12.8K instructions to repeat the distillation experiment described earlier (Figure \ref{fig:distill_perf}). This yields a shorter version of ShareGPT ("ShareGPT (short)") in which the instructions have about the same average length as our backtranslated instructions (i.e. 69 tokens). We observe that when fixing the output distribution to be distilled responses from Llama-2-70B-chat, fine-tuning on "ShareGPT (short)" is less effective than using the original ShareGPT instructions, but still outperforms backtranslated instructions (Figure \ref{fig:distill_perf}). This suggests that independent of length, human-written instructions are still of higher quality overall compared to synthetic instructions.
+\vspace{-0.25em}
+\paragraph{Complexity.} 
+Following the InsTag Complexity metric employed by \citet{liu2023makes}, we use the InsTag public tagger \cite{lu2023instag}, which is a Llama-2-7B model fine-tuned on ChatGPT-generated tags, to automatically tag our text data with all detectable semantics and intentions. We use the average number of unique tags uncovered in instructions, and separately, responses, from each dataset as a proxy for complexity. In Table \ref{tab:average_tags}, we observe that our Dolma-backtranslated instructions offers higher InsTag complexity than most instruction sets from previous work, including ClueWeb-backtranslated data \cite{li2023self} and Open Orca \cite{OpenOrca}. Human-written instructions, i.e. from user interactions with ChatGPT, still yield the highest number of tags on average.
+\begin{table}
+\centering
+\begin{adjustbox}{max width=\textwidth}
+\renewcommand{\arraystretch}{1.1}
+\small
+\begin{tabular}{p{3.6cm}p{1.4cm}p{1.4cm}}
+    \hline
+    \textbf{Data source} &  \textbf{Instruction} & \textbf{Response} \\
+    \hline
+    Dolma + filtering & 5.6 & 8.3 \\
+    Dolma + rewriting & 4.8 & 6.8 \\
+    Dolma + filtering + rewriting & 5.1 & 6.6 \\
+    ClueWeb & 3.7 & 6.6 \\
+    Open Orca & 3.5 & 4.9 \\
+    Alpaca-GPT4 & 3.6 & 4.4 \\
+    Self-instruct & 3.1 & 5.1 \\
+    ShareGPT & 6.2 & 5.2 \\
+    \hline
+\end{tabular}
+\end{adjustbox}
+\vskip -0.75em
+\caption{\textbf{Average number of semantic and intention tags uncovered in different instruction-tuning datasets by the InsTag model \cite{lu2023instag}.} While our backtranslated instructions yield fewer tags than human-written ones (i.e. ShareGPT), they exhibit higher complexity than synthetic instructions from other datasets. Besides, we find that responses sourced from or are based on web texts generally have higher InsTag complexity than those obtained via distillation.}
+\vspace{-1em}
+\label{tab:average_tags}
+\end{table}
+\vspace{-0.25em}
+\subsection{Response quality analysis}\label{response_quality}
+\paragraph{Diversity.} We apply the same diversity analysis as in Section \ref{instruction_quality} to response data. In Figure \ref{fig:trigrams} (right), we observe that the initial web responses sourced from Dolma are substantially more diverse than outputs distilled from existing models (e.g. ChatGPT, GPT-4, GPT-3), as well as web texts from ClueWeb. The rewriting process reduces information diversity of these web-scraped responses slightly, but still leads to much more diverse responses than distillation. Overall this analysis demonstrates the importance of including web sources in the data construction process, in order to encourage more diverse instructions \textit{and} responses, compared to just distilling knowledge from existing LLMs. 
+\vspace{-0.25em}
+\paragraph{Complexity.} 
+Applying the same analysis as in Section \ref{instruction_quality}, using the average number of semantic and intention tags uncovered by InsTag tagger \cite{lu2023instag} as a proxy for complexity, we compare the responses from our pipeline (with and without rewriting) to responses from other baseline datasets. In Table \ref{tab:average_tags}, we find that the initial web-scraped responses from Dolma yield the highest complexity. Rewriting generally reduces the InsTag complexity of the response. However, our rewritten responses are still substantially more complex than most existing response data, which is commonly distilled from high-performing LLMs.
+
+We also provide an analysis of instruction and response lengths as another quality metric%for different instruction-tuning sets used in our experiments
+. Refer to Appendix \ref{app:data_stats} for more details.
+\vspace{-0.25em}
+\section{Related Work}
+\vspace{-0.25em}
+We discuss related papers that construct new instruction-tuning datasets or propose methods to improve existing ones. More in-depth review can be found in \citet{zhang2023instruction}.
+\vspace{-0.25em}
+\paragraph{Human-crafted data.} Open Assistant \cite{kopf2024openassistant}, Dolly \cite{DatabricksBlog2023DollyV2} and Super-NI \cite{wang2022super} are some examples of datasets that contain solely human-generated and human-annotated conversations, covering a range of topics and NLP tasks. These datasets tend to be relatively small in scale due to the expensive costs of manual annotation and verification.
+
+Other papers do not explicitly ask humans to create questions and answer them, but instead re-purpose existing datasets. For example, FLAN \cite{longpre2023flan} and Natural instructions \cite{mishra2021cross} transform inputs and outputs of more than 60 NLP tasks into instruction-tuning data. This suffers from the same scalability issue as human-annotated datasets.
+\vspace{-0.25em}
+\paragraph{Synthetic instruction generation.} In contrast to sourcing manually written instructions, which may be expensive to scale, some papers propose ways to automatically generate large quantities of instructions \cite{wang2022self, taori2023alpaca}. In particular, our work is inspired by the backtranslation technique proposed in \citet{li2023self}, which fine-tunes an LLM specifically for the task of instruction generation, and then applies the model to augment text segments extracted from the web with corresponding instructions. The paper suggests that this approach allows the resulting instruction-tuning data to be more diverse especially in the long tail. Another prior work, LongForm \cite{koksal2023longform}, introduces a similar approach for generating instructions.
+
+Most related to our approach is the work by \citet{chen2023tegit}, who train an LLM to generate \textit{both} instructions and responses from web-scraped documents. %\footnote{The original version of this work, which appeared last year, }. 
+In contrast to their method, we (i) generate instructions separately with backtranslation and then ask an LLM to improve the existing responses, (ii) obtain better performance with much fewer data (Table \ref{tab:cc_sources}) (iii) generate more data (51.2K compared to 12.4K), (iv) offer more insights into the quality of our instructions and responses in comparison to other existing datasets. In addition, concurrent work by \citet{zheng2024kun} also proposes more detailed scoring and refinement prompts to improve the instruction curation and response formatting of the backtranslation pipeline from \citet{li2023self}, applying it to Chinese text data.
+\vspace{-0.25em}
+\paragraph{Distillation.} Perhaps the most common approach in instruction-tuning data generation, distillation seeks to mimic the capabilities of powerful LLMs (e.g. GPT-4) by feeding queries to these models and using the outputs to fine-tune subsequent LLMs. Datasets that are built this way include ShareGPT \cite{vicuna2023}, OpenInstruct \cite{wang2023far}, Alpaca-GPT4 \cite{peng2023instruction} and UltraFeedback \cite{tunstall2023zephyr}.
+\vspace{-0.25em}
+\paragraph{Improving instruction-tuning data quality.} Some prior work studies characteristics of high-quality instruction-tuning data \cite{liu2023makes} and proposes curation techniques accordingly. LIMA \cite{zhou2024lima} carefully collects 1K fine-tuning samples via both internet sourcing and human annotation, and shows that strong performance can be achieved despite the small data quantity. Similarly, \citet{chen2023alpagasus} demonstrates that performance gain is possible by fine-tuning on only a small subset of the original dataset (Alpaca), using ChatGPT as the quality evaluator. \citet{zhao2024long} finds that selecting only the 1K longest responses from existing datasets offers a very strong baseline, independent of GPT-4's preference for longer texts. Evol-Instruct \cite{xu2023wizardlm} and Orca \cite{mukherjee2023orca} manually prompt models to enhance the complexity of instructions, and subsequently, data generation (e.g. by asking for justification). \citet{fan2024reformatted} reformats the responses of existing instruction data to augment them with relevant information and align them with pre-determined criteria set by humans.
+\vspace{-0.25em}
+\section{Discussion}
+We propose instruction back-and-forth translation: combining instruction backtranslation method from \citet{li2023self} with response rewriting, in order to benefit from both the information diversity found on the internet and the quality of model annotations, while enabling scalability owing to the size of the web corpus where we source initial responses from. 
+\vspace{-1.5em}
+\paragraph{Future work.} Our findings motivate a number of interesting future directions. One concrete question is whether applying other existing curation techniques---e.g. quality filters proposed by \citet{liu2023makes}---to our pool of (synthetic instructions, rewritten response) pairs would lead to further performance gains. In addition, we also look forward to scaling up our data generation pipeline and studying the implication of the rewritten data on the pre-training process, given concurrent work \cite{maini2024rephrasing} that explores paraphrasing pre-training data into the question-answering format.
+\vspace{-0.25em}
+\paragraph{Limitations.} Although we try to control for confounding factors (e.g. data quantity)%or model to distill from in our experiments
+, our findings are only obtained from using one model family, i.e. Llama-2 \cite{touvron2023llama2}. Besides, our %backtranslation and rewritten 
+pipeline revolves around general-purpose English instructions, with limited coding or science-related tasks. Nevertheless, it is possible to extend our method to more domain-specific data, e.g. by crawling texts from StackOverflow, generating instructions and rewriting the responses with Code Llama \cite{roziere2023code}. 
+\vspace{-0.25em}
+\paragraph{Ethical considerations \& Potential risks.} It is possible that sourcing response data from the web could affect the factuality of the fine-tuned model and/ or make it more prone to hallucination. The same risks apply to the response rewriting process. Future work could include additional steps to verify the quality of the information in the responses, and check whether it overlaps with what the model already knows, before using the data for fine-tuning.
+
+\section*{Acknowledgments}
+We are grateful to Weijia Shi and Mike Lewis for helpful discussion as well as feedback on the
+manuscript. TN is supported by the UW-Meta AI Mentorship Program.
+This work is supported in part by NSF grant 2019844.
+
+\newpage
+
+\end{document}

@@ -1,0 +1,428 @@
+\title{Adversarial Graph Augmentation 
+to Improve \\ Graph Contrastive Learning}
+
+\begin{document}
+
+\maketitle
+\vspace{-5mm}
+\begin{abstract}
+\vspace{-2mm}
+Self-supervised learning of graph neural networks (GNN) is in great need because of the widespread label scarcity issue in real-world graph/network data.
+Graph contrastive learning (GCL), by training GNNs to maximize the correspondence between the representations of the same graph in its different augmented forms, may yield robust and transferable GNNs even without using labels. However, GNNs trained by traditional GCL often risk capturing redundant graph features and thus may be brittle and provide sub-par performance in downstream tasks. 
+Here, we propose a novel principle, termed adversarial-GCL (\textit{AD-GCL}), which enables GNNs to avoid capturing redundant information during the training by optimizing adversarial graph augmentation strategies used in GCL. 
+We pair AD-GCL with theoretical explanations and design a practical instantiation based on trainable edge-dropping graph augmentation.
+We experimentally validate AD-GCL\footnote{\url{https://github.com/susheels/adgcl}} by comparing with the state-of-the-art GCL methods and achieve performance gains of up-to~14\% in unsupervised, ~6\% in transfer, and~3\% in semi-supervised learning settings overall with 18 different benchmark datasets for the tasks of molecule property regression and classification, and social network classification.
+\end{abstract}
+
+\vspace{-3mm}
+\section{Introduction}
+\vspace{-2mm}
+\label{sec:intro}
+Graph representation learning (GRL) aims to encode graph-structured data into low-dimensional vector representations, which has recently shown great potential in many applications in biochemistry, physics and social science~\cite{senior2020improved,shlomi2020graph,hamilton2020book}. Graph neural networks (GNNs), inheriting the power of neural networks~\cite{hornik1989multilayer,cybenko1989approximation}, have become the almost {\em de facto} encoders for GRL~\cite{scarselli2008graph, chami2020machine, zhang2020deep_survey, hamilton2017representation}. GNNs have been mostly studied in  cases with supervised end-to-end training~\cite{kipf2016semi,dai2016discriminative,velickovic2018graph,zhang2018end,xu2018powerful,morris2019weisfeiler,li2020distance}, where a large number of task-specific labels are needed. However, in many applications, annotating labels of graph data takes a lot of time and resources~\cite{hu2019strategies,sun2019infograph}, e.g., identifying pharmacological effect of drug molecule graphs requires living animal experiments~\cite{vogel2002drug}. Therefore, recent research efforts are directed towards studying self-supervised learning for GNNs, where only limited or even no labels are needed~\cite{kipf2016variational,grover2019graphite,gmi,dgi,sun2019infograph,you2020graph, hassani2020contrastive, xie2021self, liu2021graph,zhang2020motif, thakoor2021bootstrapped,zhu2020graph,qiu2020gcc}. %For this, two major principles are typically adopted.
+
+Designing proper self-supervised-learning principles for GNNs is crucial, as they drive what information of graph-structured data will be captured by  GNNs and may heavily impact their performance in downstream tasks. Many previous works adopt the edge-reconstruction principle to match traditional network-embedding requirement~\cite{belkin2003laplacian,perozzi2014deepwalk,grover2016node2vec,ribeiro2017struc2vec}, where the edges of the input graph are expected to be reconstructed based on the output of GNNs~\cite{hamilton2017inductive,kipf2016variational,grover2019graphite}. %These works include unsupervised GraphSAGE~\cite{hamilton2017inductive}, GAE~\cite{kipf2016variational} and Graphite~\cite{grover2019graphite}. 
+Experiments showed that these GNN models learn to over-emphasize node proximity~\cite{dgi} and may lose subtle but crucial structural information, thus failing in many tasks including node-role classification~\cite{henderson2012rolx,donnat2018learning,ribeiro2017struc2vec,li2020distance} and graph classification~\cite{hu2019strategies}. 
+ 
+To avoid the above issue, graph contrastive learning (GCL) has attracted more attention recently~\cite{xie2021self,dgi,gmi, liu2021graph,sun2019infograph,hassani2020contrastive,zhang2020motif,thakoor2021bootstrapped,zhu2020graph,qiu2020gcc}. GCL leverages the mutual information maximization principle (InfoMax)~\cite{linsker1988self} that aims to maximize the correspondence between the representations of a graph (or a node) in its different augmented forms~\cite{sun2019infograph,hassani2020contrastive,you2020graph,zhang2020motif,thakoor2021bootstrapped,zhu2020graph,qiu2020gcc}. Perfect correspondence indicates that a representation precisely identifies its corresponding graph (or node) and thus the encoding procedure does not decrease the mutual information between them.
+ 
+However, researchers have found that the InfoMax principle may be risky because it may push encoders to capture redundant information that is irrelevant to the downstream tasks: Redundant information suffices to identify each graph to achieve InfoMax, but encoding it yields brittle representations and may severely deteriorate the performance of the encoder in the downstream tasks~\cite{tschannen2019mutual}. This observation reminds us of another principle, termed information bottleneck (IB)~\cite{tishby2000information,tishby2015deep,goldfeld2020information,alemi2016deep,vdb,betavae}. As opposed to InfoMax, IB asks the encoder to capture the \emph{minimal sufficient} information for the downstream tasks. Specifically, IB minimizes the information from the original data while maximizing the information that is relevant to the downstream tasks. As the redundant information gets removed, the encoder learnt by IB tends to be more robust and transferable. Recently, IB has been applied to GNNs~\cite{wu2020graph,yu2021recognizing}. But IB needs the knowledge of the downstream tasks that may not be available. 
+ 
+Hence, a natural question emerges: \emph{When the knowledge of downstream tasks are unavailable, how to train GNNs that may remove redundant information?} Previous works highlight some solutions by designing data augmentation strategies for GCL but those strategies are typically task-related and sub-optimal. They either leverage domain knowledge~\cite{hassani2020contrastive,zhang2020motif,zhu2020graph}, \textit{e.g.}, node centralities in network science or molecule motifs in bio-chemistry, or depend on extensive evaluation on the downstream tasks, where the best strategy is selected based on validation performance~\cite{you2020graph, zhu2020graph}. 
+
+\begin{figure}
+    \centering
+    \includegraphics[width=1.0\textwidth]{figures/ad-gcl-pipeline.pdf}
+    \vspace{-4mm}
+    \caption{\small{The AD-GCL principle and its instantiation based on learnable edge-dropping augmentation. AD-GCL contains two components for graph data encoding and graph data augmentation. The GNN encoder $f(\cdot)$ maximizes the mutual information between the original graph $G$ and the augmented graph $t(G)$ while the GNN augmenter optimizes the augmentation  $T(\cdot)$ to remove the information from the original graph. The instantiation of AD-GCL proposed in this work uses edge dropping: An edge $e$ of $G$ is randomly dropped according to $\text{Bernoulli}(\omega_e)$, where $\omega_e$ is parameterized by the GNN augmenter. }}%\jen{ would be helpful to include ``minimize'' somewhere wrt to T in this figure. Maybe instead of "remove info" it could be "minimize info"?}}\pan{I will definitely address this. I tried to avoid Infomin in~\cite{tian2020makes}} } %In practice, mutual infomation is maximized by minimizing the NT-Xent loss (Eq.~\ref{eq:loss}) and vice versa. \pan{Can you send me the slide or sth used to draw this figure? I plan to revise it and put it into the intro.}} 
+    \label{fig:ad-gcl-pipeline}
+    \vspace{-3mm}
+\end{figure}
+
+In this paper, we approach this question by proposing a novel principle that pairs GCL with adversarial training, termed \emph{AD-GCL}, as shown in Fig.\ref{fig:ad-gcl-pipeline}. We particularly focus on training self-supervised GNNs for graph-level tasks, though the idea may be generalized for node-level tasks. AD-GCL consists of two components: The first component contains a GNN encoder, which adopts InfoMax to maximize the correspondence/mutual information between the representations of the original graph and its augmented graphs. The second component contains a GNN-based augmenter, which aims to optimize the augmentation strategy to decrease redundant information from the original graph as much as possible. AD-GCL essentially allows the encoder capturing the minimal sufficient information to distinguish graphs in the dataset. We further provide theoretical explanations of AD-GCL. We show that with certain regularization on the search space of the augmenter, AD-GCL can yield a lower bound guarantee of the information related to the downstream tasks, while simultaneously holding an upper bound guarantee of the redundant information from the original graphs, which matches the aim of the IB principle. We further give an instantiation of AD-GCL: The GNN augmenter adopts a task-agnostic augmentation strategy and will learn an input-graph-dependent non-uniform-edge-drop probability to perform graph augmentation.
+
+Finally, we extensively evaluate AD-GCL on 18 different benchmark datasets for molecule property classification and regression, and social network classification tasks in different setting viz. unsupervised learning (Sec.~\ref{exp:unsup}), transfer learning (Sec.~\ref{exp:transfer}) and semi-supervised learning (Sec.~\ref{exp:semisup}) learning. AD-GCL achieves significant performance gains in relative improvement and high mean ranks over the datasets compared to state-of-the-art baselines. %to further support the effectiveness of our principle through its instantiation. 
+We also study the theoretical aspects of AD-GCL with apt experiments and analyze the results to offer fresh perspectives (Sec.~\ref{exp:reg_analysis}): Interestingly, we observe that AD-GCL outperforms traditional GCL based on non-optimizable augmentation across almost the entire range of perturbation levels.  
+\vspace{-3mm}
+\section{Notations and Preliminaries}
+\vspace{-2mm}
+We first introduce some preliminary concepts and notations for further exposition. In this work, we consider attributed graphs $G =(V,E)$ where $V$ is a node set and $E$ is an edge set. $G$ may have node attributes $\{X_{v} \in \mathbb{R}^F \mid v \in V\}$ and edge attributes $\{X_{e} \in \mathbb{R}^F \mid e \in E\}$ of dimension $F$. We denote the set of the neighbors of a node $v$ as $\mathcal{N}_v$. \vspace{-2mm}
+\paragraph{Learning Graph Representations.} 
+Given a set of graphs $G_i$, $i=1,2,...,n$, in some universe $\mathcal{G}$, the aim is to learn an encoder $f:\mathcal{G}\rightarrow \mathbb{R}^d$, where $f(G_i)$ can be further used in some downstream task. %Here, we call $f:\mathcal{G}\rightarrow \mathbb{R}^d$ as the \emph{encoder}. 
+We also assume that $G_i$'s are all IID sampled from an unknown distribution $\mathbb{P}_{\mathcal{G}}$ defined over $\mathcal{G}$. %Specifically,  $f(G_i): \mathcal{G} \rightarrow \mathbb{R}^d$. 
+In a downstream task, each $G_i$ is associated with a label $y_i\in\mathcal{Y}$. Another model $q:\mathbb{R}^d\rightarrow \mathcal{Y}$ will be learnt to predict $Y_i$ based on $q(f(G_i))$. We assume $(G_i, Y_i)$'s are IID  sampled from a distribution $\mathbb{P}_{\mathcal{G}\times \mathcal{Y}} = \mathbb{P}_{\mathcal{Y}|\mathcal{G}}\mathbb{P}_{\mathcal{G}}$, where $\mathbb{P}_{\mathcal{Y}|\mathcal{G}}$ is the conditional distribution of the graph label in the downstream task given the graph. 
+\paragraph{Graph Neural Networks (GNNs).} In this work, we focus on using GNNs, message passing GNNs in particular~\cite{gilmer2017neural}, as the encoder $f$. For a graph $G=(V,E)$, every node $v\in V$ will be paired with a node representation $h_v$ initialized as $h_v^{(0)}=X_v$. These representations will be updated by a GNN. During the $k^{\text{th}}$ iteration, each $h_v^{(k-1)}$ is updated using $v'$s neighbourhood information expressed as,
+
+\vspace{-4mm}
+\begin{equation}
+\label{eq:gnn_iteration}
+   \small h_v^{(k)} = \text{UPDATE}^{(k)} \Bigg( h_v^{(k-1)}, \; \text{AGGREGATE}^{(k)} \Big( \big\{(h_u^{(k-1)}, X_{uv})  \mid u \in \mathcal{N}_v\big\} \Big) \Bigg)
+\end{equation}
+ where $\text{AGGREGATE}(\cdot)$ is a trainable function that maps the set of node representations and edge attributes $X_{uv}$ to an aggregated vector, $\text{UPDATE}(\cdot)$ is another trainable function that maps both $v\text{'s}$ current representation and the aggregated vector to $v\text{'s}$ updated representation.
+After $K$ iterations of Eq.~\ref{eq:gnn_iteration}, the graph representation is obtained by pooling the final set of node representations as,
+\begin{equation}
+    \label{eq:pooling}
+    f(G):\triangleq h_{G} = \text{POOL}\big(\{ h_v^{(K)} \mid v \in V \}\big)
+\end{equation}
+For design choices regarding aggregation, update and pooling functions we refer the reader to \cite{zhang2020deep_survey, chami2020machine, hamilton2020book}. \vspace{-5mm}
+\paragraph{The Mutual Information Maximization Principle.} 
+GCL is built upon the InfoMax principle~\cite{linsker1988self}, which prescribes to learn an encoder $f$ that maximizes the mutual information or the correspondence between the graph and its representation. The rationale behind GCL is that a graph representation $f(G)$ should capture the features of the graph $G$ so that representation can distinguish this graph from other graphs. Specifically, the objective of GCL follows
+\begin{equation} \label{eq:infomax}
+   \text{InfoMax:}\quad \max_{f} I(G ; f(G)), \quad \text{where } G\sim \mathbb{P}_{\mathcal{G}}.
+\end{equation}
+where $I(X_1;X_2)$ denotes the mutual information between two random variables $X_1$ and $X_2$~\cite{cover2012elements}. %The learnt encoder $f$ can yield graph representations that are used for the downstream tasks.
+
+Note that the encoder $f(\cdot)$ given by GNNs is not injective in the graph space $\mathcal{G}$ due to its limited expressive power~\cite{xu2018powerful,morris2019weisfeiler}. Specifically, for the graphs that cannot be distinguished by $1$-WL test~\cite{weisfeiler1968reduction}, GNNs will associate them with the same representations. We leave more discussion on 1-WL test in Appendix~\ref{apd:1wl}. In contrast to using CNNs as encoders, one can never expect GNNs to identify all the graphs in $\mathcal{G}$ based their representations, which introduces a unique challenge for GCL. 
+\vspace{-3mm}
+\section{Adversarial Graph Contrastive Learning}
+\vspace{-2mm}
+In this section, we introduce our adversarial graph contrastive learning (AD-GCL) framework and one of its instantiations based on edge perturbation. 
+\vspace{-3mm}
+\subsection{Theoretical Motivation and Formulation of AD-GCL}
+\vspace{-1mm}
+\label{sec:ad-gcl}
+
+The InfoMax principle in Eq.~\ref{eq:infomax} could be problematic in practice for general representation learning. Tschannen et al. have shown that for image classification, representations capturing the information that is entirely irrelevant to the image labels are also able to maximize the mutual information but such representations are definitely not useful for image classification~\cite{tschannen2019mutual}. A similar issue can also be observed 
+in graph representation learning, as illustrated by Fig.\ref{fig:bad-exm}: We consider a binary graph classification problem with graphs in the dataset ogbg-molbace~\cite{hu2020open}. Two GNN encoders with exactly the same architecture are trained to keep mutual information maximization between graph representations and the input graphs, but one of the GNN encoders in the same time is further supervised by random graph labels. Although the GNN encoder supervised by random labels still keeps one-to-one correspondance between every input graph and its representation (i.e., mutual information maximization), we may observe significant performance degeneration of this GNN encoder when evaluating it over the downstream ground-truth labels.  
+More detailed experiment setup is left in Appendix~\ref{apd:exp_settings_motivation}. %but note that as graph representation is not an injective mapping from the graph space $\mathcal{G}$.
+
+\begin{wrapfigure}{r}{0.38\textwidth}
+\vspace{-7mm}
+  \begin{center}
+    \includegraphics[width=0.38\textwidth]{figures/bad_example_new.pdf}
+  \end{center}
+  \vspace{-4mm}
+  \caption{\small{Two GNNs keep the mutual information maximized between graphs and their representations. Simultaneously, they get supervised by ground-truth labels (green) and random labels (blue) respectively. %is supervised by ground-truth labels (green) \textit{v.s.} random labels (blue) respectively keeps the mutual information maximization between graphs and their representations maximized.  training supervised by ground-truth labels (green) \textit{v.s.} random labels (blue) respectively while. 
+  The curves show their testing performance on predicting ground-truth labels. }} %Dataset ogbg-molbace~\cite{hu2020open} is used. %and Appendix~\ref{apd:exp_settings_motivation} contains detailed experiment setup.}}
+  \vspace{-2mm}
+  \label{fig:bad-exm}
+\end{wrapfigure}
+
+This observation inspires us to rethink what a good graph representation is. Recently, the information bottleneck has applied to learn graph representations~\cite{wu2020graph,yu2021recognizing}. Specifically, the objective of graph information bottleneck (GIB) follows \vspace{-1mm}
+\begin{align} \label{eq:GIB}
+  \text{GIB:}\quad  \max_{f} I(f(G); Y) - \beta I(G; f(G)),
+\end{align} 
+\text{where } $(G,Y)\sim \mathbb{P}_{\mathcal{G}\times \mathcal{Y}}, \beta \text{ is a positive constant.}$ Comparing Eq.~\ref{eq:infomax} and Eq.~\ref{eq:GIB}, we may observe the different requirements between InfoMax and GIB: InfoMax asks for maximizing the information from the original graph, while GIB asks for minimizing such information but simultaneously maximizing the information that is relevant to the downstream tasks. As GIB asks to remove redundant information, GIB naturally avoids the issue encountered in Fig.\ref{fig:bad-exm}. Removing extra information also makes GNNs trained w.r.t. GIB robust to adverserial attack and strongly transferrable~\cite{wu2020graph,yu2021recognizing}.  
+
+Unfortunately, GIB requires the knowledge of the class labels $Y$ from the downstream task and thus does not apply to self-supervised training of GNNs where there are few or no labels. Then, the question is how to learn robust and transferable GNNs in a self-supervised way. 
+
+To address this, we will develop a GCL approach that uses adversarial learning to  avoid capturing redundant information during the representation learning. 
+In general, GCL methods use graph data augmentation (GDA) processes to perturb the original observed graphs and decrease the amount of information they encode. %; GCL makes an assumption that \emph{relevant information should be kept during GDA while irrelevant information is more fragile and thus tends to be removed}. 
+Then, the methods apply InfoMax over perturbed graph pairs (using different GDAs) to train an encoder $f$ to capture the remaining information. 
+\begin{definition}[Graph Data Augmentation (GDA)]
+For a graph $G \in \mathcal{G}$, $T(G)$ denotes a graph data augmentation of $G$, which is a distribution defined over $\mathcal{G}$ conditioned on $G$. We use $t(G)\in \mathcal{G}$ to denote a sample of $T(G)$. 
+\end{definition}\vspace{-2mm}
+Specifically, given two ways of GDA $T_1$ and $T_2$, the objective of GCL becomes
+\begin{equation} \label{eq:gcl-fix-aug}
+  \text{GDA-GCL:}\,  \max_{f} I(f(t_1(G)) ; f(t_2(G))), \, \text{where } G\sim \mathbb{P}_{\mathcal{G}}, t_i(G)\sim T_i(G), i\in\{1,2\}.
+\end{equation}
+In practice, GDA processes are often pre-designed based on either domain knowledge or extensive evaluation, and improper choice of GDA may severely impact the downstream performance~\cite{you2020graph,hu2019strategies}. %as a predefined random perturbation of the input graph. 
+ We will review a few GDAs adopted in existing works in Sec.\ref{sec:related}. 
+ 
+ In contrast to previous predefined GDAs, our idea, inspired by GIB, is to {\em learn} the GDA process (over a parameterized family), so that the encoder $f$ can capture the \textbf{minimal information } that is sufficient to identify each graph. % from the others.
+ 
+\vspace{-1mm}
+
+\paragraph{AD-GCL:} %In contrast to those predefined GDAs, our idea, inspired by GIB, is to optimize GDA so that the encoder $f$ can capture the minimal sufficient information that may identify each graph from the others. %from different ways of GDA. 
+We optimize the following objective, over a GDA family $\mathcal{T}$ (defined below).
+\begin{equation} \label{eq:ad-gcl}
+  \text{AD-GCL:}\quad  \min_{T\in \mathcal{T}} \max_{f} I(f(G) ; f(t(G))), \quad \text{where } G\sim \mathbb{P}_{\mathcal{G}}, t(G)\sim T(G),
+\end{equation}
+\begin{definition}[Graph Data Augmentation Family]  Let $\mathcal{T}$ denote a family of different GDAs $T_{\Phi}(\cdot)$, where $\Phi$ is the parameter in some universe. A $T_{\Phi}(\cdot)\in \mathcal{T}$ is a specific GDA with parameter $\Phi$. 
+\end{definition} \vspace{-0.5mm}
+The min-max principle in AD-GCL aims to train the encoder such that even with a very aggressive GDA (i.e., where $t(G)$ is very different from $G$), the mutual information / the correspondence between the perturbed graph and the original graph can be maximized. %\jen{It's not clear what you mean by {\em aggressive} here, can you relate it to the family of GDAs? or does the parametrization of $T$ need to include the ratio of edges? }%Intuitively, AD-GCL pushes the encoder to capture the minimal sufficient information to identify different graphs in $\mathcal{G}$.
+Compared with the two GDAs adopted in GDA-GCL (Eq.\ref{eq:gcl-fix-aug}), AD-GCL views the original graph $G$ as the anchor while pushing its perturbation $T(G)$ as far from the anchor as it can. The automatic search over $T \in \mathcal{T}$ saves a great deal of effort  evaluating different combinations of GDA as adopted in \cite{you2020graph}. %, which becomes another big advantage of AD-GCL.
+
+\vspace{-2mm}
+\paragraph{Relating AD-GCL to the downstream task.} %AD-GCL by definition is agnostic to the downstream task $Y$. However, we can show that if the GDA family $\mathcal{T}$ is correlated with $Y$ to some extent, $f$ learnt by AD-GCL is expected to behave well to predict $Y$. \jen{I don't think it's correct to say the whole family $\mathcal{T}$ is correlated with $Y$. It has to be something more like there is one or more $T \in \mathcal{T}$ that doesn't (tends not to) perturb the graph info that is correlated with $Y$. Or relate it to the ratio of perturbed content. }
+Next, we will theoretically characterize the property of the encoder trained via AD-GCL.  %However, we can show that if the GDA family $\mathcal{T}$ is correlated with $Y$ to some extent, $f$ learnt by AD-GCL is expected to behave well to predict $Y$.
+The analysis here not only further illustrates the rationale of AD-GCL but helps design practical $\mathcal{T}$ when some knowledge of $Y$ is accessible. But note that our analysis does not make any assumption on the availability of $Y$.
+
+Note that GNNs learning graph representations is very different from CNNs learning image representations because GNNs are never injective mappings between the graph universe $\mathcal{G}$ and the representation space $\mathbb{R}^d$, because the expressive power of GNNs is limited by the 1-WL test~\cite{weisfeiler1968reduction,xu2018powerful,morris2019weisfeiler}. So, we need to define a quotient space of $\mathcal{G}$ based on the equivalence given by the 1-WL test. \vspace{-1mm}
+
+\begin{definition}[Graph Quotient Space]
+Define the equivalence $\cong$ between two graphs $G_1\cong G_2$ if $G_1,\,G_2$ cannot be distinguished by the 1-WL test. Define the quotient space $\mathcal{G}' = \mathcal{G}/\cong$. %\jen{I'm not sure how to read this, does it mean that $\mathcal{G}'$ is the reduced space of graphs, where all (WL) isomorphic graphs are grouped together (ie all $G' \in \mathcal{G}'$ are unique by WL test)? }
+\end{definition}\vspace{-1mm}
+So every element in the quotient space, i.e., $G' \in \mathcal{G}'$, is a representative graph from a family of graphs that cannot be distinguished by the 1-WL test. Note that our definition also allows attributed graphs.
+\begin{definition}[Probability Measures in $\mathcal{G}'$]
+Define $\mathbb{P}_{\mathcal{G}'}$ over the space $\mathcal{G}'$ such that $\mathbb{P}_{\mathcal{G}'}(G') = \mathbb{P}_{\mathcal{G}}(G\cong G')$ for any $G'\in\mathcal{G}'$. Further define $\mathbb{P}_{\mathcal{G}'\times \mathcal{Y}} (G', Y') = \mathbb{P}_{\mathcal{G}\times \mathcal{Y}} (G\cong G', Y=Y')$. Given a GDA $T(\cdot)$ defined over $\mathcal{G}$, define a distribution on $\mathcal{G}'$, $T'(G') = \mathbb{E}_{G\sim \mathbb{P}_{\mathcal{G}}}[T(G)| G\cong G']$ for $G'\in \mathcal{G}'$. %\jen{Are you assuming something about isomorphism in the GDA family here? eg. that two WL isomorphic graphs will have same augmentation in expectation? If so, we might need to include that in Def 2. }
+\end{definition}\vspace{-1mm}
+
+Now, we provide our theoretical results and give their implication. The proof is in the Appendix~\ref{apd:prf}.
+\begin{theorem} \label{thm:main}
+Suppose the encoder $f$ is implemented by a GNN as powerful as the 1-WL test. Suppose $\mathcal{G}$ is a countable space and thus $\mathcal{G'}$ is a countable space. Then, the optimal solution $(f^*, T^*)$ to AD-GCL satisfies, letting $T'^{*}(G') = \mathbb{E}_{G\sim \mathbb{P}_{\mathcal{G}}}[T^*(G)| G\cong G']$, \vspace{-1mm}
+\begin{enumerate}[leftmargin=*]
+    \item $I(f^*(t^*(G)); G\,|\,Y) \leq  \min_{T\in\mathcal{T}} I(t'(G'); G') - I(t'^*(G'); Y) $, where $t'(G')\sim T'(G')$, $t'^*(G')\sim T'^{*}(G')$, $(G,Y)\sim \mathbb{P}_{\mathcal{G}\times \mathcal{Y}}$ and $(G',Y)\sim \mathbb{P}_{\mathcal{G}'\times \mathcal{Y}}$.
+    \item $I(f^*(G); Y)\geq I(f^*(t'^*(G')); Y) = I(t'^*(G'); Y)$, where  $t'^*(G')\sim T'^*(G')$, $(G,Y)\sim \mathbb{P}_{\mathcal{G}\times \mathcal{Y}}$ and $(G',Y)\sim \mathbb{P}_{\mathcal{G}'\times \mathcal{Y}}$.
+\end{enumerate}
+\vspace{-1mm}
+\end{theorem}
+
+The statement 1 in Theorem~\ref{thm:main} guarantees a upper bound of the information that is captured by the representations but irrelevant to the downstream task, which matches our aim. This bound has a form very relevant to the GIB principle (Eq.\ref{eq:GIB} when $\beta=1$), since $ \min_{T\in\mathcal{T}} I(t'(G'); G') - I(t'^*(G'); Y) \geq \min_{f} [I(f(G); G) - I(f(G); Y)]$,
+where $f$ is a GNN encoder as powerful as the 1-WL test. But note that this inequality also implies that the encoder given by AD-GCL may be worse than the optimal encoder given by GIB ($\beta =1$). This makes sense as GIB has the access to the downstream task $Y$.
+
+The statement 2 in Theorem~\ref{thm:main} guarantees a lower bound of the mutual information between the learnt representations and the labels of the downstream task. As long as the GDA family $\mathcal{T}$ has a good control, $I(t'^*(G'); Y)\geq \min_{T\in\mathcal{T}}I(t'(G');Y)$ and $I(f^*(G); Y)$ thus cannot be too small. This implies that it is better to regularize when learning over $\mathcal{T}$. In our instantiation, based on edge-dropping augmentation (Sec.~\ref{sec:instantiation}), we regularize the ratio of dropped edges per graph. 
+
+\vspace{-1mm}
+\subsection{Instantiation of AD-GCL via Learnable Edge Perturbation} \label{sec:instantiation}
+\vspace{-1mm}
+We now introduce a practical instantiation of the AD-GCL principle (Eq.~\ref{eq:ad-gcl}) based on learnable edge-dropping augmentations as illustrated in Fig.~\ref{fig:ad-gcl-pipeline}. 
+(See Appendix~\ref{apd:algo} for a summary of AD-GCL in its algorithmic form.)
+The objective of AD-GCL has two folds: (1) Optimize the encoder $f$ to maximize the mutual information between the representations of the original graph $G$ and its augmented graph $t(G)$; (2) Optimize the GDA $T(G)$ where $t(G)$ is sampled to minimize such a mutual information. We always set the encoder as a GNN $f_{\Theta}$ with learnable parameters $\Theta$ and next we focus on the GDA, $T_{\Phi}(G)$ that has learnable parameters $\Phi$. \vspace{-1mm}
+
+\paragraph{Learnable Edge Dropping GDA model $T_{\Phi}(\cdot)$.}
+Edge dropping is the operation of deleting some edges in a graph. As a proof of concept, we adopt edge dropping to formulate the GDA family $\mathcal{T}$. Other types of GDAs such as node dropping, edge adding and feature masking can also be paired with our AD-GCL principle. %while edge dropping has already given good enough performance in our experiments. 
+Interestingly, in our experiments, edge-dropping augmentation optimized by AD-GCL has already achieved much better performance than any pre-defined random GDAs even carefully selected via extensive evaluation~\cite{you2020graph} (See Sec.\ref{sec:exp}). %We attribute such improvement to the AD-GCL principle. 
+Another reason that supports edge dropping is due to our Theorem~\ref{thm:main} statement 2, which shows that good GDAs should keep some information related to the downstream tasks. Many GRL downstream tasks such as molecule classification only depends on the structural fingerprints that can be represented as subgraphs of the original graph~\cite{duvenaud2015convolutional}. Dropping a few edges may not change those subgraph structures %of the original graph allows those subgraphs being kept 
+and thus keeps the information sufficient to the downstream classification. But note that this reasoning does not mean that we leverage domain knowledge to design GDA, as the family $\mathcal{T}$ is still broad and the specific GDA still needs to be optimized. Moreover, experiments show that our instantiation also works extremely well on social network classification and molecule property regression, where the evidence of subgraph fingerprints may not exist any more.  \vspace{-1mm}
+
+\paragraph{Parameterizing $T_{\Phi}(\cdot)$.} For each $G=(V,E)$, we set $T_{\Phi}(G)$, $T\in \mathcal{T}$ as a random graph model \cite{gilbert1959random, erdds1959random} conditioning on $G$. Each sample $t(G)\sim T_{\Phi}(G)$ is a graph that shares the same node set with $G$ while the edge set of $t(G)$ is only a subset of $E$. Each edge $e \in E$ will be associated with a random variable $p_e\sim$ Bernoulli$(\omega_e)$, where $e$ is in $t(G)$ if $p_e=1$ and is dropped otherwise. 
+
+We parameterize the Bernoulli weights $\omega_e$ by leveraging another GNN, \textit{i.e.,} the \emph{augmenter}, to run on $G$ according to Eq.\ref{eq:gnn_iteration} of $K$ layers, get the final-layer node representations $\{h_v^{(K)}|v\in V\}$ and set
+\begin{equation}\label{eq:w_e}
+    \omega_{e} = \text{MLP} ([h_u^{(K)};h_z^{(K)}]), \quad \text{where }  e=(u,z) \,\text{and}\,\{ h_v^{(K)} \mid v \in V \} = \text{GNN-augmenter}(G)
+\end{equation}
+
+To train $T(G)$ in an end-to-end fashion, %we require the gradients $\frac{\partial p_{e}}{\partial \omega_{e}}$ to be smooth and well defined. 
+we relax the discrete $p_{e}$ to be a continuous variable in $[0,1]$ and utilize the Gumbel-Max reparametrization trick \cite{maddison2016concrete, jang2016categorical}. Specifically, % which is crucial for backpropagation when dealing with. Specifically, 
+$p_{e} = \text{Sigmoid}((\log \delta - \log(1-\delta) + \omega_{e})/\tau)$, where $\delta \sim \text{Uniform(0,1)}$. 
+As temperature hyper-parameter $\tau \rightarrow 0$, $p_{e}$ gets closer to being binary. Moreover, the gradients $\frac{\partial p_{e}}{\partial \omega_{e}}$ are smooth and well defined. This style of edge dropping based on a random graph model has also been used for parameterized explanations of GNNs \cite{luo2020parameterized}. \vspace{-1mm}
+
+\begin{comment}
+for a graph $G = (V, E)$, let $p_{ij}$ be a binary indicator that specifies if edge $(i,j) \in E$ is perturbed i.e., $p_{ij} = 1$ if edge $(i,j)$ is perturbed and 0 otherwise. The probability of edge being perturbed follows a Bernoulli distribution i.e., $p_{ij} \sim \text{Bernoulli}(\omega_{ij})$. This allows us to parameterize the GDA as $T_{\Omega} (G)$, where $\Omega$ holds parameters $\omega_{ij}, \forall (i,j) \in E$ for $G$. Now, taking into account our MI estimator, encoder and parametrized GDA, we can rewrite the AD-GCL principle
+
+Objective (2) requires a parametrized GDA family $\mathcal{T}$ which allows us to search over its space. To make this objective tractable, we design $\mathcal{T}$ as an edge perturbation family within the paradigm of a random graph model \cite{gilbert1959random, erdds1959random} where each edge is perturbed following a Bernoulli distribution.
+
+For a graph $G = (V, E)$, let $p_{ij}$ be a binary indicator that specifies if edge $(i,j) \in E$ is perturbed i.e., $p_{ij} = 1$ if edge $(i,j)$ is perturbed and 0 otherwise. The probability of edge being perturbed follows a Bernoulli distribution i.e., $p_{ij} \sim \text{Bernoulli}(\omega_{ij})$. This allows us to parameterize the GDA as $T_{\Omega} (G)$, where $\Omega$ holds parameters $\omega_{ij}, \forall (i,j) \in E$ for $G$. Now, taking into account our MI estimator, encoder and parametrized GDA, we can rewrite the AD-GCL principle as,
+\begin{equation} \label{eq:ad-gcl-edge-perturb}
+  \min_{\Omega} \max_{\Theta} I_{\text{NCE}}(f_{\Theta}(G) ; f_{\Theta}(t(G))), \quad \text{where } G\sim \mathbb{P}_{\mathcal{G}}, t(G)\sim T_{\Omega}(G), 
+\end{equation}
+To implement $T_{\Omega}(\cdot)$ and optimize $\Omega$ in practice with gradient based optimization, we make use of another network called \textit{augmentor}, which is composed of a separate GNN with parameters $\Phi_1$ followed by an MLP edge model with parameters $\Phi_2$. Concretely, for graph $G$, the GNN of the \textit{augmentor} following Eq.~\ref{eq:gnn_iteration} iteratively for K layers gives final node representations and another MLP provides the parameters $\Omega$ for perturbing edges: 
+\begin{equation}
+    \omega_{ij} = \text{MLP}_{\Phi_2} ([h_i^{(K)};h_j^{(K)}]) \quad \text{where } \{ h_v^{(K)} \mid v \in V \} = \text{GNN}_{\Phi_1}(G)
+\end{equation}
+This augmentor with combined parameters $\Phi = \{\Phi_1, \Phi_2\}$ provides us with a continuous $\omega_{ij} \in \mathbb{R}$ parameter for each edge, constituting our $\Omega$.
+\begin{equation} \label{eq:ad-gcl-encoder-augmentor}
+  \min_{\Phi} \max_{\Theta} I_{\text{NCE}}(f_{\Theta}(G) ; f_{\Theta}(t(G))), \quad \text{where } G\sim \mathbb{P}_{\mathcal{G}}, t(G)\sim T_{\Phi}(G), 
+\end{equation}
+In this instantiation, generating samples $t(G)$ from the distribution defined by $T_{\Omega}(G)$ equivalently means drawing samples $p_{ij}$ from $\text{Bernoulli}(\omega_{ij})$. Because our aim is to do the learning (finding $\omega_{ij}$) in an end-to-end fashion, we require the gradients $\frac{\partial p_{ij}}{\partial \omega_{ij}}$ to be smooth and well defined. For that, we first relax the discrete $p_{ij}$ to be a continuous variable in $[0,1]$ and utilize the well-known Gumbel-Max reparametrization trick \cite{maddison2016concrete, jang2016categorical} which is crucial for backpropagation when dealing with . Specifically, 
+\begin{equation}
+\label{eq:p_ij}
+    p_{ij} = \text{Sigmoid}((\log \delta - log(1-\delta) + \omega_{ij})/\tau) \quad \text{where } \delta \sim \text{Uniform(0,1)} 
+\end{equation}
+As temperature hyper-parameter $\tau \rightarrow 0$, $p_{ij}$ gets closer to being binary.
+
+\end{comment}
+
+\paragraph{Regularizing $T_{\Phi}(\cdot)$.} As shown in Theorem~\ref{thm:main}, a reasonable GDA should keep a certain amount of information related to the downstream tasks (statement 2). Hence, we expect the GDAs in the edge dropping family $\mathcal{T}$ not to perform very aggressive perturbation. Therefore, we regularize the ratio of edges being dropped  per graph by enforcing the following constraint: For a graph $G$ and its augmented graph $t(G)$, we add $\sum_{e\in E} \omega_e/|E|$ to the objective, where $\omega_e$ is defined in Eq.\ref{eq:w_e} indicates the probability that $e$ gets dropped. 
+
+Putting everything together, the final objective is as follows.
+\begin{equation} \label{eq:ad-gcl-encoder-augmentor-reg}
+  \min_{\Phi} \max_{\Theta} I(f_{\Theta}(G) ; f_{\Theta}(t(G))) + \lambda_{\text{reg}} \mathbb{E}_{G}\big[\sum_{e \in E} \omega_e/|E|\big],\, \text{where } G\sim \mathbb{P}_{\mathcal{G}}, t(G)\sim T_{\Phi}(G).
+\end{equation}
+
+\vspace{-3mm}
+Note $\Phi$ corresponds to the learnable parameters of the augmenter GNN and MLP used to derive the $\omega_{e}$'s and $\Theta$ corresponds to the learnable parameters of the GNN $f$. 
+\vspace{-2mm}
+\paragraph{Estimating the objective in Eq.\ref{eq:ad-gcl-encoder-augmentor-reg}.} In our implementation, the second (regularization) term is easy to estimate empirically. For the first (mutual information) term, we adopt InfoNCE as the estimator~\cite{oord2018representation, tian2019contrastive, poole2019variational}, which is known to be a lower bound of the mutual information and is frequently used for contrastive learning~\cite{oord2018representation,tschannen2019mutual,chen2020simple}. Specfically, during the training, given a minibatch of $m$ graphs $\{G_i\}_{i=1}^m$, let $z_{i, 1} = g(f_{\Theta}(G_i))$ and $z_{i, 2} = g(f_{\Theta}(t(G_i)))$ where $g(\cdot)$ is the projection head implemented by a 2-layer MLP as suggested in~\cite{chen2020simple}. With $sim(\cdot, \cdot)$ denoting cosine similarity, we estimate the mutual information for the mini-batch as follows.
+\begin{equation}
+    \label{eq:loss}
+    \small{I(f_{\Theta}(G) ; f_{\Theta}(t(G))) \rightarrow \hat{I}= \frac{1}{m}\sum_{i= 1}^{m} \log \frac{\exp(sim(z_{i,1}, z_{i,2}))}{\sum_{i^\prime = 1, i^\prime \neq i }^{m}\exp(sim(z_{i,1}, z_{i^\prime,2}))}}
+\end{equation}
+
+\vspace{-6mm}
+\section{Related Work}
+\vspace{-2mm}
+\label{sec:related}
+GNNs for GRL is a broad field and gets a high-level review in the Sec.~\ref{sec:intro}. Here, we focus on the topics that are most relevant to graph contrastive learning (GCL). 
+
+Contrastive learning (CL)~\cite{linsker1988self,becker1992self, henaff2020data, oord2018representation, tian2019contrastive,hjelm2018learning} was initially proposed to train CNNs for image representation learning and has recently achieved great success~\cite{chen2020simple,chen2020big}. GCL applies the idea of CL on GNNs. In contrast to the case of CNNs, GCL trained using GNNs posts us new fundamental challenges. An image often has multiple natural views, say by imposing different color filters and so on. Hence, different views of an image give natural contrastive pairs for CL to train CNNs. However, graphs are more abstract and the irregularity of graph structures typically provides crucial information. Thus, designing contrastive pairs for GCL must play with irregular graph structures and thus becomes more challenging. Some works use different parts of a graph to build contrastive pairs, including nodes \textit{v.s.} whole graphs~\cite{velivckovic2018deep,sun2019infograph}, nodes \textit{v.s.} nodes~\cite{peng2020graph}, nodes \textit{v.s.} subgraphs~\cite{jiao2020sub, hu2019strategies}.
+Other works adopt graph data augmentations (GDA) such as edge perturbation~\cite{qiu2020gcc} to generate contrastive pairs. Recently. GraphCL~\cite{you2020graph} gives an extensive study on different combinations of GDAs including node dropping, edge perturbation, subgraph sampling and feature masking. Extensive evaluation is required to determine good combinations. MVGRL~\cite{hassani2020contrastive} and GCA~\cite{zhu2020graph} leverage the domain knowledge of network science and adopt network centrality to perform GDAs. Note that none of the above methods consider optimizing augmentations.  In contrast, our principle AD-GCL provides theoretical guiding principles to optimize augmentations. Very recently, JOAO~\cite{you2021graph} adopts a bi-level optimization framework sharing some high-level ideas with our adversarial training strategy but has several differences: 1) the GDA search space in JOAO is set as different types of augmentation with uniform perturbation, such as uniform edge/node dropping while we allow augmentation with non-uniform perturbation. 2) JOAO relaxes the GDA combinatorial search problem into continuous space via Jensen’s inequality and adopts projected gradient descent to optimize. Ours, instead, adopts Bayesian modeling plus reparameterization tricks to optimize. The performance comparison between AD-GCL and JOAO for the tasks investigated in Sec.~\ref{sec:exp} is given in Appendix~\ref{apd:joao_compare}. %Augmentation schemes are generally guided by vague principles and for success requires extensive domain knowledge. 
+
+Tian et al.~\cite{tian2020makes} has recently proposed the InfoMin principle that shares some ideas with AD-GCL but there are several fundamental differences. Theoretically, InfoMin needs the downstream tasks to supervise the augmentation. Rephrased in our notation, the optimal augmentation $T_{IM}(G)$ given by InfoMin (called the sweet spot in~\cite{tian2020makes}) needs to satisfy $I(t_{IM}(G);Y) = I(G;Y)$ and $I(t_{IM}(G);G|Y)=0$, $t_{IM}(G)\sim T_{IM}(G)$, neither of which are possible without the downstream-task knowledge. Instead, our Theorem~\ref{thm:main} provides more reasonable arguments and creatively suggests using regularization to control the tradeoff. Empirically, InfoMin is applied to CNNs while AD-GCL is applied to GNNs. AD-GCL needs to handle the above challenges due to irregular graph structures and the limited expressive power of GNNs~\cite{xu2018powerful,morris2019weisfeiler}, which InfoMin does not consider. 
+
+\begin{comment}
+\subsection{Graph Representation Learning}
+Owing to the widespread use of graphs to represent data from diverse domains \cite{applications}, machine learning methods for various downstream tasks like node-level, subgraph-level, graph-level classification/regression and link prediction have become extremely important. A significant amount of work has been done towards this goal \cite{}. The common goal in all these methods is to build representations in latent space that can capture the structure and various attributes of a graph that can be useful for downstream tasks. In particular, Graph Neural Networks (GNNs) \cite{scarselli2008graph, bruna2014spectral,gilmer2017neural, kipf2017semi, morris2019weisfeiler} making use of the message passing paradigm, learn useful node-level and graph-level representations with much of the focus in supervised settings. There is now growing interest to build self-supervised graph representation learning methods given the prevalent label scarcity issue. For a comprehensive review of the design and principles of GNNs we refer the reader to \cite{chami2020machine, zhang2020deep_survey, hamilton2020book}.
+
+Earliest works in self-supervised graph representation learning (SS-GRL) were inspired by language models which learn word representation by predicting their context \cite{mikolov2013distributed}. They have been adapted to build node and graph level embeddingsby using hand-crafted procedures like random walks, adjacency reconstruction and Weisfeiler-Lehman relabelling for providing suitable context~\cite{perozzi2014deepwalk,grover2016node2vec,ribeiro2017struc2vec, narayanan2017graph2vec,hamilton2017inductive, kipf2016variational} .
+
+\subsection{Graph Contrastive Learning (GCL)}
+Contrastive Learning (CL)~\cite{becker1992self, henaff2020data, oord2018representation, tian2019contrastive} aims to learn an encoder that can differentiate similar data instances (views) from dissimilar instances and has found great success in self-supervised language and image representation learning~\cite{}. It provides a natural learning metric based on the mutual information maximization between correlated instances~\cite{linsker1988self}. For graphs, with the advent of GNNs as the primary encoder of choice, CL has been adopted but, defining the contrastive pairs for graphs plays a very significant role in the learning outcome and has been guided by heuristics and extensive evaluation. These strategies include, contrasting node-level and graph-level pairs as done in DGI~\cite{velivckovic2018deep}, InfoGraph~\cite{sun2019infograph}, contrasting node-node pairs and including edge information as in GMI~\cite{peng2020graph}, contrasting node and sub-graph pairs~\cite{jiao2020sub, hu2019strategies}. The above methods use simple shuffling of node features or edge permutations to construct dissimilar instances. Different from them MVGRL~\cite{hassani2020contrastive} uses graph diffusion kernels to generate augmented graphs and contrasts node-graph pairs. GCC~\cite{qiu2020gcc} contrasts sampled sub-graph pairs, GraphCL~\cite{you2020graph} contrasts graph-graph pairs and augmentations like node dropping, edge perturbation, subgraph sampling and feature masking are designed. It is to be noted that these augmentations are not conditioned on the input graph and thus requires very extensive evaluation when deploying them in practice. Finally, GCA~\cite{zhu2020graph} takes a step in the direction of creating augmentations that are adaptive to both structure and attributes of a graph but, resort to non-learnable augmentation schemes that are based on degree, eigenvector and PageRank centrality. In addition this method is designed with the specific objective of node classification. As evident, a common thread is that none of the above methods have any theoretical guiding principles for defining these contrastive pairs or generating augmentations. Augmentation schemes are generally guided by vague principles and for success requires extensive domain knowledge. Improperly designed augmentations can inject too much or too little information that risk learning sub-optimal representations. Different from them our principle AD-GCL, guides the automatic generation of augmentations that can be most beneficial for GCL. 
+
+Here I will cite and discuss \cite{tian2020makes}
+
+\subsection{Information Bottleneck}
+I will work on this. Here I will cite and discuss \cite{tian2020makes}
+\end{comment}
+
+\vspace{-3mm}
+\section{Experiments and Analysis}
+\vspace{-3mm}
+\label{sec:exp}
+This section is devoted to the empirical evaluation of the proposed instantiation of our AD-GCL principle. Our initial focus is on unsupervised learning which is followed by analysis of the effects of regularization. We further apply AD-GCL to transfer and semi-supervised learning. Summary of datasets and training details for specific experiments are provided in Appendix~\ref{apd:datasets} and \ref{apd:exp_settings} respectively.
+
+\vspace{-3mm}
+\subsection{Unsupervised Learning}
+\vspace{-3mm}
+\label{exp:unsup}
+In this setting, an encoder (specifically GIN~\cite{xu2018how}) is trained with different self-supervised methods to learn graph representations, which are then evaluated by feeding these representations to make prediction for the downstream tasks. We use datasets from Open Graph Benchmark (OGB)~\cite{hu2020open}, TU Dataset~\cite{Morris+2020} and ZINC~\cite{dwivedi2020benchmarking} for graph-level property classification and regression. More details regarding the experimental setting are provided in the Appendix~\ref{apd:exp_settings}.
+
+We consider two types of AD-GCL, where one is with a fixed regularization weight $\lambda_{\text{reg}}=5$ (Eq.\ref{eq:ad-gcl-encoder-augmentor-reg}), termed AD-GCL-FIX, and another is with $\lambda_{\text{reg}}$ tuned over the validation set among $\{0.1, 0.3, 0.5, 1.0, 2.0, 5.0, 10.0\}$, termed AD-GCL-OPT. AD-GCL-FIX assumes any information from the downstream task as unavailable while AD-GCL-OPT assumes the augmentation search space has some weak information from the downstream task. A full range of analysis on how $\lambda_{\text{reg}}$ impacts AD-GCL will be investigated in Sec.~\ref{exp:reg_analysis}. We compare AD-GCL with three unsupervised/self-supervised learning baselines for graph-level tasks, which include randomly initialized untrained GIN (RU-GIN)~\cite{xu2018how}, InfoGraph~\cite{sun2019infograph} and GraphCL~\cite{you2020graph}. Previous works~\cite{you2020graph, sun2019infograph} show that they generally outperform graph kernels~\cite{kriege2020survey,yanardag2015deep,shervashidze2011weisfeiler} and network embedding methods~\cite{grover2016node2vec, perozzi2014deepwalk, narayanan2017graph2vec,adhikari2018sub2vec}.
+
+We also adopt GCL with GDA based on non-adversarial edge dropping (NAD-GCL) for ablation study. NAD-GCL drops the edges of a graph uniformly at random. We consider NAD-GCL-FIX and NAD-GCL-OPT with different edge drop ratios. NAD-GCL-GCL adopts the edge drop ratio of AD-GCL-FIX at the saddle point of the optimization (Eq.\ref{eq:ad-gcl-encoder-augmentor-reg}) while NAD-GCL-OPT optimally tunes the edge drop ratio over the validation datasets to match AD-GCL-OPT.
+We also adopt fully supervised GIN (F-GIN) to provide an anchor of the performance. We stress that all methods adopt GIN~\cite{xu2018how} as the encoder. Except F-GIN, all methods adopt a downstream \emph{linear} classifier or regressor with the same hyper-parameters for fair comparison. Adopting \emph{linear models} was suggested by~\cite{tschannen2019mutual}, which explicitly attributes any performance gain/drop to the quality of learnt representations.  
+
+\begin{table}[t]
+\centering
+\renewcommand{\arraystretch}{1.5}
+\newcommand{\STAB}[1]{\begin{tabular}{@{}c@{}}#1\end{tabular}}
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{clcccc|ccccc}
+\hline
+& Dataset                                      & NCI1           & PROTEINS            & MUTAG          & DD                                      & COLLAB           & RDT-B            & RDT-M5K          & IMDB-B           & IMDB-M           \\ \hline
+
+& F-GIN & 78.27 $\pm$ 1.35 & 72.39 $\pm$ 2.76 & 90.41 $\pm$ 4.61 & 74.87 $\pm$ 3.56 & 74.82 $\pm$ 0.92 & 86.79 $\pm$ 2.04 & 53.28 $\pm$ 3.17 & 71.83 $\pm$ 1.93 & 48.46 $\pm$ 2.31 \\ \hline
+\multirow{3}{*}{\STAB{\rotatebox[origin=c]{90}{Baselines}}}&RU-GIN~\cite{xu2018how}& 62.98 $\pm$ 0.10 & 69.03 $\pm$ 0.33 & 87.61 $\pm$ 0.39 & 74.22 $\pm$ 0.30  & 63.08 $\pm$ 0.10 & 58.97 $\pm$ 0.13 & 27.52 $\pm$ 0.61 & 51.86 $\pm$ 0.33 & 32.81 $\pm$ 0.57 \\
+& InfoGraph~\cite{sun2019infograph}& 68.13 $\pm$ 0.59 & 72.57 $\pm$ 0.65 & 87.71 $\pm$ 1.77 & 75.23 $\pm$ 0.39                                     & 70.35 $\pm$ 0.64 & 78.79 $\pm$ 2.14 & 51.11 $\pm$ 0.55 & 71.11 $\pm$ 0.88 & 48.66 $\pm$ 0.67 \\
+& GraphCL ~\cite{you2020graph}& 68.54 $\pm$ 0.55 & 72.86 $\pm$ 1.01 & 88.29 $\pm$ 1.31 & 74.70 $\pm$ 0.70                                     & 71.26 $\pm$ 0.55 & 82.63 $\pm$ 0.99 & 53.05 $\pm$ 0.40 & 70.80 $\pm$ 0.77 & 48.49 $\pm$ 0.63 \\\hline
+\multirow{2}{*}{\STAB{\rotatebox[origin=c]{90}{AB-S}}}& NAD-GCL-FIX & 69.23 $\pm$ 0.60 & 72.81 $\pm$ 0.71 & 88.58 $\pm$ 1.58 & 74.55 $\pm$ 0.55              & 71.56 $\pm$ 0.58 & 83.41 $\pm$ 0.66 & 52.72 $\pm$ 0.71 & 70.94 $\pm$ 0.77 & 48.33 $\pm$ 0.47 \\
+& NAD-GCL-OPT & 69.30 $\pm$ 0.32 & 73.18 $\pm$ 0.71 & 89.05 $\pm$ 1.06 & 74.55 $\pm$ 0.55             & 72.04 $\pm$ 0.67 & 83.74 $\pm$ 0.76 & 53.43 $\pm$ 0.26 & 71.94 $\pm$ 0.59 & 49.01 $\pm$ 0.93 \\\hline\hline
+\multirow{2}{*}{\STAB{\rotatebox[origin=c]{90}{Ours}}} 
+
+& AD-GCL-FIX & \bf{69.67 $\pm$ 0.51}$^\star$ & \bf{73.59 $\pm$ 0.65} & \bf{89.25 $\pm$ 1.45} & 74.49 $\pm$ 0.52 & \textbf{73.32 $\pm$ 0.61}$^\star$ & \textbf{85.52 $\pm$ 0.79}$^\star$ & 53.00 $\pm$ 0.82 & \textbf{71.57 $\pm$ 1.01} & \textbf{49.04 $\pm$ 0.53} \\ 
+
+& AD-GCL-OPT & \bf{69.67 $\pm$ 0.51}$^\star$ & \bf{73.81 $\pm$ 0.46}$^\star$ & \textbf{89.70 $\pm$ 1.03} & 75.10 $\pm$ 0.39 & \textbf{73.32 $\pm$ 0.61}$^\star$ & \textbf{85.52 $\pm$ 0.79}$^\star$ & \textbf{54.93 $\pm$ 0.43}$^\star$ & \textbf{72.33 $\pm$ 0.56}$^\star$ & \textbf{49.89 $\pm$ 0.66}$^\star$ \\ \hline\hline
+\end{tabular}%
+}\\
+\vspace{3mm}
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{clcccc|ccccc}
+\hline
+& Task                                         & \multicolumn{4}{c|}{Regression (Downstream Classifier - Linear Regression + L2)} & \multicolumn{5}{c}{Classification (Downstream Classifier - Logistic Regression + L2)}       \\ \cline{1-11} 
+& Dataset                                      & molesol            & mollipo           & molfreesolv        & \multicolumn{1}{|c|}{ZINC-10K}           & molbace          & molbbbp          & molclintox       & moltox21         & molsider         \\
+& Metric                                       & \multicolumn{3}{c}{RMSE (shared) ($\downarrow$)}                     & \multicolumn{1}{|c|}{MAE ($\downarrow$) }& \multicolumn{5}{c}{ROC-AUC \% (shared) ($\uparrow$)}                                               \\ \hline
+
+&F-GIN                         & 1.173 $\pm$ 0.057  & 0.757 $\pm$ 0.018 & 2.755 $\pm$ 0.349  & \multicolumn{1}{|c|}{0.254 $\pm$ 0.005}  & 72.97 $\pm$ 4.00 & 68.17 $\pm$ 1.48 & 88.14 $\pm$ 2.51 & 74.91 $\pm$ 0.51 & 57.60 $\pm$ 1.40 \\ \hline
+\multirow{3}{*}{\STAB{\rotatebox[origin=c]{90}{Baselines}}} & RU-GIN~\cite{xu2018how}                              & 1.706 $\pm$ 0.180  & 1.075 $\pm$ 0.022 & 7.526 $\pm$ 2.119  & \multicolumn{1}{|c|}{0.809 $\pm$ 0.022}  & 75.07 $\pm$ 2.23 & 64.48 $\pm$ 2.46 & 72.29 $\pm$ 4.15 & 71.53 $\pm$ 0.74 & 62.29 $\pm$ 1.12 \\
+
+&InfoGraph~\cite{sun2019infograph}                                    & 1.344 $\pm$ 0.178  & 1.005 $\pm$ 0.023 & 10.005 $\pm$ 4.819 & \multicolumn{1}{|c|}{0.890 $\pm$ 0.017}  & 74.74 $\pm$ 3.64 & 66.33 $\pm$ 2.79 & 64.50 $\pm$ 5.32 & 69.74 $\pm$ 0.57 & 60.54 $\pm$ 0.90 \\
+
+&GraphCL~\cite{you2020graph}                                      & 1.272 $\pm$ 0.089  & 0.910 $\pm$ 0.016 & 7.679 $\pm$ 2.748  & \multicolumn{1}{|c|}{0.627 $\pm$ 0.013}  & 74.32 $\pm$ 2.70 & 68.22 $\pm$ 1.89 & 74.92 $\pm$ 4.42 & 72.40 $\pm$ 1.01 & 61.76 $\pm$ 1.11 \\ 
+
+\hline
+\multirow{2}{*}{\STAB{\rotatebox[origin=c]{90}{AB-S}}} & NAD-GCL-FIX                   & 1.392 $\pm$ 0.065  & 0.952 $\pm$ 0.024 & 5.840 $\pm$ 0.877  & \multicolumn{1}{|c|}{0.609 $\pm$ 0.010}  & 73.60 $\pm$ 2.73 & 66.12 $\pm$ 1.80 & 73.32 $\pm$ 3.66 & 71.65 $\pm$ 0.94 & 60.41 $\pm$ 1.48 \\ 
+
+&NAD-GCL-OPT             & 1.242 $\pm$ 0.096  & 0.897 $\pm$ 0.022 & 5.840 $\pm$ 0.877  & \multicolumn{1}{|c|}{0.609 $\pm$ 0.010}  & 73.69 $\pm$ 3.67 & 67.70 $\pm$ 1.78 & 74.40 $\pm$ 4.92 & 71.65 $\pm$ 0.94 & 61.14 $\pm$ 1.43 \\ 
+
+\hline\hline
+\multirow{2}{*}{\STAB{\rotatebox[origin=c]{90}{Ours}}}&AD-GCL-FIX     & \textbf{1.217 $\pm$ 0.087}  & \textbf{0.842 $\pm$ 0.028}$^\star$ & \textbf{5.150 $\pm$ 0.624}$^\star$  & \multicolumn{1}{|c|}{\textbf{0.578 $\pm$ 0.012}$^\star$} & \textbf{76.37 $\pm$ 2.03} & 68.24 $\pm$ 1.47 & \textbf{80.77 $\pm$ 3.92} & 71.42 $\pm$ 0.73 & \textbf{63.19 $\pm$ 0.95} \\
+
+&AD-GCL-OPT & \textbf{1.136 $\pm$ 0.050}$^\star$  & \textbf{0.812 $\pm$ 0.020}$^\star$ & \textbf{4.145 $\pm$ 0.369}$^\star$ & \multicolumn{1}{|c|}{\textbf{0.544 $\pm$ 0.004}$^\star$}  & \textbf{77.27 $\pm$ 2.56} & \textbf{69.54 $\pm$ 1.92} & \textbf{80.77 $\pm$ 3.92} & \textbf{72.92 $\pm$ 0.86} & \textbf{63.19 $\pm$ 0.95} \\ \hline \hline
+\end{tabular}%
+}
+
+\caption{\small{Unsupervised learning performance for (TOP) biochemical and social network classification in TU datasets~\cite{Morris+2020} (Averaged accuracy $\pm$ std. over 10 runs) and (BOTTOM) chemical molecules property prediction in OGB datasets~\cite{hu2020open} (mean $\pm$ std. over  10 runs). % 
+\textbf{Bold}/\textbf{Bold}$^\star$ indicats our methods outperform baselines with $\geq$ 0.5/$\geq$ 2 std respectively. Fully supervised (F-GIN) results are shown \textbf{only} for placing GRL methods in perspective. Ablation-study (AB-S) results do not count as baselines.}}
+\label{tab:unsupervised_learning_ogbg}
+\vspace{-5mm}
+\end{table}
+Tables~\ref{tab:unsupervised_learning_ogbg} %and \ref{tab:unsupervised_learning_social} 
+show the results for unsupervised graph level property prediction in social and chemical domains respectively.  %a random edge drop augmentation strategy using GCL. 
+We witness the big performance gain of AD-GCL as opposed to all baselines across all the datasets. Note GraphCL utilizes extensive evaluation to select the best combination of augmentions over a broad GDA family including node-dropping, edge dropping and subgraph sampling. Our results indicate that such extensive evaluation may not be necessary while optimizing  the augmentation strategy in an adversarial way is greatly beneficial.
+
+We stress that edge dropping is not cherry picked as the search space of augmentation strategies. Other search spaces may even achieve better performance, while an extensive investigation is left for the future work. 
+
+Moreover, AD-GCL also clearly improves upon the performance against its non-adversarial counterparts (NAD-GCL) across all the datasets, which further demonstrates stable and significant advantages of the AD-GCL principle. Essentially, the input-graph-dependent augmentation learnt by AD-GCL yields much benefit.
+Finally, we compare AD-GCL-FIX with AD-GCL-OPT. %The take-away is that, %our framework with a large $\lambda_{\text{reg}}$ is comparable to the optimized $\lambda_{\text{reg}}$ version 
+Interestingly, two methods achieve comparable results though AD-GCL-OPT is sometimes better. This observation implies that the AD-GCL principle may be robust to the choice of $\lambda_{\text{reg}}$ and thus motivates the analysis in the next subsection. Moreover, weak information from the downstream tasks indeed help with controlling the search space and further betters the performance. We also list the optimal $\lambda_{\text{reg}}$'s of AD-GCL-OPT for different datasets in Appendix~\ref{apd:more_results_opt_reg} for the purpose of comparison and reproduction.
+\subsubsection{Note on the linear downstream classifier}
+We find that the choice of the downstream classifier can significantly affect the evaluation of the self-supervised representations. InfoGraph~\cite{sun2019infograph} and GraphCL~\cite{you2020graph} adopt a non-linear SVM model as the downstream classifier. Such a non-linear model is more powerful than the linear model we adopt and thus causes some performance gap between the results showed in Table~\ref{tab:unsupervised_learning_ogbg} (TOP) and (BOTTOM) and their original results (listed in Appendix~\ref{apd:unsup_nonlinear} as Table~\ref{tab:unsup_tu_non_linear_eval_results}). We argue that using a non-linear SVM model as the downstream classifier is unfair, because the performance of even a randomly initialized untrained GIN (RU-GIN) is significantly improved  (comparing results from Table~\ref{tab:unsupervised_learning_ogbg} (TOP) to Table~\ref{tab:unsup_tu_non_linear_eval_results} ). Therefore, we argue for adopting a linear classifier protocol as suggested by~\cite{tschannen2019mutual}.
+That having been said, our methods (both AD-GCL-FIX and AD-GCL-OPT) still performs significantly better than baselines in most cases, even when a non-linear SVM classifer is adopted, as shown in Table~\ref{tab:unsup_tu_non_linear_eval_results}. Several relative gains are there no matter whether the downstream classifier is a simple linear model (Tables~\ref{tab:unsupervised_learning_ogbg}) or a non-linear SVM model (Table~\ref{tab:unsup_tu_non_linear_eval_results}). AD-GCL methods significantly outperform InfoGraph in 5 over 8 datasets and GraphCL in 6 over 8 datasets. This further provides the evidence for the effectiveness of our method. Details on the practical benefits of linear downstream models can be found in Appendix~\ref{apd:unsup_nonlinear}.
+
+\vspace{-3mm}
+\subsection{Analysis of Regularizing the GDA Model}
+\vspace{-2mm}
+\label{exp:reg_analysis}
+
+\begin{figure}[t]
+    \centering
+    \includegraphics[width=\textwidth]{figures/reg_analysis.pdf}
+    \caption{\small{(a) $\lambda_{\text{reg}}$ \textit{v.s.} expected edge drop ratio $\mathbb{E}_\mathcal{G}[\sum_{e} \omega_e/|E|]$ (measured at saddle point of Eq.\ref{eq:ad-gcl-encoder-augmentor-reg}). (b) Training dynamics of expected drop ratio for $\lambda_{\text{reg}}$. (c) Validation performance for graph classification \textit{v.s.} edge drop ratio. Compare AD-GCL and GCL with non-adversarial edge dropping. The markers on AD-GCL's performance curves show the $\lambda_{\text{reg}}$ used.}}% \sus{make in high dpi setting for making legible }}
+    \label{fig:reg_term_analysis}
+    \vspace{-4mm}
+\end{figure}
+
+Here, we study how different $\lambda_{\text{reg}}$'s impact the expected edge drop ratio of AD-GCL at the saddle point of Eq.\ref{eq:ad-gcl-encoder-augmentor-reg} and further impact the model performance on the validation datasets. Due to the page limitation, we focus on classification tasks in the main text while leaving the discussion on regression tasks in the Appendix~\ref{apd:more_results_reg_analysis}. Figure~\ref{fig:reg_term_analysis} %and~\ref{fig:perf_vs_edge_drop} 
+shows the results.
+
+As shown in Figure~\ref{fig:reg_term_analysis}(a), a large $\lambda_{\text{reg}}$ tends to yield a small expected edge drop ratio at the convergent point, which matches our expectation. $\lambda_{\text{reg}}$ ranging from 0.1 to 10.0 corresponds to dropping almost everything (80\% edges) to nothing (<10\% edges). The validation performance in %Figure~\ref{fig:perf_vs_edge_drop} 
+Figure~\ref{fig:reg_term_analysis}(c) is out of our expectation. We find that for classification tasks, the performance of the encoder is extremely robust to different choices of $\lambda_{\text{reg}}$'s when trained w.r.t. the AD-GCL principle, though the edge drop ratios at the saddle point are very different. However, the non-adversarial counterpart NAD-GCL is sensitive to different edge drop ratios, especially on the molecule dataset (e.g., ogbg-molclitox, ogbg-molbbbp). We actually observe the similar issue of NAD-GCL across all molecule datasets (See Appendix~\ref{apd:more_results_perf_vs_edge_drop}). More interesting aspects of our results appear at the extreme cases. When $\lambda_{\text{reg}}\geq 5.0$, the convergent edge drop ratio is close to 0, which means no edge dropping, but AD-GCL still significantly outperforms naive GCL with small edge drop ratio. When $\lambda_{\text{reg}}=0.3$, the convergent edge drop ratio is greater than 0.6, which means dropping more than half of the edges, but AD-GCL still keeps reasonable performance. We suspect that such benefit comes from the training dynamics of AD-GCL (examples as shown in Figure~\ref{fig:reg_term_analysis}(b)). Particularly, optimizing augmentations allows for non-uniform edge-dropping probability. During the optimization procedure, AD-GCL pushes high drop probability on redundant edges while low drop probability on critical edges, which allows the encoder to differentiate redundant and critical information. This cannot be fully explained by the final convergent edge drop ratio % may not tell the entire story. 
+ and motivates future investigation of AD-GCL from a more in-depth theoretical perspective. 
+\vspace{-3mm}
+\subsection{Transfer Learning}
+\vspace{-2mm}
+\label{exp:transfer}
+\begin{table}[t]
+\centering
+\renewcommand{\arraystretch}{1.25}
+\newcommand{\STAB}[1]{\begin{tabular}{@{}c@{}}#1\end{tabular}}
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{lcccccccc|c}
+\hline
+Pre-Train Dataset   & \multicolumn{8}{c|}{\begin{tabular}[c]{@{}c@{}} ZINC 2M\end{tabular}}                                                                                                                              & \begin{tabular}[c]{@{}c@{}}PPI-306K\end{tabular} \\ \hline
+Fine-Tune Dataset    & BBBP                                & Tox21                                & SIDER                                & ClinTox                              & BACE                                 & \multicolumn{1}{c}{HIV} & MUV              & ToxCast & PPI                                                                                       \\ \hline
+No Pre-Train & 65.8 $\pm$ 4.5                      & 74.0 $\pm$ 0.8                       & 57.3 $\pm$ 1.6                       & 58.0 $\pm$ 4.4                       & 70.1 $\pm$ 5.4                       & 75.3 $\pm$ 1.9          & 71.8 $\pm$ 2.5   &  63.4 $\pm$ 0.6 & 64.8 $\pm$ 1.0                                                                            \\
+EdgePred~\cite{hu2019strategies}     & 67.3 $\pm$ 2.4                      & 76.0 $\pm$ 0.6                       & 60.4 $\pm$ 0.7                       & 64.1 $\pm$ 3.7                       & 79.9 $\pm$ 0.9                       & 76.3 $\pm$ 1.0          & 74.1 $\pm$ 2.1   & 64.1$\pm $ 0.6 & 65.7 $\pm$ 1.3                                                                            \\
+AttrMasking~\cite{hu2019strategies}  & 64.3 $\pm$ 2.8                      & 76.7 $\pm$ 0.4                       & 61.0 $\pm$ 0.7                       & 71.8 $\pm$ 4.1                       & 79.3 $\pm$ 1.6                       & 77.2 $\pm$ 1.1          & 74.7 $\pm$ 1.4   & 64.2 $\pm$ 0.5 & 65.2 $\pm$ 1.6                                                                            \\
+ContextPred~\cite{hu2019strategies}  & 68.0 $\pm$ 2.0                      & 75.7 $\pm$ 0.7                       & 60.9 $\pm$ 0.6                       & 65.9 $\pm$ 3.8                       & 79.6 $\pm$ 1.2                       & 77.3 $\pm$ 1.0          & 75.8 $\pm$ 1.7   & 63.9 $\pm$ 0.6& 64.4 $\pm$ 1.3                                                                            \\
+InfoGraph~\cite{sun2019infograph}    & 68.8 $\pm$ 0.8                      & 75.3 $\pm$ 0.5                       & 58.4 $\pm$ 0.8                       & 69.9 $\pm$3.0                        & 75.9 $\pm$ 1.6                       & 76.0 $\pm$ 0.7          & 75.3 $\pm$ 2.5   & 62.7 $\pm$ 0.4 & 64.1 $\pm$ 1.5                                                                            \\
+GraphCL~\cite{you2020graph}      & 69.68 $\pm$ 0.67                    & 73.87 $\pm$ 0.66                     & 60.53 $\pm$ 0.88                     & 75.99 $\pm$ 2.65                     & 75.38 $\pm$ 1.44                     & 78.47 $\pm$ 1.22        & 69.8 $\pm$ 2.66  &  62.40 $\pm$ 0.57 & 67.88 $\pm$ 0.85                                                                          \\ \hline\hline
+AD-GCL-FIX         & \multicolumn{1}{l}{70.01 $\pm$1.07} & \multicolumn{1}{l}{76.54 $\pm$ 0.82} & \multicolumn{1}{l}{\textbf{63.28 $\pm$ 0.79}} & \multicolumn{1}{l}{\textbf{79.78 $\pm$ 3.52}} & \multicolumn{1}{l}{78.51 $\pm$ 0.80} & 78.28 $\pm$ 0.97        & 72.30 $\pm$ 1.61 & 63.07 $\pm$ 0.72 & \textbf{68.83 $\pm$ 1.26} \\
+\centering{Our Ranks} & 1 & 2 & 1 & 1 & 4 & 2 & 5 & 5 &  1 \\
+\hline\hline
+\end{tabular}%
+}
+\caption{\small{Transfer learning performance for chemical molecules property prediction (mean ROC-AUC $\pm$ std. over  10 runs). \textbf{Bold} indicates our methods outperform baselines with $\geq$ 0.5 std..} }%Compared numbers are from~\cite{you2020graph, hu2019strategies}.}
+\vspace{-5mm}
+\label{tab:transfer_learning}
+\end{table}Next, we evaluate the GNN encoders trained by AD-GCL on transfer learning to predict chemical molecule properties and biological protein functions. We follow the setting in~\cite{hu2019strategies} and use the same datasets: GNNs are pre-trained on one dataset using self-supervised learning and later fine-tuned on another dataset to test out-of-distribution performance. Here, we only consider AD-GCL-FIX as AD-GCL-OPT is only expected to have better performance. We adopt baselines including no pre-trained GIN (\textit{i.e.,} without self-supervised training on the first dataset and with only fine-tuning), InfoGraph~\cite{sun2019infograph}, GraphCL~\cite{you2020graph}, three different pre-train strategies in~\cite{hu2019strategies} including edge prediction, node attribute masking and context prediction that utilize edge, node and subgraph context respectively. More detailed setup is given in Appendix~\ref{apd:exp_settings}. 
+
+According to Table~\ref{tab:transfer_learning}, AD-GCL-FIX significantly outperforms baselines in 3 out of 9 datasets and achieves a mean rank of 2.4 across these 9 datasets which is better than all baselines. Note that although AD-GCL only achieves 5th on some datasets, AD-GCL still significantly outperforms InfoGraph~\cite{sun2019infograph} and GraphCL~\cite{you2020graph}, both of which are strong GNN self-training baselines. In contrast to InfoGraph~\cite{sun2019infograph} and GraphCL~\cite{you2020graph}, AD-GCL achieves some performance much closer to those baselines (EdgePred, AttrMasking and ContextPred) based on domain knowledge and extensive evaluation in~\cite{hu2019strategies}. This is rather significant as our method utilizes only edge dropping GDA, which again shows the effectiveness of the AD-GCL principle.
+
+\vspace{-2mm}
+\subsection{Semi-Supervised Learning}
+\vspace{-1mm}
+\label{exp:semisup}
+\begin{table}[t]
+\centering
+\renewcommand{\arraystretch}{1.25}
+\resizebox{0.8\textwidth}{!}{%
+\begin{tabular}{lccc|ccc}
+\hline
+Dataset            & NCI1             & PROTEINS         & DD               & COLLAB           & RDT-B            & RDT-M5K          \\ \hline
+No Pre-Train      & 73.72 $\pm$ 0.24 & 70.40 $\pm$ 1.54 & 73.56 $\pm$ 0.41 & 73.71$\pm$ 0.27  & 86.63 $\pm$ 0.27 & 51.33 $\pm$ 0.44 \\
+SS-GCN-A & 73.59 $\pm$ 0.32 & 70.29 $\pm$ 0.64 & 74.30 $\pm$ 0.81 & 74.19 $\pm$ 0.13 & 87.74 $\pm$ 0.39 & 52.01 $\pm$ 0.20 \\
+GAE~\cite{kipf2016variational}           & 74.36 $\pm$ 0.24 & 70.51 $\pm$ 0.17 & 74.54 $\pm$ 0.68 & 75.09 $\pm$ 0.19 & 87.69 $\pm$ 0.40 & 53.58 $\pm$ 0.13 \\
+InfoGraph~\cite{sun2019infograph}     & 74.86 $\pm$ 0.26 & 72.27 $\pm$ 0.40 & 75.78 $\pm$ 0.34 & 73.76 $\pm$ 0.29 & 88.66 $\pm$ 0.95 & 53.61 $\pm$ 0.31 \\
+GraphCL~\cite{you2020graph}      & 74.63 $\pm$ 0.25 & 74.17 $\pm$ 0.34 & 76.17 $\pm$ 1.37 & 74.23 $\pm$ 0.21 & 89.11 $\pm$ 0.19 & 52.55 $\pm$ 0.45 \\ \hline
+AD-GCL-FIX        & \textbf{75.18 $\pm$ 0.31} &  73.96 $\pm$ 0.47 & \textbf{77.91 $\pm$ 0.73}$^\star$ & \textbf{75.82 $\pm$ 0.26}$^\star$ & \textbf{90.10 $\pm$ 0.15}$^\star$ & 53.49 $\pm$ 0.28 \\ 
+Our Ranks & 1 &  2  & 1 & 1 & 1  &  3 \\
+\hline
+\end{tabular}%
+}
+\caption{\small{Semi-supervised learning performance with 10\% labels on TU datasets~\cite{Morris+2020} (10-Fold Accuracy (\%)$\pm$ std over 5 runs). \textbf{Bold}/\textbf{Bold}$^\star$ indicate our methods outperform baselines with $\geq$ 0.5 std/ $\geq$ 2 std respectively.} } %Compared number from~\cite{you2020graph}.}
+\label{tab:semi_supervised_learning}
+\vspace{-5mm}
+\end{table}Lastly, we evaluate AD-GCL on semi-supervised learning for graph classification on the benchmark TU datasets~\cite{Morris+2020}. We follow the setting in \cite{you2020graph}:  GNNs are pre-trained on one dataset using self-supervised learning and later fine-tuned based on 10\% label supervision on the same dataset.  Again, we only consider AD-GCL-FIX and compare it with several baselines in \cite{you2020graph}: 1) no pre-trained GCN, which is directly trained by the 10\% labels from scratch, 2) SS-GCN-A, a baseline that introduces more labelled data by creating random augmentations and then gets trained from scratch, 3) a predictive method GAE~\cite{kipf2016variational} that utilizes adjacency reconstruction in the pre-training phase, and GCL methods, 4) InfoGraph~\cite{sun2019infograph} and 5) GraphCL~\cite{you2020graph}. Note that here we have to keep the encoder architecture same and thus  AD-GCL-FIX adopts GCN as the encoder. Table~\ref{tab:semi_supervised_learning} shows the results. AD-GCL-FIX significantly outperforms baselines in 3 out of 6 datasets and achieves a mean rank of 1.5 across these 6 datasets, which again demonstrates the strength of AD-GCL. \vspace{-3mm}
+\section{Conclusions}
+\vspace{-2mm}
+In this work we have developed a theoretically motivated, novel principle: \textit{AD-GCL} that goes a step beyond the conventional InfoMax objective for self-supervised learning of GNNs. The optimal GNN encoders that are agnostic to the downstream tasks are the ones that capture the minimal sufficient information to identify each graph in the dataset. To achieve this goal, AD-GCL suggests to better graph contrastive learning via optimizing graph augmentations in an adversarial way.  Following this principle, we developed a practical instantiation based on learnable edge dropping. We have extensively analyzed and demonstrated the benefits of AD-GCL and its instantiation with real-world datasets for graph property prediction in unsupervised, transfer and semi-supervised learning settings.
+
+\begin{ack}
+We greatly thank the actionable suggestions given by reviewers and the area chair.
+S.S. and J.N. are supported by the National Science Foundation under contract numbers CCF-1918483 and IIS-1618690. P.L. is partly supported by the 2021 JP Morgan Faculty Award and the National Science Foundation (NSF) award HDR-2117997.
+\end{ack}
+
+\newpage
+
+\end{document}

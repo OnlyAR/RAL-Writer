@@ -1,0 +1,587 @@
+\title{Structured Prediction as Translation \\ between Augmented Natural Languages}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+We propose a new framework, \emph{Translation between Augmented Natural Languages} (\ourmodel), to solve many structured prediction language tasks including joint entity and relation extraction, nested named entity recognition, relation classification, semantic role labeling, event extraction, coreference resolution, and dialogue state tracking. Instead of tackling the problem by training task-specific discriminative classifiers, we frame it as a translation task between \emph{augmented natural languages}, from which the task-relevant information can be easily extracted. Our approach can match or outperform task-specific models on all tasks, and in particular, achieves new state-of-the-art results on joint entity and relation extraction (CoNLL04, ADE, NYT, and ACE2005 datasets), relation classification (FewRel and TACRED), and semantic role labeling (CoNLL-2005 and CoNLL-2012). We accomplish this while using the same architecture and hyperparameters for all tasks and even when training a single model to solve all tasks at the same time (multi-task learning). Finally, we show that our framework can also significantly improve the performance in a low-resource regime, thanks to better use of label semantics.
+
+\end{abstract}
+
+\section{Introduction} \label{sec:introduction}
+
+Structured prediction refers to inference tasks where the output space consists of structured objects, for instance graphs representing entities and relations between them.
+In the context of natural language processing (NLP), structured prediction covers a wide range of problems such as entity and relation extraction, semantic role labeling, and coreference resolution.
+For example, given the input sentence \textit{``Tolkien's epic novel The Lord of the Rings was published in 1954-1955, years after the book was completed''} we might seek to extract the following graphs (respectively in a joint entity and relation extraction, and a coreference resolution task):
+
+\begin{figure}[h]
+\begin{center}
+    \includegraphics[width=4.5cm,trim={0 0 0 0},clip]{figures/sentence_graph_1.pdf}
+    \hspace{.5cm}
+    \includegraphics[width=5cm,trim={0 0 0 0},clip]{figures/sentence_graph_3.pdf}
+\end{center}
+\vspace{-0.2cm}
+\end{figure}
+
+Most approaches handle structured prediction by employing task-specific discriminators for the various types of relations or attributes, on top of \pretrained transformer encoders such as BERT \citep{bert}.
+Yet, this presents two limitations.
+First, a discriminative classifier cannot easily leverage latent knowledge that the \pretrained model may already have about the meaning (\emph{semantics}) of task labels such as \emph{person} and \emph{author}.
+For instance, knowing that a \emph{person} can write a \emph{book} would greatly simplify learning the \emph{author} relation in the example above.
+However, discriminative models are usually trained without knowledge of the label semantics (their targets are class numbers), thus preventing such positive transfer.
+Second, since the architecture of a discriminative model is adapted to the specific task, it is difficult to train a single model to solve many tasks, or to fine-tune a model from a task to another (\emph{transfer learning}) without changing the task-specific components of the discriminator.
+Hence, our main question is: can we design a framework to solve different structured prediction tasks with the same architecture, while leveraging any latent knowledge that the \pretrained model may have about the label semantics?
+
+In this paper, we propose to solve this problem with a text-to-text model, by framing it as a task of \emph{Translation between Augmented Natural Languages} (\ourmodel).
+\Cref{fig:main_model} shows how the previous example is handled within our framework, in the case of three different structured prediction tasks.
+The augmented languages are designed in a way that makes it easy to \emph{encode} structured information (such as relevant entities) in the input, and to \emph{decode} the output text into structured information.
+
+We show that out-of-the-box transformer models can easily learn this augmented language translation task.
+In fact, we successfully apply our framework to a wide range of structured prediction problems, obtaining new state-of-the-art results on many datasets, and highly competitive results on all other datasets.
+We achieve this by using the same architecture and hyperparameters on all tasks, the only difference among tasks being the augmented natural language formats.
+This is in contrast with previous approaches that use task-specific discriminative models.
+The choice of the input and output format is crucial: by using annotations in a format that is as close as possible to natural language, we allow transfer of latent knowledge that the \pretrained model has about the task, improving performance especially in a low-data regime.
+Nested entities and an arbitrary number of relations
+are neatly handled by our models, while being typical sources of complications for previous approaches.
+We implement an alignment algorithm to robustly match the structural information extracted from the output sentence with the corresponding tokens in the input sentence.
+
+We also leverage our framework to train a single model to solve all tasks at the same time, and show that it achieves comparable or better results with respect to training separately on each task.
+To the best of our knowledge, this is the first model to handle such a variety of structured prediction tasks without any additional task-specific modules.
+
+\begin{figure}[t]
+\begin{center}
+    \includegraphics[width=\linewidth,trim={0 0 0 0},clip]{figures/translation_graph.pdf}
+\end{center}
+\caption{
+Our \ourmodel{} model translates between input and output text in \emph{augmented natural language}, and the output is then decoded into structured objects. 
+}
+\label{fig:main_model}
+\end{figure}
+
+To summarize, our key contributions are the following.
+
+\begin{enumerate}[leftmargin=*]
+    \item  We introduce {\ourmodel}, a framework to solve several structure prediction tasks in a unified way, with a common architecture and without the need for task-specific modules.
+    We cast structured prediction tasks as translation tasks, by designing augmented natural languages that allow us to encode structured information as part of the input or output.
+    Robust alignment ensures that extracted structure is matched with the correct parts of the original sentence (\Cref{sec:method}).
+
+    \item We apply our framework to (1) joint entity and relation extraction; (2) named entity recognition; (3) relation classification; (4) semantic role labeling; (5) coreference resolution; (6) event extraction; (7) dialogue state tracking (\Cref{sec:sp_tasks,sec:experiments}). In all cases we achieve at least comparable results to the current state-of-the-art, and we achieve new state-of-the-art performance on joint entity and relation extraction (CoNLL04, ADE, NYT, and ACE2005 datasets), relation classification (FewRel and TACRED), and semantic role labeling (CoNLL-2005 and CoNLL-2012).
+
+    \item We also train a single model simultaneously on all tasks (multi-task learning), obtaining comparable or better results as compared with single-task models (\Cref{sec:exp_multitask}).
+    
+    \item We show that, thanks to the improved transfer of knowledge about label semantics, we can significantly improve the performance in the few-shot regime over previous approaches (\Cref{sec:exp_low_resource}).
+    
+    \item We show that, while our model is purely generative (it outputs a sentence, not class labels), it can be evaluated discriminatively by using the output token likelihood as a proxy for the class score, resulting in more accurate predictions (\Cref{sec:method} and 
+    \Cref{supp:relation-classification}).
+\end{enumerate}
+
+The code is available at \url{https://github.com/amazon-research/tanl}.
+
+\section{Related work} \label{sec:related} %
+
+Many classical methods for structured prediction (SP) in NLP are generalizations of traditional classification algorithms and include, among others, Conditional Random Fields
+\citep{crf2001}, Structured Perceptron \citep{collins-2002}, and Structured Support Vector Machines
+\citep{ioannis2004}.
+More recently, multiple efforts to integrate SP into deep learning methods have been proposed. Common approaches include placing an SP layer as the final layer of a neural net \citep{collobert2011} and incorporating SP directly into DL models \citep{dyer-2015-dp}.
+
+Current state-of-the-art approaches for SP in NLP train a task-specific classifier on top of the features learned by a \pretrained language model, such as BERT \citep{bert}.
+In this line of work, BERT MRC \citep{bert_mrc} performs NER using two classification modules to predict respectively the first and the last tokens corresponding to an entity for a given input sentence.
+For joint entity and relation extraction, SpERT \citep{spert} uses a similar approach to detect token spans corresponding to entities, followed by a relation classification module.
+In the case of coreference resolution, many approaches employ a higher-order coreference model \citep{lee-etal-2018-higher} which learns a probability distribution over all possible antecedent entity token spans.
+
+Also related to this work are papers on sequence-to-sequence (seq2seq) models for multi-task learning and SP.
+\citet{t5} describe a framework to cast problems such as translation and summarization as text-to-text tasks in natural language, leveraging the transfer learning power of a transformer-based language model.
+Other sequence-to-sequence approaches solve specific structured prediction tasks by generating the desired output directly: see for example WDec \citep{Wdec} for entity and relation extraction, and SimpleTOD \citep{hosseiniasl2020simple} and SOLOIST \citep{SOLOIST} for dialogue state tracking.
+Closer to us, GSL \citep{gsl}, which introduced the term \emph{augmented natural language}, showed early applications of the generative approach in sequence labeling tasks such as slot labeling, intent classification, and named entity recognition without nested entities.
+Our approach is also related to previous works that use seq2seq approaches to perform parsing \citep{oriol_NIPS2015,dyer-etal-2016-recurrent,choe-charniak-2016-parsing,Rongali_2020}, with the main difference that we propose a general framework that uses augmented natural languages as a way to unify multiple tasks and exploit label semantics.
+In some cases (e.g., relation classification), our output format resembles that of a question answering task \citep{multitask-learning-QA}.
+This paradigm has recently proved to be effective for some structured prediction tasks, such as entity and relation extraction and coreference resolution \citep{multiturnQA, MRC4ERE, CorefQA}.
+Additional task-specific prior work is discussed in \Cref{sec:sp-tasks-appendix}.
+
+Finally, TANL enables easy multi-task structured prediction (\Cref{sec:exp_multitask}). Recent work has highlighted benefits of multi-task learning \citep{multitask_learning_sequence_tagging} and transfer learning \citep{transfer-learning-NLP} in NLP, especially in low-resource scenarios.
+
+\section{Method} \label{sec:method}
+
+We frame structured prediction tasks as text-to-text translation problems. 
+Input and output follow specific augmented natural languages that are appropriate for a given task, as shown in \Cref{fig:main_model}.
+In this section, we describe the format design concept and the decoding procedure we use for inference.
+
+\paragraph{Augmented natural languages.} %
+We use the joint entity and relation extraction task as our guiding example for augmented natural language formats.
+Given a sentence, this task aims to extract a set of \emph{entities} (one or more consecutive tokens) and a set of \emph{relations} between pairs of entities.
+Each predicted entity and relation has to be assigned to an entity or a relation type. %
+In all the datasets considered, the relations are asymmetric; {\em i.e.}, it is important which entity comes first in the relation (the \emph{head} entity) and which comes second (the \emph{tail} entity).
+Below is the augmented natural language designed for this task (also shown in \Cref{fig:main_model}):
+
+\begin{footnotesize}
+\begin{customquote}
+\quotespacestart
+    \textbf{Input:} Tolkien's epic novel The Lord of the Rings was published in 1954-1955, years after the book was completed.
+    
+    \textbf{Output:}
+    \nohyphens{\entitybegin \entity{Tolkien} \separator \attribute{person} \entityend's epic novel \entitybegin \entity{The Lord of the Rings} \separator \attribute{book} \separator \attribute{author} \equals Tolkien \entityend was published in 1954-1955, years after the book was completed.}
+    \quotespaceend
+\end{customquote}
+\end{footnotesize}
+Specifically, the desired output replicates the input sentence and augments it with patterns that can be decoded into structured objects. %
+For this task, each group consisting of an entity and possibly some relations is enclosed by the special tokens \entitybegin \entityend.
+A sequence of \separator-separated tags describes the entity type and a list of relations in the format ``X \equals Y'', where X is the relation type, and Y is another entity (the \emph{tail} of the relation).
+Note that the objects of interest are all within the enclosed patterns ``\entitybegin $\ldots$ | $\ldots$ \entityend''. However, we replicate all words in the input sentence, as it
+helps reduce ambiguity when the sentence contains more than one occurrence of the same entity.
+It also improves learning, as shown by our ablation studies (\Cref{sec:exp_ablation} and \Cref{sec:ablation-studies}).
+In the target output sentence, entity and relation types are described in natural words (e.g.\ \emph{person}, \emph{location})
+--- not abbreviations such as \emph{PER}, \emph{LOC} ---
+to take full advantage of the latent knowledge that a \pretrained model has about those words.
+
+For certain tasks, additional information can be provided as part of the input, such as the span of relevant entities in semantic role labeling or coreference resolution (see \Cref{fig:main_model}).
+We detail the input/output formats for all structured prediction tasks in \Cref{sec:sp_tasks}.
+
+\paragraph{Nested entities and multiple relations.} 
+Nested patterns allow us to represent hierarchies of entities.
+In the following example from the ADE dataset, the entity ``lithium toxicity'' is of type \textit{disease}, and has a sub-entity ``lithium'' of type \textit{drug}.
+The entity ``lithium toxicity'' is involved in multiple relations: one of type \textit{effect} with the entity ``acyclovir'', and another of type \textit{effect} with the entity ``lithium''.
+In general, the relations in the output can occur in any order. 
+
+\begin{footnotesize}
+\begin{customquote}
+\quotespacestart
+    \textbf{Input:}
+    Six days after starting acyclovir she exhibited signs of lithium toxicity.
+    
+    \textbf{Output:}
+    Six days after starting \entitybegin \entity{acyclovir} \separator \attribute{drug} \entityend she exhibited signs of \entitybegin \entitybegin \entity{lithium} \separator \attribute{drug} \entityend \entity{toxicity} \separator \attribute{disease} \separator \attribute{effect} \equals acyclovir \separator \attribute{effect} \equals lithium \entityend .
+\quotespaceend
+\end{customquote}
+\end{footnotesize}
+
+\paragraph{Decoding structured objects.}
+Once the model generates an output sentence in an augmented natural language format, we decode the sentence to obtain the predicted structured objects, as follows. 
+\begin{enumerate}[leftmargin=*]
+\vspace{-.05cm}
+    \itemsep0em
+    \item We remove all special tokens and extract entity types and relations, to produce a cleaned output.
+    If part of the generated sentence has an invalid format, that part is discarded.
+    \item %
+    We match the input sentence and the cleaned output sentence at the token levels using the dynamic programming (DP) based Needleman-Wunsch alignment algorithm \citep{needleman1970general}. 
+    We then use this alignment to identify the tokens corresponding to entities in the original input sentence.
+    This process improves the robustness against potentially imperfect generation by the model, as shown by our ablation studies (\Cref{sec:exp_ablation} and \Cref{sec:ablation-studies}).
+    \item
+    For each relation proposed in the output, we search for the closest entity that exactly matches the predicted tail entity.
+    If such an entity does not exist, the relation is discarded.
+    \item We discard entities or relations whose predicted type does not belong to the dataset-dependent list of types.
+\vspace{-.05cm}
+\end{enumerate}
+
+To better explain the DP alignment in step 2, consider the example below where the output contains a misspelled entity word, ``Aciclovir'' (instead of ``acyclovir'').
+The cleaned output containing the word ``Aciclovir'', tokenized as ``A-cicl-o-vir'', is matched to ``a-cycl-o-vir'' in the input, from which we deduce that it refers to ``acyclovir''.
+
+\begin{footnotesize}
+\begin{customquote}
+\quotespacestart
+    \textbf{Generated output:}
+        Six days after starting \entitybegin \entity{Aciclovir} \separator \attribute{drug} \entityend she exhibited signs of \entitybegin \entitybegin \entity{lithium} \separator \attribute{drug} \entityend \entity{toxicity} \separator \attribute{disease} \separator \attribute{effect} \equals Aciclovir \separator \attribute{effect} \equals lithium \entityend .
+        
+    
+    \textbf{Cleaned output:}
+            Six days after starting \entity{Aciclovir} she exhibited signs of \entity{lithium} \entity{toxicity} .
+\quotespaceend
+\end{customquote}
+\end{footnotesize}
+
+\paragraph{Multi-task learning.} Our method naturally allows us to train a single model on multiple datasets that can cover many structured prediction tasks.
+In this setting, we add the dataset name followed by the task separator \taskseparator (for example, ``ade \taskseparator '') as a prefix to each input sentence.
+
+\paragraph{Categorical prediction tasks.}
+For tasks such as relation prediction, where there is a limited number of valid outputs, an alternative way to perform classification is to compute class scores of all possible outputs and predict the class with the highest score.
+We demonstrate that we can use the output sequence likelihood as a proxy for such score. 
+This method offers a more robust way to perform the evaluation in low resource scenarios where generation can be imperfect (see \Cref{supp:relation-classification}).
+This approach is similar to the method proposed by \cite{dos_santos_2020_beyond} for ranking with language models.
+
+\section{Structured prediction tasks} \label{sec:sp_tasks}
+
+\paragraph{Joint entity and relation extraction.} 
+Format and details for this task are provided in \Cref{sec:method}.
+
+\paragraph{Named entity recognition (NER).}%
+This is an entity-only particular case of the previous task. %
+
+\paragraph{Relation classification.}
+For this task, we are given an input sentence with \emph{head} and \emph{tail} entities 
+and seek to classify the type of relation between them, choosing from a predefined set of relations. %
+Since the head entity does not necessarily precede the tail entity in the input sentence, we add a phrase
+``The relationship between \entitybegin head  \entityend and \entitybegin tail  \entityend is'' after the original input sentence. 
+The output repeats this phrase, followed by the relation type. In the following example, the head and tail entities are ``Carmen Melis'' and ``soprano'' which have a \emph{voice type} relation.
+
+\begin{footnotesize}
+\begin{customquote}
+\quotespacestart
+    \textbf{Input:}
+    \nohyphens{
+    Born in Bologna, Orlandi was a student of the famous Italian \entitybegin \entity{soprano} \entityend and voice teacher \entitybegin \entity{Carmen Melis} \entityend in Milan.
+    The relationship between \entitybegin \entity{Carmen Melis} \entityend and \entitybegin \entity{soprano} \entityend is}
+    
+    \textbf{Output:}
+    relationship between \entitybegin \entity{Carmen Melis} \entityend and \entitybegin \entity{soprano} \entityend \equals \attribute{voice type}
+\quotespaceend
+\end{customquote}
+\end{footnotesize}
+
+\paragraph{Semantic role labeling (SRL).}
+Here we are given an input sentence along with a \emph{predicate}, and seek to predict a list of arguments and their types. %
+Every argument corresponds to a span of tokens that correlates with the predicate in a specific manner (e.g.\ subject, location, or time).
+The predicate is marked in the input, whereas arguments are marked in the output and are assigned an argument type.
+In the following example, ``sold'' is the predicate of interest.
+
+\begin{footnotesize}
+\begin{customquote}
+\quotespacestart
+    \textbf{Input:}
+    \nohyphens{The luxury auto maker last year \entitybegin \entity{sold} \entityend 1,214 cars in the U.S.}
+    
+    \textbf{Output:}
+    \entitybegin \entity{The luxury auto maker} \separator \attribute{subject} \entityend \entitybegin \entity{last year} \separator \attribute{temporal} \entityend 
+    sold
+     \entitybegin \entity{1,214 cars} \separator \attribute{object} \entityend \entitybegin \entity{in the U.S.} \separator \attribute{location} \entityend
+\quotespaceend
+\end{customquote}
+\end{footnotesize}
+
+\paragraph{Event extraction.}
+This task requires extracting
+(1) event triggers, each indicating the occurrence of a real-world event
+and (2) trigger arguments indicating the attributes associated with each trigger.
+In the following example, there are two event triggers, ``attacked'' of type \attribute{attack} and ``injured'' of type \attribute{injury}. We perform trigger detection using the same format as in NER, as shown below. 
+To perform argument extraction, we consider a single trigger as input at a time.
+We mark the trigger (with its type) in the input, and we use an output format similar to joint entity and relation extraction.
+Below, we show an argument extraction example for the trigger ``attacked'', where two arguments need to be extracted, namely, ``Two soldiers'' of type \attribute{target} and ``yesterday'' of type \attribute{attack time}.
+
+\begin{footnotesize}
+\begin{customquote}
+    \quotespacestart
+    \textbf{Trigger extraction input:}
+    \nohyphens{Two soldiers were attacked and injured yesterday.} 
+    
+    \textbf{Trigger extraction output:}
+    \nohyphens{Two soldiers were \entitybegin \entity{attacked} \separator \attribute{attack} \entityend and \entitybegin \entity{injured} \separator \attribute{injury} \entityend yesterday.}
+    
+    \textbf{Argument extraction input:}
+    \nohyphens{Two soldiers were \entitybegin \entity{attacked} \separator \attribute{attack} \entityend and injured yesterday.}
+    
+    \textbf{Argument extraction output:}
+    \entitybegin \entity{Two soldiers} \separator \attribute{individual} \separator \attribute{target} \equals attacked \entityend were attacked and injured \entitybegin \entity{yesterday} \separator \attribute{time} \separator \attribute{attack time} \equals attacked \entityend.
+\quotespaceend
+\end{customquote}
+\end{footnotesize}
+
+\paragraph{Coreference resolution.}
+This is the task of grouping individual text spans (\emph{mentions}) referring to the same real-world entity. 
+For each mention that is not the first occurrence of a group, we reference with the first mention. In the following example, ``his'' refers to ``Barack Obama'' and is marked as \entitybegin \entity{his} \separator \attribute{Barack Obama} \entityend in the output.
+
+\begin{footnotesize}
+\begin{customquote}
+\quotespacestart
+    \textbf{Input:}
+    Barack Obama nominated Hillary Rodham Clinton as his secretary of state on Monday. He chose her because she had foreign affairs experience as a former First Lady.
+    
+    \textbf{Output:}
+   \nohyphens{\entitybegin \entity{Barack Obama} \entityend nominated \entitybegin \entity{Hillary Rodham Clinton} \entityend as \entitybegin \entity{his} \separator \attribute{Barack Obama} \entityend \entitybegin \entity{secretary of state} \separator \attribute{Hillary Rodham Clinton} \entityend on Monday.	\entitybegin \entity{He} \separator \attribute{Barack Obama} \entityend chose \entitybegin\entity{her} \separator \attribute{Hillary Rodham Clinton} \entityend because \entitybegin \entity{she} \separator \attribute{Hillary Rodham Clinton} \entityend had foreign affairs	experience as a	former \entitybegin \entity{First Lady} \separator \attribute{Hillary Rodham Clinton} \entityend.}
+\quotespaceend
+\end{customquote}
+\end{footnotesize}
+
+\paragraph{Dialogue state tracking (DST).}
+Here we are given as input a history of dialogue turns,
+typically between a user (trying to accomplish a goal) and an agent (trying to help the user).
+The desired output is the dialogue state, consisting of a value for each key (or \emph{slot name}) from a predefined list.
+In the input dialogue history, we add the prefixes ``\entitybegin user \entityend\taskseparator'' and ``\entitybegin agent \entityend\taskseparator'' to delineate user and agent turns, respectively.
+Our output format consists of a list of all slot names with their predicted values.
+We add ``\entitybegin belief \entityend'' delimiters to help the model know when to stop generating the output sequence.
+We tag slots that are not mentioned in the dialogue history with the value ``not given'' (we do not show them in the example below, for brevity).
+
+\begin{footnotesize}
+\begin{customquote}
+\quotespacestart
+    \textbf{Input:}
+    \nohyphens{\entitybegin user \entityend\taskseparator I am looking for a cheap place to stay \entitybegin agent \entityend\taskseparator How long? } \entitybegin user \entityend\taskseparator Two
+    
+    \textbf{Output:}
+    \nohyphens{\entitybegin belief \entityend \attribute{hotel price range} \entity{cheap}, \attribute{hotel type} \entity{hotel}, \attribute{duration} \entity{two} \entitybegin belief \entityend}
+    \quotespaceend
+\end{customquote}
+\end{footnotesize}
+
+\section{Experiments}
+\label{sec:experiments}
+
+\renewcommand{\ourmodel}{{\textbf{TANL}}}
+\newcolumntype{C}{>{\centering\arraybackslash}X}
+\newcommand{\modelcolwidth}{4.55 cm}
+\newcommand{\tanlspace}{0.085cm}  %
+\newcommand{\betweentablespace}{\vspace{0.16cm}}
+\newcommand{\best}[1]{\textbf{#1}}
+\newcommand{\topleftdesc}[2]{\multirow{#2}{*}{ \rotatebox{90}{ \textbf{#1} }  } & }
+\newcommand{\sidedescwidth}{0.2cm}
+\newcommand{\pad}{ & }
+\begin{table}[]
+\centering
+\small
+\setlength{\tabcolsep}{5pt}
+\vspace{-.3cm}
+\caption{Results on all tasks. All numbers indicate F1 scores except noted otherwise. Datasets marked with an asterisk (*) have nested entities.
+}
+\label{tab:results}
+
+\begin{tabularx}{\textwidth}{p{\sidedescwidth} p{\modelcolwidth} *{8}{C}}
+
+ \topleftdesc{Entity Relation Extr.}{13}
+    & \multicolumn{2}{c}{\bf CoNLL04} & \multicolumn{2}{c}{{\bf ADE}*} & \multicolumn{2}{c}{\bf NYT} &
+    \multicolumn{2}{c}{\bf ACE2005} \\
+
+   \cmidrule(lr){3-4} \cmidrule(lr){5-6} \cmidrule(lr){7-8} \cmidrule(lr){9-10}
+ &  & Entity & Rel. & Entity & Rel. & Entity & Rel. & Entity & Rel. \\
+    \cmidrule(lr){2-10}
+    
+ &  SpERT \citep{spert} & 88.9 & 71.5 & 89.3 & 78.8 && \\
+ &  DyGIE \citep{dygie} & && && && 88.4 & 63.2 \\
+    
+ &  MRC4ERE \citep{MRC4ERE} & 88.9 & 71.9 & && && 85.5 & 62.1  \\
+ &  RSAN \citep{RSAN} & & & & & & 84.6 & &  \\
+ [\tanlspace]
+
+    
+ &  \ourmodel                   & 89.4 & 71.4 &  90.2 &  80.6 & \best{94.9} & \best{90.8} &  \best{88.9} &  \best{63.7} \\
+ &  \ourmodel{} (multi-dataset) & 89.8 & \bf 72.6 &	90.0 &	80.0 &	94.7 &	90.5 &	88.2 &	62.5
+ \\
+ &  \ourmodel{} (multi-task)    & \best{90.3} & 70.0 & \best{91.2} & \best{83.8} & 94.7 & 90.7 \\ %
+\end{tabularx}
+
+\betweentablespace
+
+\begin{tabularx}{\textwidth}{p{\sidedescwidth} p{\modelcolwidth} *{4}{C}}
+    \topleftdesc{NER}{10}
+     & {\bf CoNLL03} & {\bf OntoNotes} & {{\bf GENIA}*} & {{\bf ACE2005}*} \\
+
+    \cmidrule(lr){2-6}
+    
+ &  BERT-MRC \citep{bert_mrc} & 93.0 & 91.1 &  \best{83.8} & \best{86.9} \\
+ &  BERT-MRC+DSC \citep{dice_loss} & 93.3 & \best{92.1} & \\
+ &  Cloze-CNN \citep{cloze_pretrain} & \best{93.5} && \\
+ &  GSL \citep{gsl} & 90.7 & 90.2 & \\ 
+    [\tanlspace]
+ &  \ourmodel{} & 91.7 & 89.8 & 76.4 & 84.9 \\
+ &  \ourmodel{} (multi-dataset) & 92.0 & 89.8 & 75.9 & 84.4 \\ 
+ &  \ourmodel{} (multi-task) & 91.7 & 89.4 & 76.4 & \\ %
+\end{tabularx}
+
+\betweentablespace
+
+\begin{tabularx}{\textwidth}{p{\sidedescwidth} p{\modelcolwidth} *{6}{C}}
+    \topleftdesc{Relation Class.}{14}
+    & %
+    & \multicolumn{4}{c}{\textbf{FewRel 1.0} (validation)} \\
+    \cmidrule(lr){4-7}
+    
+\pad & \multirow{2}{*}{\bf TACRED } & 5-way 1-shot & 5-way 5-shot & 10-way 1-shot & 10-way 5-shot \\
+
+    \cmidrule(lr){2-7}
+    
+\pad BERT-EM \citep{matching_the_blank} & 70.1 & 88.9 && 82.8 \\
+\pad BERT$_{\text{EM}}$+MTB \citep{matching_the_blank} & 71.5 & 90.1 && \best{83.4} \\
+\pad DG-SpanBERT \citep{dg-spanbert} & 71.5 & \\
+\pad BERT-PAIR \citep{bertpair_fewrel} & & 85.7 & 89.5 & 76.8 & 81.8 \\
+    [\tanlspace]
+\pad \ourmodel{} & \best{71.9} & \best{94.0 \tpm 4.1}  & \best{96.4 \tpm 4.2}  & 82.6 \tpm 4.5  & \best{88.2 \tpm 5.9} \\
+\pad \ourmodel{} (multi-task) &  69.1 & \\ %
+\end{tabularx}
+
+\betweentablespace
+
+\begin{tabularx}{\textwidth}{p{\sidedescwidth} p{\modelcolwidth} *{3}{C}}
+    \topleftdesc{SRL}{9}
+    & \textbf{CoNLL05 WSJ}          & \textbf{CoNLL05 Brown}         & \textbf{CoNLL2012}               \\
+    \cmidrule(lr){2-5}
+\pad Dep and Span \citep{span_dependency_srl} & 86.3 & 76.4 & 83.1 \\
+\pad BERT SRL \citep{bert_re_srl}               & 88.8 & 82.0   & \,86.5 \\
+[\tanlspace]
+\pad \ourmodel{}                    &    89.3                      &  82.0              &            \textbf{87.7}      \\
+\pad \ourmodel{} (multi-dataset) & \best{89.4}  & \best{84.3}  & 87.6  \\
+\pad \ourmodel{} (multi-task) & 89.1  & 84.1  & 87.7  \\ %
+\end{tabularx}
+
+\betweentablespace
+
+\begin{tabularx}{\textwidth}{p{\sidedescwidth} p{\modelcolwidth} *{4}{C}}
+    \topleftdesc{Event Extr.}{10}
+    & \multicolumn{4}{c}{\textbf{ACE2005}} \\
+    \cmidrule(lr){3-6} %
+    
+\pad & 
+    {\makecell{Trigger Id.}} &  {\makecell{Trigger Cl.}} & {\makecell{Argument Id.}} &  {\makecell{Argument Cl.}} \\
+    \cmidrule(lr){2-6} %
+    
+    
+\pad J3EE \citep{nguyen2019one} & 72.5 & \best{69.8} & \best{59.9} & 52.1 \\
+\pad DyGIE++ \citep{wadden2019entity}  &  & 69.7 & 55.4 & \,\best{52.5} \\
+    [\tanlspace]
+\pad \ourmodel{} & \best{72.9} & 68.4 & 50.1 & 47.6  \\
+\pad \ourmodel{} (multi-task) & 71.8 & 68.5 & 48.5 & 48.5 \\
+\end{tabularx}
+
+\betweentablespace
+
+\begin{tabularx}{\textwidth}{p{\sidedescwidth} p{5.2cm} *{8}{C}}
+    \topleftdesc{Coreference Res.}{12}
+    & \multicolumn{8}{c}{\textbf{CoNLL-2012}* (BERT-base $\brokenvert$ BERT-large) } \\
+    \cmidrule(lr){3-10} %
+    \pad \bf & \multicolumn{2}{c}{MUC} & \multicolumn{2}{c}{B$^{3}$} & \multicolumn{2}{c}{CEAF$_{\phi_{4}}$} & \multicolumn{2}{c}{Avg.\ F1} \\
+    \cmidrule(lr){2-10} %
+\pad Higher-order c2f-coref \citep{lee-etal-2018-higher} & \multicolumn{1}{c:}{80.4} & & \multicolumn{1}{c:}{70.8} &  & \multicolumn{1}{c:}{67.6} &  & \multicolumn{1}{c:}{73.0} & \\ 
+\pad SpanBERT
+\citep{spanbert} & \multicolumn{1}{c:}{} & 85.3 & \multicolumn{1}{c:}{} & 78.1 & \multicolumn{1}{c:}{} & 75.3 & \multicolumn{1}{c:}{} & 79.6 \\
+\pad BERT+c2f-coref \citep{joshi2019bert} & \multicolumn{1}{c:}{81.4} & 83.5 & \multicolumn{1}{c:}{71.7} & 75.3 & \multicolumn{1}{c:}{68.8} & 71.9 & \multicolumn{1}{c:}{73.9} & 76.9 \\
+\pad CorefQA+SpanBERT \citep{CorefQA} & \multicolumn{1}{c:}{\bf 86.3} & \bf 88.0 & \multicolumn{1}{c:}{\bf 77.6} & \bf 82.2 & \multicolumn{1}{c:}{\bf 75.8} & \bf 79.1 & \multicolumn{1}{c:}{\bf 79.9} & \bf \,83.1 \\
+    [\tanlspace]
+\pad \ourmodel{}             & \multicolumn{1}{c}{81.0} & & \multicolumn{1}{c}{69.0} & & \multicolumn{1}{c}{68.4} & & \multicolumn{1}{c}{72.8} & \\
+\pad \ourmodel{} (multi-task) & \multicolumn{1}{c}{78.7} &  & \multicolumn{1}{c}{65.7} & & \multicolumn{1}{c}{63.8} & & \multicolumn{1}{c}{69.4} & \\
+\end{tabularx}
+
+\betweentablespace
+
+\begin{tabularx}{\textwidth}{p{\sidedescwidth}  p{5.2cm} *{2}{C}}
+    \topleftdesc{DST}{7} 
+    & \multicolumn{2}{c}{\textbf{MultiWOZ 2.1} (Joint Accuracy)} \\
+    \cmidrule(lr){2-4}
+\pad TRADE \citep{WuTradeDST2019} & 45.6 \\
+\pad SimpleTOD \citep{hosseiniasl2020simple} & \bf \,55.7  \\
+    [\tanlspace]
+\pad \ourmodel{} & 50.5 \\
+\pad \ourmodel{} (multi-task) & 51.4 \\
+\end{tabularx}
+\end{table}
+\renewcommand{\ourmodel}{TANL}
+
+In this section, we show that our TANL framework, with the augmented natural languages outlined in \Cref{sec:sp_tasks}, can effectively solve the structured prediction tasks considered and exceeds the previous state of the art on multiple datasets. 
+
+All our experiments start from a \pretrained T5-base model \citep{t5}. %
+To keep our framework as simple as possible, hyperparameters are the same across all experiments, except for some dataset-specific ones, such as the maximum sequence length.
+Details about the experimental setup, datasets, and baselines are described in \Cref{sec:experimental-setup}.
+
+\begin{figure*}[]
+\vspace{-.3cm}
+\centering
+    \newcommand{\plotwidth}{0.48\textwidth}
+  \begin{subfigure}[t]{\plotwidth}
+    \includegraphics[trim=20 0 30 21, clip, width=1.\textwidth]{figures/low_resourse_relation.pdf}
+    \caption{Low-resource scenarios} \label{fig:low_resource_conll04_relation}
+  \end{subfigure}
+  \begin{subfigure}[t]{\plotwidth}
+    \includegraphics[trim=20 0 30 21, clip, width=1.\textwidth]{figures/ablation_relation_diff.pdf}
+    \caption{Ablation studies }\label{fig:ablation_relation}
+  \end{subfigure}
+\vspace{-.2cm}
+\caption{
+Experiments on the CoNLL04 dataset.
+(a) Our model outperforms the previous state-of-the-art 
+model SpERT, in low-resource scenarios.
+(b) Ablation studies where we remove label semantics (numeric labels), augmented natural language format (abridged output) or dynamic programming alignment (no DP alignment), and plot the score difference with the non-ablated \ourmodel{}.
+}
+\label{fig:low-resource-conll}
+\vspace{-.4cm}
+\end{figure*}
+
+\subsection{Single-task and Multi-task experiments}  \label{sec:exp_singletask}  \label{sec:exp_multitask}
+We use three data settings in our experiments: (1) single dataset, (2) multiple datasets for the same task (multi-dataset), and (3) all datasets across all tasks (multi-task).
+\Cref{tab:results} shows the results.\footnote{We are grateful to Wenxuan Zhou and Tianyu Gao for pointing out an inconsistency in computing results on the TACRED dataset, which have been corrected in \Cref{tab:results}.}
+
+With the single-task setup, we achieve state-of-the-art performance on the following datasets: ADE, NYT, and ACE2005 (joint entity and relation extraction), FewRel and TACRED (relation classification), CoNLL-2005 and CoNLL-2012 (semantic role labeling). 
+For example, we obtain a +6.2 absolute improvement in F1 score on the NYT dataset over the previous state of the art.
+Interestingly, this result is higher than the performance of models that use ground-truth entities to perform relation extraction, such as REDN \citep{REDN}, which achieves a relation F1 score of 89.8. %
+In coreference resolution, \ourmodel{} performs similarly to previous approaches that employ a BERT-base model, except for CorefQA \citep{CorefQA}.
+To the best of our knowledge, ours is the first end-to-end approach to coreference resolution not requiring a separate mention proposal module and not enforcing a maximum mention length.
+
+For other datasets, we obtain a competitive performance within a few points of the best baselines. 
+We highlight that our approach uses a single model architecture that can be trained to perform \emph{any} of the tasks without model modification. This is in stark contrast with typical discriminative models, which tend to be task-specific, as can be seen from \Cref{tab:results}.
+
+In fact, under this unified framework, a single model can be trained to perform multiple or all tasks at once, with the performance being on par or even better than the single-task setting. %
+In particular, when the dataset sizes are small such as in ADE or CoNLL04, we obtain sizable improvements and become the new state of the art (from 80.6 to 83.7 for ADE relation F1, and from 89.4 to 90.6 for CoNLL04 entity F1).
+The only case where our multi-task model has notably lower scores is coreference resolution, where the input documents are much longer than in the other tasks.
+Since the maximum sequence length in the multi-task experiment (512 tokens) is smaller than in the single-dataset coreference experiment (1,536 tokens for input and 2,048 for output), the input documents need to be split into smaller chunks, and this hurts the model's ability to connect multiple mentions of the same entity across different chunks.
+From the multi-task experiment, we leave out all datasets based on ACE2005 except for event extraction due to overlap between train and test splits for different tasks.
+We discuss our experiments in more detail in \Cref{sec:sp-tasks-appendix}.
+
+All results presented in this paper are obtained from a \pretrained T5-base model.
+In principle, any \pretrained generative language model can be used, such as BART \citep{bart} or GPT-2 \citep{gpt2}.
+It would be interesting to check whether these models are as capable as T5 (or even better) at learning to translate between our augmented languages.
+We leave this as a direction for future investigation.
+
+\subsection{Low-resource settings} \label{sec:exp_low_resource}
+Multiple experiments suggest that \ourmodel{} is data-efficient compared to other baselines.
+On the FewRel dataset, a benchmark for few-shot relation classification, our model outperforms the best baselines BERT$_{\text{EM}}$ and BERT$_{\text{EM}}$+MTB \citep{bert,matching_the_blank}, where the MTB version uses a large entity-linked text corpus for \pretraining.
+On the TACRED relation classification dataset, our model also improves upon the best baselines (from 71.5 to 71.9).
+While TACRED is not specifically a few-shot dataset, we observe that there are many label types that rarely appear in the training set, some of them having less than 40 appearances out of approximately 70,000 training label instances.
+We show the occurrence statistics for all label types in the appendix (\Cref{tab:sup_tacred}), demonstrating that the dataset is highly imbalanced.
+Nonetheless, we find that our model performs well, even on instances involving scarce label types. 
+This ability distinguishes our models from other few-shot approaches such as prototypical networks \citep{protonet} or matching networks \citep{matching_net}, which are designed only for few-shot scenarios but do not scale well on real-world data which often contains a mix of high and low-resource label types. 
+
+Our low-resource study on the joint entity and relation extraction task also confirms that our approach is more data-efficient compared to other methods.
+We experiment on the CoNLL04 dataset, using only 0.8\% (9 sentences) to 6\% (72 sentences) of the training data. Our approach outperforms SpERT (a state-of-the-art discriminative model for joint entity and relation extraction) in this low-resource regime, whereas the performance is similar when using the full training set.
+
+Thanks to the unified framework, we can easily train on a task, potentially with larger resources, and adapt to other low-resource end tasks (transfer learning). To show this, we train a model with a large dataset from joint entity and relation extraction (NYT) and fine-tune it on a limited portion of the CoNLL04 dataset (\Cref{fig:low-resource-conll}), obtaining a significant increase in performance (up to +9 relation F1).
+
+Finally, in \Cref{sec:appendix-errors} we analyze how the size of the training dataset affects the number of generation errors of our model.
+
+\subsection{Ablation studies} \label{sec:exp_ablation}
+We conduct ablation studies to demonstrate that label semantics, augmented natural language format, and optimal alignment all contribute to the effectiveness of \ourmodel{} (\Cref{fig:ablation_relation}).
+Further details on these ablation studies can be found in \Cref{sec:ablation-studies}.
+
+\textbf{Numeric labels:} To prevent the model from understanding the task through label semantics, we use numeric labels. This substantially hurts the performance, especially in a low-resource setting where transfer learning is more important.
+\textbf{Abridged output:} Second, to determine the impact of the augmented natural language format outlined in \Cref{sec:sp_tasks}, we experiment with a format which does not repeat the entire input sentence.
+We find that this abridged format consistently hurts model performance, especially in low-resource scenarios. 
+In other tasks, we generally find that a more natural-looking format usually performs better (see \Cref{supp:relation-classification}).
+\textbf{No DP alignment:} We use exact word matching instead of the dynamic programming alignment described in \Cref{sec:method}.
+
+\section{Discussion and Conclusion} \label{sec:discussion}
+
+We have demonstrated that our unified text-to-text approach to structured prediction can handle all the considered tasks within a simple framework and offers additional benefits in low-resource settings.
+Unlike discriminative models common in the literature, \ourmodel{} is generative as it translates from an input to an output in augmented natural languages.
+These augmented languages are flexible and can be designed to handle a variety of tasks, some of which are complex and previously required sophisticated prediction modules. %
+By streamlining all tasks to be compatible with a single model, multi-task learning becomes seamless and yields state-of-the-art performance for many tasks.
+
+Generative models, and in particular sequence-to-sequence models, have been used successfully in many NLP problems such as machine translation, text summarization, etc. %
+These tasks involve mappings from one \emph{natural} language input to another \emph{natural} language output. %
+However, the use of sequence modeling for structured prediction has received little consideration.
+This is perhaps due to the perception that the generative approach is too unconstrained and that it would not be a robust way to generate a precise output format that corresponds to structured objects, or that it may add an unnecessary layer of complexity with respect to discriminative models.
+We demonstrate that this is quite the opposite.
+The generative approach can easily handle disparate tasks, even at the same time, by outputting specific structures appropriate for each task with little, if any, format error.
+
+We note that one drawback of the current generative approach is that the time complexity for each token generation is $\O(L^2)$ where $L$ is the sentence length. %
+However, there have been recent advances in the attention mechanism that reduce the complexity to $\mathcal{O}(L \log L)$ as in Reformer \citep{reformer}, or to $\mathcal{O}(L)$ as in Linformer \citep{linformer}.
+Incorporating these techniques in the future can significantly reduce computation time and allow us to tackle more complex tasks, as well as improve on datasets with long input sequences such as in coreference resolution.
+
+Based on our findings, we believe that generative modeling is highly promising but has been an understudied topic in structured prediction.
+Our findings corroborate a recent trend where tasks typically treated with discriminative methods have been successfully solved using generative approaches \citep{gpt3,fusion_in_decoder,small_lm_fewshot}.
+We hope our results will foster further research in the generative direction.
+
+ 
+
+    
+    
+
+    
+
+    
+
+    
+    
+
+    
+
+    
+
+    
+    
+    
+
+\clearpage
+
+\end{document}

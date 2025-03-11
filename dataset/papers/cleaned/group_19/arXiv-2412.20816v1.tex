@@ -1,0 +1,633 @@
+\title{Length-Aware DETR for Robust Moment Retrieval}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+    Video Moment Retrieval (MR) aims to localize moments within a video based on a given natural language query.
+    Given the prevalent use of platforms like YouTube for information retrieval, the demand for MR techniques is significantly growing.
+    Recent DETR-based models have made notable advances in performance but still struggle with accurately localizing short moments.
+    Through data analysis, we identified limited feature diversity in short moments, which motivated the development of MomentMix. MomentMix employs two augmentation strategies: ForegroundMix and BackgroundMix, each enhancing the feature representations of the foreground and background, respectively. Additionally, our analysis of prediction bias revealed that short moments particularly struggle with accurately predicting their center positions of moments. To address this, we propose a Length-Aware Decoder, which conditions length through a novel bipartite matching process.
+    Our extensive studies demonstrate the efficacy of our length-aware approach, especially in localizing short moments, leading to improved overall performance.
+    Our method surpasses state-of-the-art DETR-based methods on benchmark datasets, achieving the highest R1 and mAP on QVHighlights and the highest R1@0.7 on TACoS and Charades-STA (such as a 2.46\% gain in R1@0.7 and a 2.57\% gain in mAP average for QVHighlights). The code is available at \url{https://github.com/sjpark5800/LA-DETR}.
+    
+\end{abstract}
+
+\section{Introduction}
+\label{sec:introduction}
+
+As vast amounts of video content are created and shared on the internet daily~\cite{cheng2013understanding_YouTube}, the need for effective filtering has become more critical. Text-based search algorithms~\cite{boyer1977fast_search_matching} have emerged as one of the most effective solutions, enabling rapid and accurate retrieval of videos that match user queries. 
+To improve user experience and search efficiency, moment retrieval (MR)~\cite{anne2017localizing,gao2017tall_tall} has gained significant attention. MR identifies the specific moments within a video that best align with a given query. Specifically, this task involves localizing the start and end points in the video relevant to the textual query, offering a more fine-grained understanding of video content.
+
+\begin{table}[tb]    
+    \caption{
+        Mean Average Precision (mAP) of previous moment retrieval (MR) DETR-based methods on \textsc{QVHighlights} \textit{val} set by the lengths of the moment. Notice that the mAP drops significantly in capturing short-moment, where MR can be best utilized.
+    }
+    \centering
+
+    \scalebox{0.80}{
+    
+    \tabcolsep=0.11cm
+    
+    \begin{tabular}{l r >{\columncolor{yellow}}c c c c}
+        \hline
+
+        
+        \multirow{2}{*}{Method} &  & Short & Middle & Long & All \\
+
+        \cline{3-3}
+        \cline{4-4}
+        \cline{5-5}
+        \cline{6-6}
+
+        \multirow{1}{*}{}
+        & \multirow{1}{*}{{$_{\textrm{(seconds)}}$}}
+        & \multirow{1}{*}{{$_{(000,010]}$}}
+        & \multirow{1}{*}{{$_{(010,030]}$}}
+        & \multirow{1}{*}{{$_{(030,150]}$}}
+        & \multirow{1}{*}{{$_{(000,150]}$}} \\
+        
+        \hline
+
+        
+        \multicolumn{2}{l}{QD-DETR {\footnotesize\color{gray}(CVPR 2023)}} & 8.34 & 43.54 & 47.80 & 41.24 \\
+        \multicolumn{2}{l}{TR-DETR {\footnotesize\color{gray}(AAAI 2024)}} & 9.93 & 46.91 & 51.71 & 45.09 \\
+        \multicolumn{2}{l}{UVCOM {\footnotesize\color{gray}(CVPR 2024)}}   & 12.65 & 49.04 & 49.39 & 45.80 \\
+        \hline \\
+    \end{tabular}
+}
+\label{tab:table_performance_moment_length}
+\end{table}
+
+For the MR task, previous approaches leveraging DETR for its efficiency and flexibility~\cite{lei2021detecting_Moment-DETR,moon2023query_QD-DETR,sun2024tr_TR-DETR, zhang2024temporally_TaskWeave, xiao2024bridging_UVCOM} have proposed methods to improve video-text feature representation, achieving impressive performance. 
+However, our empirical findings indicate that these DETR-based models suffer from a significant drop in performance when handling short moments as highlighted in \Cref{tab:table_performance_moment_length}.
+For example, UVCOM~\cite{xiao2024bridging_UVCOM} shows an average mAP of 49.04 for middle-length moments (10–30 seconds), 
+while achieving only 12.65 for short moments (less than 10 seconds), revealing a substantial gap. As illustrated in \Cref{fig:intro_dataset_info}, moments are uniformly distributed across different lengths. However, due to the inherently short duration of short moments, they appear more frequently within a single video sample. Performance metrics are calculated by averaging the performance across all moments within a sample and then averaging these sample performances to obtain the overall performance. Therefore, the overall performance does not sufficiently reveal the performance on short moments, leading to a lack of attention to the challenges associated with short moment retrieval.
+
+Retrieving short moments within videos is a crucial task because videos often contain a significant amount of redundant or irrelevant information, while essential content is frequently condensed in short moments. This aligns with the importance of MR, where improving the accuracy of short-moment retrieval enables the precise extraction of the most relevant information. 
+Such improvements can significantly reduce the time and effort required for video exploration.
+For example, highlights in sports and news, as well as key scenes in movies and dramas, often involves short moments. This emphasizes the importance of accurately retrieving short moments in practical scenarios.
+
+\begin{figure}[tb]
+    \centering
+    \includegraphics[width=\linewidth]{assets/intro_dataset_info.pdf}
+    \caption{In \textsc{QVHighlights} dataset, a single video can contain multiple moments of varying lengths. The yellow bars represent the count of each \textbf{moment} length across all videos. In contrast, the blue bars categorize a \textbf{video sample} by a specific length if it includes at least one moment of that length.
+    }
+    \label{fig:intro_dataset_info}
+\end{figure}
+
+In this study, we analyzed the challenges associated with existing methods in short-moment retrieval from both data and model perspectives. From a data perspective, we examined the feature distribution of short moments compared to other moments.  As shown in \Cref{fig:method_feature_diversity}, the features of short moments tend to be more concentrated around the mean feature, with 42.9\% of samples falling within one standard deviation. In contrast, for other moments, 26.6\% of samples fall within one standard deviation of the mean. These observations show that short moments exhibit relatively simple and less diverse feature distributions. On the model side, we analyzed the trends in prediction accuracy by breaking down the model’s final output into center and length components, as illustrated in \Cref{fig:method_predictions}. Although conceptually, moments are defined by (start, end), existing models predict them in the format of (center, length). Interestingly, we found that the accuracy of center predictions for short moments was significantly lower than for other moment types.
+
+Based on the above analysis, we propose a new DETR-based MR framework that addresses the performance degradation when retrieving short moments. Our framework consists of two novel techniques: a data augmentation technique called \textbf{MomentMix} and a length-aware decoder (\textbf{LAD}). Through data analysis, we identified a key limitation in the feature diversity of short moments. It prompts us to design MomentMix, which comprises two types of mix-based data augmentation strategies: ForegroundMix and BackgroundMix. In a video sample, we define the temporal moments relevant to the text query as the foreground and the unrelated moments as the background. ForegroundMix enhances the diversity of foreground features by combining rich foreground elements from different moments to create new short foregrounds. These newly created short foregrounds enable the model to detect short moments more robustly. Conversely, BackgroundMix utilizes portions of other videos as backgrounds, forming varied foreground-background combinations. This enables the model to better differentiate between foreground and background, ultimately improving the quality of video features across all moment lengths, not just short ones. 
+
+Our analysis of model outputs revealed that center prediction errors significantly contribute to performance drops in short-moment retrieval. To address this, we introduce a length-aware decoder, which structures the decoder to focus more effectively on center prediction by conditioning it on length. Specifically, we predefine length classes (e.g., short, middle, long) and uniformly assign each decoder query to these length-specific classes. Additionally, we modify the bipartite matching process so that queries are matched with ground-truth moments within the same length class. This approach improves the accuracy of both center and length predictions for short moments.
+
+In this work, we tackled the significant challenge of short-moment retrieval by proposing MomentMix augmentation and Length-Aware Decoder.
+Our approach significantly improved performance across various datasets, including \textsc{QVHighlights}, \textsc{TACoS}, and \textsc{Charades-STA}.
+Our contributions are summarized as follows:
+\begin{enumerate}
+    \item We identify the root causes of performance degradation in short-moment retrieval for MR from both data and model perspectives.
+    
+    \item To address the issue of limited feature diversity in short moments, we propose a novel augmentation strategy based on two types of mixing methods, specifically tailored for video moment retrieval.
+    
+    \item To enhance both center and length prediction for short moments, we introduced length conditioning into DETR-based MR methods for the first time, effectively creating  ``length-wise expert'' queries with length-wise matching.
+    
+    \item Our approach notably enhanced performance on the various MR datasets, resulting in significant improvement of mAP in \textsc{QVHighlights} (9.36\%; 41.22 $\rightarrow$ 45.08) and across other datasets.
+\end{enumerate}
+
+\section{Related Work}
+\label{sec:related_work}
+
+\subsection{Moment Retrieval}
+The moment retrieval (MR) task involves identifying the start and end timestamps of a specific moment within a video given a text query.
+Traditional methods approach MR through either \textbf{two-stage}~\cite{anne2017localizing_mcn, hendricks2018localizing_MLLC, zhang2019exploiting_TCMN, zhang2019cross_QSPN, gao2021fast_SAP} or \textbf{one-stage}~\cite{chen2018temporally_tgn, wang2020temporally_cbp, otani2020uncovering_SCDM, Zhang_2019_CVPR_man, hu2021video_CMHN, liu2018temporal_tmn, zhang2020learning_2d_tan} framework, which often rely on cumbersome processes such as proposal generation, non-maximum suppression (NMS), and human priors.
+A significant paradigm shift was introduced with Moment-DETR~\cite{lei2021detecting_Moment-DETR}, which framed MR as a direct set prediction task using \textbf{Detection Transformer} (DETR)~\cite{carion2020end_DETR}. 
+This approach eliminates these dependencies, thereby making MR more efficient and flexible. Subsequent models, including QD-DETR~\cite{moon2023query_QD-DETR}, and MESM~\cite{liu2024towards_MESM}, have further optimized DETR-based MR by addressing cross-modal alignment and refining prediction accuracy. 
+Recent works, such as TR-DETR~\cite{sun2024tr_TR-DETR}, TaskWeave~\cite{zhang2024temporally_TaskWeave}, and UVCOM~\cite{xiao2024bridging_UVCOM}, leverage task-specific features to bridge Moment Retrieval and Highlight Detection, enhancing robustness across both tasks. Additionally, there are researches to develop boundary-aware notations for moments~\cite{lee2025bam-detr} and to explore advanced feature in MR~\cite{liu2024r2-tuning, wang2024internvideo2}. 
+Considering the efficiency and advancements of DETR-based architectures, our research specifically targets the challenges within DETR-based methods.
+
+Different from the previous works, to the best of our knowledge, we are the first to address the critical limitation of performance degradation on short moments, a common challenge across existing DETR-based methods. Our approach specifically targets the accurate retrieval of short-duration moments, thereby filling a significant gap in the current landscape of DETR-based MR research.
+
+\begin{figure}[tb]
+    \centering
+    \includegraphics[width=1.0\linewidth]{assets/method_features_diversity.pdf}
+    \caption{ \textbf{Data perspective analysis}. t-SNE~\cite{van2008tsne} visualization of visual features for 50 sampled short moments and 50 non-short moments from \textsc{QVHighlights} \textit{train} set. Each sampled moment is taken from a distinct video. This plot demonstrates that short moments exhibit fewer and significantly sparser visual features compared to non-short moments, highlighting the limited visual information inherent to their short duration.
+    }
+    \label{fig:method_feature_diversity}
+\end{figure}
+
+\subsection{Mixing-based Augmentation}
+Mixing-based augmentations have been explored in both image and video tasks, each adapting spatial or temporal mixing based on task requirements.
+In image classification, Mixup~\cite{zhang2017mixup} and CutMix~\cite{yun2019cutmix} create new image samples by interpolating or combining patches, promoting diverse feature representations. Copy-Paste~\cite{ghiasi2021copypaste} augments data for detection and segmentation by inserting objects from one image into another, increasing object and scene variety.
+In video understanding tasks, VideoMix~\cite{yun2020videomix} inserts randomly selected video cuboid patches from one video into another, thereby introducing both spatial and temporal diversity. Similarly, VIPriors~\cite{kim2020VIPriors} extends traditional image-based mixing augmentations to the temporal dimension, which strengthens temporal feature representations and improves model robustness against temporal fluctuations.
+
+However, these approaches primarily focus on modifying spatial features and are not directly applicable to the Moment Retrieval framework, which relies solely on frame-level features without spatial dimensions. To address this limitation, we introduce a novel data augmentation technique specifically designed for moment retrieval that enhances the diversity of frame-level features. 
+
+\section{Method}
+\label{sec:method}
+
+\begin{figure}[tb]
+    \centering
+    \includegraphics[width=0.9\linewidth]{assets/method_center_length.pdf}
+    \caption{ \textbf{Model perspective analysis}.     We analyze the top-1 predictions of QD-DETR on the \textsc{QVHighlights} \textit{val} set.     
+    [Left] Percentage of predictions where the predicted center falls within the ground truth. Only 37\% of center predictions for short moments have their centers within the ground truth, indicating substantial errors in center prediction.
+    [Right] Confusion matrix displaying predicted moment lengths (x-axis) versus ground-truth moment lengths (y-axis) across various durations. Short moments (highlighted in red) show a high rate of length prediction errors. 
+    }
+    \label{fig:method_predictions}
+\end{figure}
+
+\subsection{Motivation}
+
+\begin{figure*}[tb]
+    \centering
+    \includegraphics[width=0.95\linewidth]{assets/method_overview.pdf}
+    \caption{\textbf{Overview.} In \Cref{subsec:MomentMix_Augmentation}, we propose MomentMix, which comprises two types of mix-based data augmentations: ForegroundMix and BackgroundMix. ForegroundMix implementation involves cutting a long moment into shorter segments, which are then shuffled to generate new short-moment data. The BackgroundMix preserves the foregrounds unchanged and replaces the backgrounds with temporal segments randomly cropped from other video samples. In \Cref{subsec:Length_Aware_Decoder}, We introduce a Length-Aware Decoder, which utilizes a length-wise bipartite matching process to create length-wise expert decoder queries.
+    }
+    \label{fig:method_overview}
+\end{figure*}
+
+\noindent\textbf{Background.} Suppose that a video consists of $\mathcal{N}_v$ clips, ${\{v_i\}}_{i=1}^{\mathcal{N}_v}$, and a text query of $\mathcal{N}_t$ words, ${\{t_i\}}_{i=1}^{\mathcal{N}_t}$.
+The objective of moment retrieval (MR) is to predict a set of $\mathcal{N}_m$ moments, $\{m_i\}_{i=1}^{\mathcal{N}_m}$, corresponding to video clips relevant to the text query.
+Each moment $m_i$ is defined by its center coordinate $c_i$ and length (span) $\sigma_i$, representing a contiguous subset of video clips. In this paper, we classify moments based on the following criteria: 1) A temporal moment within the video is defined as \textit{foreground} if it is relevant to the text query, and as \textit{background} if it is not. 2) Moments are categorized as short (less than 10 seconds), middle (10 to 30 seconds), or long (over 30 seconds) based on their temporal duration, consistent with the classification used in the previous method~\cite{lei2021detecting_Moment-DETR}.
+
+\vspace{1mm}
+\noindent\textbf{Performance limit of DETR-based methods.} Recent approaches actively employ DETR for the MR task and achieve impressive performances.
+We selected representative DETR-based models and analyzed their performance according to the length of target moments. Despite achieving strong performance, these models exhibited significant performance drops in retrieving short moments, as shown in \Cref{tab:table_performance_moment_length}. 
+Specifically, QD-DETR, TR-DETR, and UVCOM experienced mAP declines of - 79.8\%, 78.0\%, and 72.4\% for short moments. These results indicate a consistently significant decrease relative to overall performance. To address this degradation, we investigated the underlying causes from both data-centric and model-centric perspectives.
+ 
+
+For the data-centric analysis, we examined the statistical characteristics of short moments. As shown in \Cref{fig:intro_dataset_info}, while the total number of short moments is comparable to that of other types of moments, the number of videos containing short moments is clearly limited. This led us to hypothesize that short moments might lack diverse contextual representation and could exhibit a narrow distribution in the training data. To test this hypothesis, we compared the feature distribution of short moments to that of other moments using feature visualization. We randomly sampled 50 short moments and 50 non-short moments from the training set and applied t-SNE~\cite{van2008tsne} to visualize their visual features. As shown in \Cref{fig:method_feature_diversity}, the distribution of visual features for short moments was concentrated, indicating a significant lack of diversity. This observation suggests that the training data for short moments does not capture a wide range of visual features, leading to suboptimal generalization performance during testing.
+ 
+
+For the model-centric analysis, we evaluated the model's prediction tendencies by separately assessing the center and length predictions of short moments compared to other types of moments. As illustrated in \Cref{fig:method_predictions}, only 37\% of center predictions for short moments have their center within the ground truth, while 74\% for middle moment and 82\%  for long moments. This revealed that inaccuracies in center prediction are a significant source of overall error.
+
+To overcome these limitations, we propose two novel techniques, MomentMix and Length-Aware Decoder that can be easily integrated into other DETR-based models. Our overall architecture is illustrated in \Cref{fig:method_overview}, following the design of the common baseline, QD-DETR.
+
+\subsection{MomentMix: Leveraging ForegroundMix and BackgroundMix}
+\label{subsec:MomentMix_Augmentation}
+
+We propose MomentMix, a data augmentation strategy designed to address the issue of low feature diversity for short moments. MomentMix consists of two components: (1) ForegroundMix, which enhances the diversity of foreground features, and (2) BackgroundMix, which increases the variety of background features. To the best of our knowledge, this is the first data augmentation approach specifically tailored for video moment retrieval.
+
+\vspace{1mm}
+\noindent\textbf{ForegroundMix augmentation.} The goal of ForegroundMix is to increase the visual diversity of foreground features in short moments, enabling more generalized prediction. To achieve this, we randomly extract and mix rich foreground features from longer samples to create augmented short moments. Visual features within a single video naturally exhibit higher similarity compared to those from different videos. By exploiting features from other video clips, our method allows the model to generalize diverse contexts, ensuring it can detect short moments reliably even in challenging or ambiguous frames.
+
+Given an existing video training sample \(X = \{v_i\}_{i=0}^{\mathcal{N}_v}\) that contains a long foreground (moment) \( f_\text{source} = \{v_i\}_{i=s}^{e} \),  this foreground can be divided into sub-foregrounds \( f_1, f_2, \dots, f_n \) as follows:
+
+\begin{equation}
+f_\text{source} = \bigcup_{i=1}^{n} f_i, \:\: \text{where} \:\:  f_i \cap f_j = \emptyset \:\: \text{for all} \:\: i \neq j.
+\end{equation}
+
+Here, \( n = \frac{\texttt{len}(f_\text{source})}{{\varepsilon}_\text{cut}} \), where \(\varepsilon_\text{cut}\) is a hyperparameter determining the extent to which each sub-foreground is shortened relative to the original long foreground.
+
+These sub-regions represent segments of the foreground, uniformly sampled as \( f_i^s, f_i^e \sim \text{Unif}(s, e) \), where $s$ and $e$ indicate start and end of \(f_\text{source}\).
+Similarly, the background region, $b_\text{source} = b_\text{front} \cup b_\text{back}$, is divided into \( n+1 \) sub-regions denoted as \( b_0, b_1, \dots, b_{n} \), representing the segments of the background as:
+\begin{equation}
+b_\text{source} = \bigcup_{i=0}^{n} b_i \:\: \text{where} \:\: b_i \cap b_j = \emptyset \:\: \text{for all} \:\: i \neq j.
+\end{equation}
+The original foreground, $\{f_i\}_{i=1}^{n}$, and backgrounds, $\{b_i\}_{i=0}^{n}$, are then shuffled as
+\begin{equation}
+\begin{gathered}
+    \pi: \{f_1, f_2, \dots, f_n\} \rightarrow \{f_1', f_2', \dots, f_n'\}, \\
+    \pi: \{b_0, b_1, \dots, b_n\} \rightarrow \{b_0', b_1', \dots, b_n'\}, \\
+\end{gathered}
+\end{equation} where $\pi$ be a random permutation function.
+
+Each shuffled foregrounds $\{f'_i\}_{i=1}^{n}$ is then paired with backgrounds $\{b'_i\}_{i=0}^{n}$ to form the following augmented samples:
+\begin{equation}
+\begin{gathered}
+    X' = b'_0 \cup \bigcup_{i=1}^{n} (f'_i \cup b'_{i}).
+\end{gathered}
+\end{equation}
+
+\noindent\textbf{BackgroundMix augmentation.} The goal of BackgroundMix is to improve the diversity of the visual background features, thereby strengthening the association between foreground visual features and the text query. To achieve this, we keep the original foreground features while replacing the background with features from different videos. This method provides the model with richer training signals, allowing it to learn various boundaries more effectively.
+
+A given the \(k\)-th video training sample \( X^k \), consists of \(\mathcal{N}^k_f\) foreground segments \( f^k = \{f^k_i\}_{i=1}^{\mathcal{N}^k_f} \) and \(\mathcal{N}^k_b\) background segments \( b^k = \{b^k_i\}_{i=1}^{\mathcal{N}^k_b} \). All segments within the video are defined as follows:
+
+\begin{equation}
+a^k =  f^k \cup b^k = \{a^k_i\}_{i=1}^{\mathcal{N}^k_a},
+\text{where } \mathcal{N}^k_a = \mathcal{N}^k_f + \mathcal{N}^k_b.
+\end{equation}
+
+To increase feature diversity, we replace each background segment \(b^k_i\) of the \(k\)-th sample with a randomly cropped segment from a different training sample \(X^m\) (\(m \neq k\)). Specifically, for each \(b^k_i\), a segment \(a^m_j\) is randomly selected from \(X^m\) and cropped to match the duration of \(b^k_i\). The replacement is performed as follows:
+
+\[
+b^k_i \leftarrow \text{Crop}(a^m_j, \lvert b^k_i \rvert)
+\]
+
+This approach ensures that while the backgrounds of the \(k\)-th sample are augmented with diverse background features, the original foreground remains intact.
+
+\subsection{Length-Aware Decoder}
+\label{subsec:Length_Aware_Decoder}
+
+\begin{figure}[ht]
+    \centering
+    \includegraphics[width=1.00\linewidth]{assets/method_matching.pdf}
+    \caption{
+    [Left] Group-DETR~\cite{chen2023group_Group_DETR} employs one-to-many matching, where the same labels are utilized across all groups.
+    [Right] Our length-wise matching is one-to-one, and it operates within each length class.
+    By matching only the predictions and ground truths that belong to the same class, this approach enables the creation of length-wise expert queries.
+    }
+    \label{fig:matching}
+\end{figure}
+
+\noindent 
+
+In our previous analysis, we identified that the model struggles to accurately predict both the center and the length of short moments. To address this issue, we propose a length-aware decoder that conditions the moment length, enabling the model to focus more effectively on center prediction. We categorize moment lengths into distinct classes—such as short, middle, and long—by analyzing a cumulative mAP graph and identifying inflection points as boundaries. (Detailed information can be found in the supplementary materials.) The decoder queries are trained using a length-wise matching approach based on these length categories. This categorization creates length-wise expert queries that better handle the specific characteristics of different moment lengths.
+
+\vspace{1mm}
+\noindent\textbf{Decoder queries with class-pattern.} We define $\mathcal{N}_c$ as the number of length classes for assigning roles to decoder queries. Drawing inspiration from Anchor-DETR~\cite{wang2109anchor_Anchor_DETR}, we interpret \textit{pattern} in pattern embedding as a length category and create \textit{class-pattern embeddings} \(Q_c\):
+\begin{equation}
+    Q_c = \texttt{Embedding}(\mathcal{N}_c, d) \in \mathbb{R}^{\mathcal{N}_c \times d}.
+\end{equation}
+By replicating each class-pattern embedding $\mathcal{N}_q$ times (the number of queries per length), we obtain class-specific queries \(Q \in \mathbb{R}^{\mathcal{N}_c \mathcal{N}_q \times d}\). This approach ensures that decoder queries share the same class embedding within each length category, enabling each query to perform roles tailored to its specific length class.
+
+\vspace{1mm}
+\noindent\textbf{Length-wise matching.}
+To create the length-wise expertise within class-pattern embeddings, we revised the bipartite matching approach to operate on a per-class basis.
+This method ensures that class-specific queries are matched and trained only with ground truth moments of the corresponding length class.
+By categorizing ground truth moments into length classes and performing length-class-wise matching, we ensure precise alignment.
+Although this may resemble group-wise matching in object detection~\cite{chen2023group_Group_DETR}, it differs significantly. As shown in \Cref{fig:matching}, existing methods use the same labels across all groups, resulting in one-to-many label assignments.
+In contrast, our approach assigns a unique subset of labels to each length class, enabling one-to-one assignments and effectively creating a "length-wise expert" for matching.
+
+We denote $\hat y = \{\hat y_i \}^{\mathcal{N}_c \mathcal{N}_q}_{i=1}$ as all the predicted moments from the decoder head, where $\mathcal{N}_c$ and $\mathcal{N}_q$ are a number of classes and a number of queries for each class $k \in \texttt{length-classes}$, respectively.
+Then, the predictions belonging to class $k$ can be denoted as:
+\begin{equation}
+    \label{equation_ground_truth}
+    \hat y^{(k)}  = \{\hat y_i \: \mid \: i^{th}\ query \in \texttt{class}\ k \}, \\
+\end{equation}
+When all ground truth moments are denoted as \(y = \{y_i\}^{\mathcal{N}_y}_{i=1}\), ground truth moments belonging to a specific class $k$ can be defined as:
+\begin{equation}
+    \label{equation_ground_truth2}
+    y^{(k)} = \{ y_i \: \mid \:  \texttt{length}(y_i)  \: \in \: \texttt{class} \: k \: \}. \\
+\end{equation}
+For bipartite matching, by applying background \(\varnothing\) padding to make each set size $\mathcal{N}_q$, the final ground truth set becomes $\tilde y^{(k)} = \{{y_i^{(k)}}\}_{i=1}^{\mathcal{N}_q}$. 
+The bipartite matching for each class $k$ is determined by finding the lowest cost among permutations of $\mathcal{N}_q$ elements, denoted as $\sigma \in {\mathfrak{S}}_{\mathcal{N}_q}$.
+\begin{equation}
+    \label{equation_ground_truth3}
+    \hat \sigma^{(k)} = \argmin_{\sigma \in {\mathfrak{S}}_{\mathcal{N}_q}} \sum_{i}^{\mathcal{N}_q} \{ {{\mathbb{C}_{match}} (\tilde y^{(k)}_i, \hat y^{(k)}_{\sigma(i)})} \},
+\end{equation}  where \({\mathbb{C}_{match}}\) is a \textit{matching cost} between ground truth and prediction. The matching cost function is set identically to that of the previous method~\cite{lei2021detecting_Moment-DETR}. 
+
+This approach of class-wise matching aids in explicitly determining the length classes that were implicitly carried by the moment queries. By combining all the results from the bipartite matching for each class, we achieve an efficient matching that considers moment length.
+
+\section{Experiments}
+\label{sec:experiments}
+
+\subsection{Experimental Setup}
+\label{sec:experiment_setup}
+
+\noindent\textbf{Datasets.}
+We utilized three datasets, {\textsc{QVHighlights}} \cite{lei2021detecting_Moment-DETR}, \textsc{Charades-STA} \cite{gao2017tall_dataset_charades}, and \textsc{TACoS}, \cite{regneri2013grounding_dataset_tacos}) for evaluation.
+\textsc{QVHighlights} consists of over 10k YouTube videos covering various topics such as everyday activities, travel, social activities, and political activities.
+It contains moments of various lengths distributed evenly and allows for testing our intended aspects effectively, as multiple moments appear within a single video.
+Considering the diversity and complexity of the dataset, it covers the most realistic and challenging scenario. 
+\textsc{Charades-STA} focuses on daily indoor activities, comprising 9,848 videos with 16,128 annotated queries.
+The lengths of moments are mostly below 20 seconds.
+\textsc{TACoS} primarily features activities in the cooking domain, consisting of 127 videos with 18,818 queries.
+The video lengths vary from very short to nearly 800 seconds, with most moments being shorter than 30 seconds.
+Unlike \textsc{QVHighlights} and \textsc{TACoS}, which encompass moments of varying lengths, \textsc{Charades-STA} is predominantly composed of shorter samples (under 30 seconds), thus it does not fully align with the problem we aim to address. Nevertheless, we include it in our evaluation to assess the model's generalization performance.
+
+\vspace{1mm}
+\noindent\textbf{Evaluation metrics.}
+Following the metrics of existing methods, we use mean average precision (mAP) with Intersection of Union (IoU) thresholds of 0.5 and 0.75, as well as the average mAP over multiple IoU thresholds [0.5: 0.05: 0.95].
+Additionally, we report the standard metric Recall@1 (R1) metric, commonly used in single-moment retrieval, with IoU thresholds of 0.5 and 0.7. Also, we report the average R1 over multiple IoU thresholds [0.5: 0.05: 0.95].
+
+\vspace{1mm}
+\noindent\textbf{Implementation details.}
+We divided the classes based on the point where the change in performance was most significant in the validation results of each baseline model. To achieve this, we plotted the cumulative mAP graph with respect to length and identified the inflection points.
+The thresholds for class division were then determined by calculating the k-means centers of these inflection points.
+As a result, we set the thresholds for \textsc{QVHighlights} as [12, 36, 65, \(\inf\)], for \textsc{Charades-STA} as [5.67, 14, \(\inf\)], and for \textsc{TACoS} as [10, 19, 38, \(\inf\)], using UVCOM as baseline.
+
+In ForegroundMix, we set \(\varepsilon_\text{cut}=5\) for \textsc{QVHighlights} and \textsc{TACoS} and  \(\varepsilon_\text{cut}=10\) for \textsc{Charades-STA} to create shorter moments. In Length-Aware Decoder, the number of queries per class $ \mathcal{N}_q$ was set to 10. 
+
+For a fair comparison, we utilize the same features that previous works used. 
+On \textsc{QVHighlights} and \textsc{TACoS}, the video features are extracted from SlowFast~\cite{feichtenhofer2019slowfast_slowfast} and CLIP visual encoder~\cite{radford2021learning_CLIP}.
+On \textsc{Charades-STA}, we use two feature types as in previous works.
+The first type is the video features from SlowFast and CLIP visual encoder, and text features extracted from the CLIP text encoder.
+The second type is video features extracted from VGG \cite{simonyan2014very_vgg} and text features extracted from GloVe \cite{pennington2014glove_glove}. 
+
+The model is trained for 200 epochs on all datasets with learning rates 1e-4. The batch size is 32 for \textsc{QVHighlights}, 8 for \textsc{Charades-STA}, and 16 for \textsc{TACoS}, following previous methods. We kept all the baseline parameters.
+
+\begin{table}[ht]
+
+\setlength{\tabcolsep}{0.3em}
+\centering
+
+\caption{Performance gains of our method on the \textsc{QVHighlights} \textit{test} set across different moment lengths.
+}
+
+\begin{small}
+\setlength{\tabcolsep}{2pt}
+
+\resizebox{\linewidth}{!}
+{
+
+    \begin{tabular}{
+        l    c c   c c   c c    c c
+    }
+
+    
+    \toprule
+    
+
+    \multirow{3}{*}{Method} & \multicolumn{2}{c}{\textbf{Short}} & \multicolumn{2}{c}{Middle} & \multicolumn{2}{c}{Long}  & \multicolumn{2}{c}{All} \\
+
+    \cmidrule(l){2-3}  \cmidrule(l){4-5}  \cmidrule(l){6-7}  \cmidrule(l){8-9}
+
+    
+      & R1 & mAP & R1 & mAP & R1 & mAP  & R1 & mAP \\    
+
+    \midrule
+
+QD-DETR~\cite{moon2023query_QD-DETR}	 & 3.95	 & 6.98	 & 37.39	 & 41.12	 & 42.86	 & 46.95	 & 40.01	 & 39.84	\\
+\rowcolor{gray!10} ~ +Ours	 & 13.47	 & 15.36	 & 39.57	 & 44.93	 & 46.15	 & 52.75	 & 45.03	 & 46.03	\\
+	& \gainp{+9.52} 	& \gainp{+8.38} 	& \gainp{+2.18} 	& \gainp{+3.81} 	& \gainp{+3.29} 	& \gainp{+5.80} 	& \gainp{+5.03} 	& \gainp{+6.19} 	\\
+\hline
+    
+TR-DETR~\cite{sun2024tr_TR-DETR}	 & 4.95	 & 8.22	 & 40.08	 & 43.27	 & 47.63	 & 50.80	 & 43.70	 & 42.62	\\
+\rowcolor{gray!10} ~ +Ours	 & 13.40	 & 15.45	 & 41.59	 & 46.42	 & 47.51	 & 53.01	 & 46.76	 & 47.23	\\
+	& \gainp{+8.44} 	& \gainp{+7.23} 	& \gainp{+1.51} 	& \gainp{+3.15} 	& \gainm{-0.12} 	& \gainp{+2.21} 	& \gainp{+3.06} 	& \gainp{+4.61} 	\\
+\hline
+
+    
+UVCOM~\cite{xiao2024bridging_UVCOM}	 & 5.28	 & 10.67	 & 41.81	 & 44.90	 & 44.95	 & 48.37	 & 43.85	 & 43.18	\\
+\rowcolor{gray!10} ~ +Ours	 & 12.54	 & 16.36	 & 42.40	 & 48.30	 & 46.08	 & 52.22	 & 46.51	 & 47.93	\\
+	& \gainp{+7.26} 	& \gainp{+5.69} 	& \gainp{+0.59} 	& \gainp{+3.40} 	& \gainp{+1.13} 	& \gainp{+3.85} 	& \gainp{+2.66} 	& \gainp{+4.75} 	\\
+
+    \bottomrule
+    \end{tabular}
+}
+
+\end{small}
+
+\label{tab:exp_length_test}
+
+\end{table}
+
+\begin{table}[t]
+
+\setlength{\tabcolsep}{0.3em}
+\centering
+
+\caption{Performance comparison on \textsc{QVHighlights} \textit{test} set. {\dag} indicates training with additional audio features.
+}
+
+\begin{small}
+\setlength{\tabcolsep}{2pt}
+
+\resizebox{\linewidth}{!}
+{
+
+    \begin{tabular}{
+         l  c c c  c c c  c c
+    }
+
+    
+    \toprule
+    
+
+\multirow{3}{*}{Method} & \multicolumn{6}{c}{\textbf{MR}}  & \multicolumn{2}{c}{\textbf{HD}} \\
+
+\cmidrule(l){2-7} \cmidrule(l){8-9}
+
+& \multicolumn{3}{c}{R$1$}  & \multicolumn{3}{c}{mAP} & \multicolumn{2}{c}{$\geq$ Very Good} \\
+
+\cmidrule(l){2-4} \cmidrule(l){5-7} \cmidrule(l){8-9}
+
+ & @$0.5$ & @$0.7$ & Avg. & @$0.5$ & @$0.75$ & Avg. & mAP & HIT@$1$ \\
+
+    \midrule
+
+M-DETR~\cite{lei2021detecting_Moment-DETR}	 & 52.89	 & 33.02	& -	 & 54.82	 & 29.40	 & 30.73	 & 35.69	 & 55.60	\\
+UMT $\dagger$~\cite{liu2022umt_Umt}	 & 56.23	 & 41.18	& -	 & 53.83	 & 37.01	 & 36.12	 & 38.18	 & 59.99	\\
+EaTR~\cite{jang2023knowing_EaTR}	 & 57.98	 & 42.41	& -	 & 59.95	 & 39.29	 & 39.00	& -	& -	\\
+UniVTG~\cite{lin2023univtg_Univtg}	 & 58.86	 & 40.86	& -	 & 57.60	 & 35.59	 & 35.47	 & 38.20	 & 60.96	\\
+MomentDiff~\cite{li2024momentdiff_momentdiff}	 & 57.42	 & 39.66	& -	 & 54.02	 & 35.73	 & 35.95	& -	& -	\\
+MESM~\cite{liu2024towards_MESM}	 & 62.78	 & 45.20	& -	 & 62.64	 & 41.45	 & 40.68	& -	& -	\\
+TaskWeave~\cite{zhang2024temporally_TaskWeave}	 & 61.87	 & 46.24	 & 42.45	 & 63.75	 & 43.63	 & 43.33	 & 37.87	 & 59.08	\\
+BAM-DETR~\cite{lee2025bam-detr}	 & 62.71	 & 48.64	& -	 & 64.57	 & 46.33	 & 45.36	& -	& -	\\
+
+\hline
+QD-DETR~\cite{moon2023query_QD-DETR}	 & 61.22	 & 44.49	 & 40.01	 & 62.31	 & 39.45	 & 39.84	 & 39.01	 & 62.13	\\
+\rowcolor{gray!10} ~ +Ours	 & 64.01	 & 48.90	 & 45.03	 & 64.69	 & 47.23	 & 46.03	 & 40.32	 & \textbf{66.99}	\\
+	& \gainp{+2.79} 	& \gainp{+4.41} 	& \gainp{+5.03} 	& \gainp{+2.38} 	& \gainp{+7.78} 	& \gainp{+6.19} 	& \gainp{+1.31} 	& \gainp{+4.86} 	\\
+
+\hline
+    
+TR-DETR~\cite{sun2024tr_TR-DETR}	 & \underline{64.66}	 & 48.96	 & 43.70	 & 63.98	 & 43.73	 & 42.62	 & 39.91	 & 63.42	\\
+\rowcolor{gray!10} ~ +Ours	 & \textbf{65.43}	 & \underline{50.13}	 & \textbf{46.76}	 & \textbf{65.66}	 & \underline{47.89}	 & \underline{47.23}	 & \textbf{41.41}	 & \underline{65.63}	\\
+	& \gainp{+0.77} 	& \gainp{+1.17} 	& \gainp{+3.06} 	& \gainp{+1.68} 	& \gainp{+4.16} 	& \gainp{+4.61} 	& \gainp{+1.50} 	& \gainp{+2.21} 	\\
+
+\hline
+    
+UVCOM~\cite{xiao2024bridging_UVCOM}	 & 63.55	 & 47.47	 & 43.85	 & 63.37	 & 42.67	 & 43.18	 & 39.74	 & 64.20	\\
+\rowcolor{gray!10} ~ +Ours	 & 63.94	 & \textbf{51.10}	 & \underline{46.51}	 & \underline{65.65}	 & \textbf{49.44}	 & \textbf{47.93}	 & \underline{40.39}	 & 65.50	\\
+	& \gainp{+0.39} 	& \gainp{+3.63} 	& \gainp{+2.66} 	& \gainp{+2.28} 	& \gainp{+6.77} 	& \gainp{+4.75} 	& \gainp{+0.65} 	& \gainp{+1.30} 	\\
+    
+    \bottomrule
+    \end{tabular}
+}
+
+\end{small}
+
+\label{tab:exp_qv_test}
+
+\end{table}
+
+\begin{table}[ht]
+
+\centering
+
+\caption{Results on \textsc{Charades-STA} and \textsc{TaCoS} \textit{test} set. {\ddag} indicates training with VGG features and GloVe features.}
+
+\setlength{\tabcolsep}{0.05pt}
+
+\begin{small}
+
+\resizebox{1\linewidth}{!}
+{
+
+    \begin{tabular}{
+        l c   c c   c c   c c
+    }
+    \toprule
+    \multirow{2}{*}{Method} & \multicolumn{2}{c}{\textsc{Charades-STA}} & \multicolumn{2}{c}{\textsc{TACoS}} & \multicolumn{2}{c}{\textsc{Charades-STA}$^{\ddag}$}\\
+    \cmidrule(l){2-3}  \cmidrule(l){4-5}  \cmidrule(l){6-7}
+    & R1@0.5 & R1@0.7 & R1@0.5 & R1@0.7 & R1@0.5 & R1@0.7\\
+
+    \midrule
+SAP~\cite{gao2021fast_SAP}          & -              & -              & -          & -          & 27.42          & 13.36 \\
+SM-RL~\cite{wang2019language_sm_rl}        & -              & -              & -          & -          & 24.36          & 11.17 \\
+MAN~\cite{Zhang_2019_CVPR_man}          & -              & -              & -          & -          & 41.24          & 20.54 \\
+2D-TAN~\cite{zhang2020learning_2d_tan}       & 46.02          & 27.50          & 27.99      & 12.92      & 40.94          & 22.85 \\
+VSLNet~\cite{zhang2020span_vslnet}       & 42.69          & 24.14          & 23.54      & 13.15      & -              & - \\
+M-DETR~\cite{lei2021detecting_Moment-DETR}       & 53.63          & 31.37          & 24.67      & 11.97      & -              & - \\
+QD-DETR~\cite{moon2023query_QD-DETR}      & 57.31          & 32.55          & -          & -          & 52.77          & 31.13 \\
+UniVTG~\cite{lin2023univtg_Univtg}       & 58.01          & 35.65          & 34.97      & 17.35      &                &  \\
+MESM~\cite{liu2024towards_MESM}         & \underline{61.24} & {38.04}          & -          & -          & \textbf{56.69}          & {35.99} \\
+TR-DETR~\cite{sun2024tr_TR-DETR}      & 57.61          & 33.52          & -          & -          & 53.47          & 30.81 \\
+TaskWeave~\cite{zhang2024temporally_TaskWeave}    & {56.51}          & 33.66          & -          & -          & \underline{56.51}          & 33.66 \\
+
+BAM-DETR~\cite{lee2025bam-detr}        & 59.83          & \underline{39.83}          & \underline{41.54}      & \underline{26.77}      & -  & - \\
+
+\hline
+
+UVCOM~\cite{xiao2024bridging_UVCOM}        & 59.25          & 36.64          & 36.39      & 23.32      & 54.57          & \underline{34.13} \\
+
+\rowcolor{gray!10}~+Ours & \textbf{61.45}    & \textbf{40.22}   & \textbf{42.31} & \textbf{28.09}   & {56.16} & \textbf{36.10} \\
+
+& \gainp{+2.20} 	& \gainp{+3.58} 	& \gainp{+5.92} 	& \gainp{+4.77} 	& \gainp{+1.59} 	& \gainp{+1.97} \\
+
+    \bottomrule
+    \end{tabular}
+}
+
+\end{small}
+
+\label{tab:exp_cha_tacos}
+
+\end{table}
+
+\begin{table*}[!t]
+    \caption{
+        Performance comparison with baseline(QD-DETR) on \textsc{QVHighlights} \textit{val} set. FGMix, BGMix, and LAD indicate \underline{F}ore\underline{G}round \underline{M}ix, \underline{B}ack\underline{G}round \underline{M}ix and \underline{L}ength-\underline{A}ware \underline{D}ecoder, respectively. 
+    }
+    \label{tab:exp_component_analysis}
+    \centering
+
+\setlength{\tabcolsep}{4pt}
+\resizebox{0.85\linewidth}{!}
+{
+    \begin{tabular}{
+        c c c   c c   c c   c c   c c c    c c c 
+    }
+    \toprule
+
+    \multicolumn{3}{c}{\multirow{3}{*}{Method}} & \multicolumn{2}{c}{Short}  & \multicolumn{2}{c}{Middle }  & \multicolumn{2}{c}{Long } & \multicolumn{6}{c}{All}  \\
+
+    \cmidrule(l){4-5}  \cmidrule(l){6-7} \cmidrule(l){8-9} \cmidrule(l){10-15} 
+    
+    & & & R1 & mAP & R1 & mAP & R1 & mAP & \multicolumn{3}{c}{R1} & \multicolumn{3}{c}{mAP}  \\
+
+    \cmidrule(l){4-5}  \cmidrule(l){6-7} \cmidrule(l){8-9} \cmidrule(l){10-12}  \cmidrule(l){13-15} 
+    
+    FGMix & BGMix & LAD &\multicolumn{2}{c}{Avg.} & \multicolumn{2}{c}{Avg.} & \multicolumn{2}{c}{Avg.} & @0.5 & @0.7 & Avg.  & @0.5 & @0.75 & Avg.  \\
+    \midrule
+    
+    \nomark   & \nomark & \nomark	 & 4.57	 & 7.77	 & 38.89	 & 43.10	 & 42.62	 & 47.44	 & 61.39	 & 46.18	 & 41.06	 & 61.68	 & 41.57	 & 41.00	\\
+    \yesmark   & \nomark & \nomark	 & 7.86	 & 12.21	 & 41.42	 & 45.28	 & 43.45	 & 47.69	 & 64.06	 & 48.97	 & 43.84	 & 64.15	 & 43.96	 & 43.32	\\
+    \nomark   & \yesmark & \nomark	 & 6.27	 & 11.07	 & 42.74	 & 46.51	 & 44.55	 & 48.57	 & 63.87	 & 49.03	 & 44.62	 & 63.64	 & 44.23	 & 43.86	\\
+    \nomark   & \nomark & \yesmark	 & 6.99	 & 10.26	 & 39.48	 & 44.68	 & 43.34	 & 51.23	 & 60.77	 & 46.71	 & 42.36	 & 62.89	 & 45.47	 & 43.91	\\
+    \yesmark   & \yesmark & \nomark	 & 7.60	 & 13.35	 & \textbf{42.95}	 & 47.20	 & 45.23	 & 48.42	 & 63.87	 & 50.19	 & 45.37	 & 63.96	 & 46.21	 & 44.95	\\
+    \yesmark   & \yesmark & \yesmark	 & \textbf{12.26}	 & \textbf{16.44}	 & 42.89	 & \textbf{47.69}	 & \textbf{45.78}	 & \textbf{52.75}	 & \textbf{64.32}	 & \textbf{50.90}	 & \textbf{46.83}	 & \textbf{65.49}	 & \textbf{48.92}	 & \textbf{47.84}	\\
+
+        \bottomrule
+    \end{tabular}
+}
+
+\end{table*}
+
+\begin{table}[!t]
+    \caption{
+        Results on the \textsc{QVHighlights} \textit{val} set using 50\%, 20\%, and 10\% of the original training data.
+    }
+    \label{tab:exp_semi}
+    \centering
+
+\setlength{\tabcolsep}{4pt}
+\resizebox{0.95\linewidth}{!}
+{
+    \begin{tabular}{
+        l   c c c   c c c 
+    }
+    \toprule
+    {\multirow{3}{*}{Method}} & \multicolumn{3}{c}{R1} & \multicolumn{3}{c}{mAP}  \\
+
+    \cmidrule(l){2-4}  \cmidrule(l){5-7}  
+    
+     & @0.5 & @0.7 & Avg.  & @0.5 & @0.75 & Avg.  \\
+    \midrule
+
+100\% train data & 61.39	 & 46.18	 & 41.06	 & 61.68	 & 41.57	 & 41.00	\\
+\hline
+ 50\% train data & 57.23	 & 40.26	 & 36.10	 & 57.51	 & 35.63	 & 35.98	\\
+\rowcolor{gray!10} ~ + MomentMix	 & 63.16	 & 47.74	 & 43.36	 & 61.91	 & 41.90	 & 41.73	\\
+	& \gainp{+5.93} 	& \gainp{+7.48} 	& \gainp{+7.26} 	& \gainp{+4.40} 	& \gainp{+6.27} 	& \gainp{+5.75} 	\\
+\hline
+    
+ 20\% train data& 46.84	 & 30.45	 & 26.58	 & 48.27	 & 25.35	 & 26.88	\\
+\rowcolor{gray!10} ~ + MomentMix	 & 52.45	 & 37.68	 & 33.69	 & 52.66	 & 34.25	 & 33.72	\\
+	& \gainp{+5.61} 	& \gainp{+7.23} 	& \gainp{+7.11} 	& \gainp{+4.39} 	& \gainp{+8.90} 	& \gainp{+6.84} 	\\
+\hline
+    
+ 10\% train data& 32.45	 & 16.84	 & 15.90	 & 37.10	 & 15.37	 & 18.17	\\
+\rowcolor{gray!10} ~ + MomentMix	 & 43.10	 & 28.71	 & 25.61	 & 44.97	 & 26.12	 & 26.62	\\
+	& \gainp{+10.65} 	& \gainp{+11.87} 	& \gainp{+9.71} 	& \gainp{+7.87} 	& \gainp{+10.75} 	& \gainp{+8.45} 	\\
+
+        \bottomrule
+    \end{tabular}
+}
+
+\end{table}
+
+\subsection{Results}\label{sec:results}
+
+We applied our method to QD-DETR~\cite{moon2023query_QD-DETR}, a common baseline in many studies.
+However, since our method can be easily added to other models, we further validated our method on three recent methods (TR-DETR~\cite{sun2024tr_TR-DETR}, and UVCOM~\cite{xiao2024bridging_UVCOM}) to demonstrate its effectiveness.
+We compared our approach against existing moment retrieval methods, including the latest DETR-based models.
+While existing models report only overall performance, we also analyze the performance of each length.
+
+\vspace{1mm}
+\noindent\textbf{Performance with respect to moment length on \textsc{QVHighlights}.} 
+In \Cref{tab:exp_length_test}, our method significantly improves short-moment performance across all baselines. Specifically, for QD-DETR, the R1 average and mAP average for short moments increased by +9.52\% and +8.38\%, respectively. Moreover, our approach consistently outperforms all baselines in mAP average across all lengths.
+
+\vspace{1mm}
+\noindent\textbf{Overall performance on \textsc{QVHighlights}.} 
+In \Cref{tab:exp_qv_test}, our method yields significant improvements across all metrics, indicating enhanced overall performance across all baselines. Notably, while our primary objective was to improve the short moment performance in Moment Retrieval (MR) by enhancing feature diversity, we also observed substantial performance gains in Highlight Detection (HD). This demonstrates that enhancing feature diversity is an effective strategy that can positively impact other tasks as well.
+
+\vspace{1mm}
+\noindent\textbf{Overall performance on \textsc{Charades-STA} and \textsc{TACoS}.} 
+As shown in \Cref{tab:exp_cha_tacos}, our method achieved a substantial performance improvement of +5.92\% in R1@0.5 on \textsc{TACoS}, which encompasses moments with a broader range of lengths compared to \textsc{QVHighlights}. This significant enhancement demonstrates the superior generalization capabilities of our length-aware approach.
+
+In contrast to other datasets, \textsc{Charades-STA} contains moments with highly restricted lengths, making it less representative of the problem we aim to address. Nevertheless, we included \textsc{Charades-STA} in our evaluation to ensure the robustness of our approach. The results show that our method improved R1@0.7 by +3.58\% when using SlowFast and CLIP features, +1.97\% using VGG features. 
+
+\subsection{Ablation Studies and Discussions}\label{sec:Ablation studies}
+
+\noindent\textbf{Component analysis.} In \Cref{tab:exp_component_analysis}, we examined the impact of MomentMix and the Length-Aware Decoder on enhancing performance for short moments, observing overall gains.
+While each component individually improves performance, their combined application leads to even greater improvements.
+This suggests that our two components, MomentMix and Length-Aware Decoder, each contribute effectively without redundancy, making their combined use the effective approach for tackling the challenge of short-moment retrieval.
+
+\vspace{1mm}
+\noindent\textbf{Evaluation in few-shot scenarios.} To validate the effectiveness of MomentMix as a data augmentation technique, we conducted experiments using 50\%, 20\%, and 10\% of the training data.
+As shown in \Cref{tab:exp_semi}, our method significantly outperformed the baseline (QD-DETR) with substantial performance gains. Specifically, utilizing only half of the training samples with our augmentation surpassed the baseline performance that employed the entire training dataset. Additionally, even in the extreme scenario of using just 10\% of the training samples, our method achieved remarkable improvements of +9.71\% in R1 average and +8.45\% in mAP. These results indicate that MomentMix effectively generates new training samples by enhancing feature diversity.
+
+\begin{figure}[t]
+    \centering
+    \includegraphics[width=\linewidth]{assets/exp_4427_final.png}
+    \includegraphics[width=\linewidth]{assets/exp_251_final.png}
+    \caption{
+        A qualitative result on \textsc{QVHighlights} \textit{val} set. Existing models often fail to accurately distinguish between foreground and background, leading to unsuccessful predictions or missed detections of short moments. In contrast, our model is capable of predicting short moments with greater accuracy and robustness. 
+    }
+    \label{fig:exp_qualitative}
+\end{figure}
+
+\vspace{1mm}
+\noindent\textbf{Qualitative results.} We visualized predictions with confidence scores exceeding 0.7, using an alpha value of 0.5. As shown in \Cref{fig:exp_qualitative}, by applying our method, short moments predicted as background in other methods can now be accurately captured. Also, predictions that merged multiple short instances into a single long instance can now be segmented into precise, fine-grained predictions.
+
+\section{Limitation and Conclusion}
+\label{sec:conclusion}
+\noindent\textbf{Limitation.} While we have incorporated length-awareness in the decoder, further investigation into enhancing the encoder is necessary. Moreover, our novel data augmentation method for MR improves performance but also increases training time. Thus, future research should focus on developing more efficient approaches.
+
+\noindent\textbf{Conclusion.}
+In this study, we addressed the limitations of short-moment retrieval in existing DETR-based approaches from both data and model perspectives. To overcome the data-centric issue of limited feature diversity in short moments, we introduced MomentMix, which leverages two mix-based data augmentation strategies: ForegroundMix and BackgroundMix. These strategies enhance the feature representations of both foreground and background elements. On the model side, we identified inaccuracies in center predictions for short moments and proposed a Length-Aware Decoder with a novel bipartite matching process conditioned on moment length. This approach leverages length expert queries to improve center prediction accuracy. Extensive experiments demonstrate that our method surpasses state-of-the-art DETR-based moment retrieval models in terms of R1 and mAP on benchmark datasets. Furthermore, our methodology can be seamlessly integrated with other DETR-based models, paving the way for future advancements in the field.
+
+{
+    \small
+        }
+
+\clearpage
+\newpage
+\setcounter{page}{1}
+\maketitlesupplementary
+
+\end{document}

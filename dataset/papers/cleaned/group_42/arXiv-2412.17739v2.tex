@@ -1,0 +1,372 @@
+\title{Fourier Position Embedding:\\Enhancing Attention's Periodic Extension for Length Generalization}
+
+\begin{document}
+
+\maketitle
+\begin{abstract}
+Extending the context length of Language Models (LMs) by improving Rotary Position Embedding (RoPE) has become a trend.
+While existing works mainly address RoPE's limitations within attention mechanism, this paper provides an analysis across nearly all parts of LMs, uncovering their adverse effects on length generalization for RoPE-based attention.
+Using \textit{Discrete Signal Processing} theory, we show that RoPE enables periodic attention by implicitly achieving \textit{Non-Uniform Discrete Fourier Transform}.
+However, this periodicity is undermined by the spectral damage caused by: 1) linear layers and activation functions outside of attention; 2) insufficiently trained frequency components brought by time-domain truncation. 
+Building on our observations, we propose \textbf{\textit{Fourier Position Embedding (FoPE)}}, which enhances attention's frequency-domain properties to improve both its periodic extension and length generalization. 
+FoPE constructs \textit{Fourier Series} and zero-outs the destructive frequency components, increasing model robustness against the spectrum damage.
+Experiments across various model scales show that, within varying context windows, FoPE can maintain a more stable perplexity and a more consistent accuracy in a needle-in-haystack task compared to RoPE and ALiBi.
+Several analyses and ablations bring further support to our method and theoretical modeling.
+
+\end{abstract}
+
+\section{Introduction}
+
+\begin{figure}
+    \subfloat[Accuracy on Passkey Retrieval (higher is better)]{
+        \includegraphics[width=0.95\linewidth]{figures/c4_512_downstream.pdf}
+    }
+    \hfill
+    \subfloat[Perplexity on C4 (lower is better)]{
+        \includegraphics[width=0.95\linewidth]{figures/c4_512_overall.pdf}
+    }
+    \caption{Training with max\_seq\_length=512.}
+    \label{fig:c4_512}
+\end{figure}
+
+\begin{figure*}[t]
+    \centering
+    \includegraphics[width=\textwidth]{figures/main.pdf}
+    \caption{The reasons why RoPE’s periodic extension deteriorates and how FoPE addresses these issues to improve length generalization. (a) As signals pass through linear and nonlinear transformations, this causes spectral leakage and distortion, mixing multiple frequencies into a single dimension. Under RoPE, each dimension is treated as a single-frequency component. By contrast, FoPE models each dimension as a Fourier series of different frequency components, thereby separating information more effectively and mitigating spectral damage. (b) FoPE eliminates inadequately trained frequency components, which are harmful for periodic extension. By preserving only the zero-frequency component, FoPE safeguards periodic extension and delivers more robust length generalization.}
+    \label{fig:main}
+\end{figure*}
+
+Generation based on the information from long contexts is crucial for Language Models (LMs). However, LMs are typically trained on a fixed context window \citep{vaswani2017attention, touvron2023llama, groeneveld2024olmo} and tends to overfit to the specific context length.
+
+Many studies consider the absolute position embedding \citep{vaswani2017attention} to be the source of overfitting in length generalization.
+As mitigation, several relative position embedding methods have been proposed \citep{press2021train, su2024roformer, peng2023yarn, jin2024llm} to improve LMs' long-distance dependency.
+Among these, ALiBi \citep{press2021train} introduced a position-biased attention mask, which linearly declines the attention weights based on distance. ALiBi delivers stable perplexity in pre-training, but it loses the information from long-distance tokens, resulting in poor performance on long-context downstream tasks.
+Another method, RoPE \citep{su2024roformer}, uses the phase of complex numbers to store the position information. Combined with continual pre-training and other interpolation-based methods \citep{peng2023yarn,xiong-etal-2024-effective,chen2024clex,jin2024llm}, RoPE provides better access to long-distance information, making it one of the most widely used position embedding. 
+However, RoPE-based LMs still struggle with length generalization without supplementary methods. 
+
+In this paper, we take a closer look at RoPE in the frequency-domain with tools from \textit{Discrete Signal Processing (DSP)} theory.
+Our modeling reveals that RoPE implicitly performs \textit{Non-Uniform Discrete Fourier Transform (NUDFT)} on the hidden states, enabling periodic attention based on the frequency-domain encoding.
+However, we find that the periodicity is hindered by the spectral damage caused by: 1) linear layers and activation functions outside attention; 2) inadequately-trained frequency components within attention (See Fig \ref{fig:main}). This explains why RoPE fails to achieve length generalization without assistance from other methods. 
+
+Building on our observations above, we propose \textbf{\textit{Fourier Position Embedding (FoPE)}} to further improve the attention's periodic extension for better length generalization. Compared to RoPE, FoPE introduces two main improvements:
+1) While RoPE treats each dimension as a single-frequency function, FoPE models each dimension as a \textit{Fourier Series}, consisting of a dominate frequency component and several harmonic components. This approach better mirrors the actual spectrum in LMs and helps attention separate information across different wavelengths, mitigating the negative effects of Spectral Damage.
+2) FoPE clips inadequately trained frequency components that is harmful to length generalization. To keep the passing of long wavelength information, we substitute these components with zero, as the zero-frequency component corresponds to the longest wavelength.
+
+We summarize our contribution as follows:
+
+    1. Based on DSP, we provide frequency-domain analysis to reveal the negative influence from nearly all parts from LMs. We find that the length generalization is hindered by the Spectrum Damage arised from: 1) linear layers and activation functions; 2) undertrained frequency components. 
+
+    2. We propose FoPE to improve attention's robustness on the Spectrum Damage. FoPE construct Fourier Series to extract multi-frequency information in each dimension, and clip the frequency of destructive components to zero. Thus, FoPE delivers better periodic extension of attention, thus bringing better length generalizaion.
+
+    3. We conduct experiments across several model scales and datasets. The perplexity in pre-training and the accuracy in needle-in-haystack demonstrate FoPE's superiority over RoPE and ALiBi on length generalization. Ablations on both frequency and time domain bring further support to our method and theoretical modeling.
+    
+    
+    
+
+\section{Preliminaries}
+\subsection{Non-Uniform Discrete Fourier Transform}
+Given a finite sequence of equally-spaced samples $\{x_n\}:=x_0, x_1, ..., x_{N-1}$ of a continuous function $x$, \textit{\textbf{Discrete Fourier Transform (DFT)}} converts them into equally-spaced frequency-domain components $\{X_m\}:=X_0, X_1, ..., X_{M-1}$, the original samples can be recovered by Inverse DFT (IDFT):
+\begin{equation}\label{eq:dft}
+    \resizebox{0.98\hsize}{!}{%
+    $X_m = \sum\limits_{n=0}^{N-1}x_n e^{-i2\pi\frac{n}{N}m}, \ \ x_n = \frac{1}{M}\sum\limits_{m=0}^{M-1}X_m e^{i2\pi\frac{m}{M}n}$
+    }
+\end{equation}
+As $e^{i\omega n}=\cos\omega n+i\sin\omega n$ is periodic in the original domain, DFT implicitly transforms the original function into a linear combination of periodic waves with frequency $\omega_m=2\pi\frac{m}{M}$. 
+Thus, DFT is an estimation of the original function, which is lossless only if the original function exactly composed of these specific periodic components. 
+
+To achieve a more precise approximation, the sampled frequencies can follow any arbitrary distribution $\{\omega_m\}:=\omega_0, \omega_1, ..., \omega_{M-1}$, 
+where the only constraint is $\omega_m\in[0, 2\pi)$. The generalization of DFT is called \textit{\textbf{Non-Uniform DFT (NUDFT)}}.
+
+\subsection{RoPE implicitly achieves Periodic Attention based on NUDFT}
+
+Given a $M$ dimension Query $Q$ and Key $K$ of token $a$ and $b$, RoPE rotates them to different phase based on the dimension $m$:
+\begin{equation}
+    \widetilde{q_m}(n_a) = Q_me^{i\omega_mn_a}, \widetilde{k_m}(n_b) = K_me^{i\omega_mn_b}
+\end{equation}
+where $\omega_m=1/{\theta^{^{(2m/M)}}}$ and $\theta$ is the pre-defined parameters in RoPE. Then, the attention weight $h_m(n)$ in each dimension will be calculated as:
+\begin{equation}
+    \widetilde{h_m}(n) = \widetilde{q_m}(n_a)\widetilde{k_m}^*(n_b) = H_me^{i\omega_mn}
+\end{equation}
+where $n=n_a-n_b$ and $H_m=Q_mK_m$. Finally, the overall attention weight between different tokens can be formalized as:
+\begin{equation}
+    h(n) = \sum\limits_{m=0}^{M-1}\widetilde{h_m}(n) = \sum\limits_{m=0}^{M-1}H_me^{i\omega_mn}
+\end{equation}
+Comparing it with Eq (\ref{eq:dft}), it can be observed that RoPE implicitly achieves a token-level Inverse NUDFT with frequency components $\{\omega_m\}$. 
+
+Based on NUDFT, RoPE models the interactions between different tokens as functions composed of several periodic components, which brings \textbf{\textit{periodic extension}} in each dimension $m$:
+\begin{equation}\label{eq:periodic}
+    \widetilde{h_m}(n+N_{\omega_m}) =  \widetilde{h_m}(n)
+\end{equation}
+where $N_{\omega_m}=\frac{2\pi}{\omega_m}$ is this component's period. This property can generalize LMs to longer context.
+
+\section{Spectrum Damage Confine the Length Generalization}
+\label{sec:spectrum_damage}
+Ideally, RoPE-based Attention achieves periodic extension in any length scenario. However, this extension is confined as a key ideal property that is not guaranteed in LMs.
+
+\subsection{Negative Influence of Spectrum Damage}
+The ideal coefficients and frequencies of NUDFT have one-to-one correspondence. The coefficient of each frequency represents the influence of each token on others propagated at a specific wavelength.
+
+However, the periodic extension is hindered, if the coefficient also contains the information from another frequency component $\omega_o$ with coefficient $H_{\omega_o}=\sigma H_\omega$, called the \textbf{\textit{Spectrum Damage}}. 
+
+If we define the damaged function as $h_{m}' = H_{\omega_m}[(1-\sigma)e^{i\omega_m n}+\sigma e^{i\omega_o n}]$, we find:
+\begin{equation}\label{eq:spectrum_damage}
+    h_{m}'(n+N_{\omega_m}) \neq h_{m}'(n)
+\end{equation}
+as $N_{\omega_m}$ is not the period of $h_{\omega_o}$. 
+In other words, the information from each component is transmitted through waves with mismatched wavelengths, leading to inaccurate estimation of the influence propagated within each wavelength. As a result, the periodic extension and length generalization of attention are adversely affected.
+
+\subsection{Spectrum Damage Outside Attention}
+\label{subsec:spectrum_damage}
+
+The LMs' linear layers and activation functions outside attention bring two types of spectrum damage, destroying the one-to-one correspondence between coefficients and frequencies.
+
+\textbf{Linear Layer} uses weights $W\in\mathbb{R}^{M \times M}$ to map a $M$ dimension hidden state $X\in\mathbb{R}^M$ to another hidden state $Y\in\mathbb{R}^M$. Thus, each dimension of $Y$ will be a linear combination of different components of $X$:
+\begin{equation}
+    Y_m = \sum\limits_{k=0}^{M-1}W_{km}X_k
+\end{equation}
+This results in \textbf{\textit{Spectrum Leakage}}, as different frequency components exhibit interplay. 
+
+\textbf{Activation Function} has non-linearity in the time domain, generating harmonic frequencies as described by the following Lemma:
+
+\begin{lemma}
+Given a double-frequency sinusoid function $x(n)=\cos\omega_1 n + \cos\omega_2 n$ and any time-independent non-linear function $g$. The effect of $g$ on $x(n)$ will produce waves whose frequencies are the linear combinations of $\omega_1$ and $\omega_2$:
+\begin{equation}
+    g(x(n)) = \sum\limits_{j \in N}\sum\limits_{k \in N} a_{j,k} \cos(j \omega_1 + k \omega_2)n
+\end{equation}
+which can be generalized to any multi-frequency function $x(n)=\sum(a_\omega\sin\omega n+b_\omega\cos\omega n)$\footnote{From \citep{oppenheim1982signal}}.
+\label{lemma:harmonic}
+\end{lemma}
+
+As the hidden states have been transformed into multi-frequency functions by Linear Layer, passing them across Activation Functions introduces additional harmonic components, leading to serious \textbf{\textit{Spectrum Distortion}}.
+
+These two types of Spectrum Damage undermine the periodic extension of attention (as shown in Eq.(\ref{eq:periodic})(\ref{eq:spectrum_damage})), hindering the model's length generalization property.
+
+\subsection{Spectrum Damage Inside Attention}
+\label{subsec:undertrained_frequency}
+Besides the spectrum damage outside attention, the undertrained components of attention within extremely low frequencies ($\omega_m<\frac{2\pi}{N}$) also bring spectrum damage.
+
+Consider a single-frequency function $x_m(n)=e^{i\omega_m n}\text{rect}(n)$ truncated by a square wave:
+\begin{equation}
+    \text{rect}(n)=
+    \left\{
+        \begin{array}{cc}
+            1 & ,n \leq N \\
+            0 & ,n > N
+        \end{array}
+    \right.
+\end{equation}
+Based on the results of DFT, the spectrum estimation of x(n) is\footnotemark[1]:
+\begin{equation}
+    X(\omega) = \alpha\delta(\omega_m)+ \frac{\sin[(N-\alpha N_m)(\omega-\omega_m)]}{\omega-\omega_m}
+    \label{eq:undertrained}
+\end{equation}
+where $\alpha=\lfloor\frac{N}{N_m}\rfloor$ and $N_m=\frac{2\pi}{\omega_m}$. 
+
+In the frequency domain, time-domain truncation introduces noisy components via the latter sub-function. When the period of the primary frequency component exceeds the truncation length, its amplitude is significantly weakened. Consequently, noisy components dominate these dimensions, impairing the periodic extension (as defined by Eq.(\ref{eq:periodic})(\ref{eq:spectrum_damage})). 
+In contrast, high-frequency components are minimally affected because their coefficients $\alpha$ dominate over the noisy components.
+
+Intuitively, when sampling sinusoidal functions based on token positions, these low-frequency components cannot cover a complete cycle. Therefore, for positions exceeding the pre-training sequence length, these dimensions may sample outside the training domain, leading to difficulties in generalization. Although previous works \citep{peng2023yarn} have identified this issue, we are the first to model it from a Fourier perspective and provide a theoretical explanation.
+
+\begin{figure*}[ht]
+    \subfloat[Accuracy on Passkey Retrieval (higher is better)]{
+        \includegraphics[width=\textwidth]{figures/c4_512_downstream_extra_1024.pdf}
+    }
+    \hfill
+    \subfloat[Perplexity on C4 (lower is better)]{
+        \includegraphics[width=\textwidth]{figures/c4_512_ppl_extra_1024.pdf}
+    }
+    \caption{Effectiveness of FoPE in length extrapolation. Starting point models trained with a maximum sequence length of 512 are extrapolated using YARN and FoPE on a corpus with a maximum sequence length of 1024.}
+    \label{fig:length-extrapolation}
+\end{figure*}
+
+\section{Fourier Position Embedding}
+To mitigate the negative affect of the non-ideal frequency-domain properties in LMs, we propose \textit{\textbf{Fourier Position Embedding (FoPE)}} to modify frequency-domain properties of attention:
+
+\textbf{Treating Each Dimension as Multi-Frequency.} Although Linear Layers and Activation Functions bring serious Spectrum Leakage and Spectrum Distortion, they are crucial for enhancing expressive capacity. Therefore, we keep these modules unchanged but focus on modifying how attention processes information within each dimension.
+
+To achieve this, we replace the single frequency in each dimension with Fourier Series:
+\begin{equation}
+    h_m(n) = H_m(n)(e^{i\omega_m n}+\sum\limits_{\omega}a_{\omega} e^{i\omega n})
+\end{equation}
+where $a_\omega<1$ because $\omega_m$ is the dominant frequency. This allows attention modules to capture multi-frequency information in each dimension. 
+
+We initialize vector $\{\omega_m\}$ as same as RoPE, and initialize vector $\{\omega\}$ and matrix $\{a_\omega\}$ based on the analysis in Sec \ref{subsec:spectrum_damage}: 
+For $\{\omega\}\in\mathbb{R}^D$, we make sure $M \leq D$ so that $\{\omega_m\}\subseteq\{\omega\}$, and the other frequencies can be sampled within $[0, \pi]$ in any distribution.
+For $\{a_\omega\}\in\mathbb{R}^{D \times M}$, we initialize it with $N(0,\sigma)$ based on the hypothesis that the Spectrum Damage obeys the similar distribution as the Linear Layers. The coefficients for the real and imaginary part of the frequency are sampled separately in our implementation, which can also use the same coefficient.
+The $D$ and $\sigma$ are kept as hyper-parameters to be adjusted.
+
+\textbf{Zero-out Undertrained Frequencies.} As analyzed in Sec \ref{subsec:undertrained_frequency}, the inadequate training of extremely-low frequencies $\omega_m<\frac{2\pi}{N}$ impairs the frequency-domain properties of attention. Thus, we define the floor frequency as $\omega_l=\frac{2\pi}{N}$, and clip the frequencies under the floor frequency to zero. 
+
+We choose zero as the substitute because the zero-frequency component can represent any period, making it easier to train and ensuring stable periodic extensions. Also, since the zero-frequency component has the longest wavelength and typically carries the most information, this substitution does not compromise the length generalization or hinder model fitting.
+
+\textbf{Overall function of FoPE} can be formalized as:
+\begin{equation}
+    h_m(n)=H_m(n)f(\omega_m)
+\end{equation}
+\begin{equation}
+    f(\omega_m) = 
+    \left\{
+        \begin{array}{cc}
+            1 & ,\omega_m < \omega_l \\
+            e^{i\omega_m n}+\sum\limits_{\omega}a_{\omega} e^{i\omega n} & ,\omega_m \geq \omega_l
+        \end{array}
+    \right.
+\end{equation}
+which treats each dimension either as a Fourier Series or as a zero-frequency component.
+
+\textbf{Implementation of FoPE} can be easily achieved with a weight matrix $W^F\in\mathbb{R}^{D \times (M-M_0)}$, where $M_0$ is the number of zero-frequency components in each head (details in \ref{appendix:implementation}). This matrix maps the coefficients of all frequencies to a Fourier Series for each dimension. 
+Since the zero-frequency sinusoidal function does not affect the original hidden states, the output dimension is less than the dimension of each head. 
+To introduce more diversity and better simulate the randomness of the Spectrum Damage, we assign separate weights for different heads, as well as for the cosine and sine functions. In our implementation, gradients are not required for these matrices, so FoPE adds negligible memory and computation overhead compared to RoPE.
+
+\section{Experiments}
+To demonstrate the effectiveness of FoPE as both a position embedding and an extrapolation method, we conduct experiments during pre-training (Sec. \ref{subsec:pre-training}) and fine-tuning (Sec. \ref{subsec:fine-tuning}). Additionally, we perform ablation studies to analyze the impact of hyperparameters on FoPE (Sec. \ref{subsec:ablation}) and analysis to demonstrate the necessity to zero-out undertrained components (Sec. \ref{subsec:analysis}).
+
+\subsection{Basic Settings}
+We mainly consider two metrics: perplexity for pre-training and accuracy on Passkey Retrieval.
+
+\textbf{Perplexity} quantifies how well a language model predicts a sequence of words or tokens. A lower perplexity indicates the model is more confident and accurate in its predictions.
+
+\textbf{Accuracy on Passkey Retrieval} \citep{mohtashami2023landmark} measures the models' ability in retrieving a short passkey (i.e., a five-digit number) from a large context full of meaningless text. 
+We conduct this evaluation based on the implementation from \citep{peng2023yarn}. During evaluation, the passkey is randomly positioned at uniformly distributed locations within the context. For each context length, we test for 1000 trials to ensure the positions sampled are sufficiently dispersed.
+
+We conduct experiments with the OLMo \citep{groeneveld2024olmo} framework and consider different scale models having 60M, 180M, 1.2B parameters. 
+
+\subsection{Length Generalization after Pre-Training}
+\label{subsec:pre-training}
+We consider two settings to evaluate both the intra-domain and out-of-domain generalization: 
+
+\textbf{Setting 1:} We train models with a 10B-tokens subset of C4 \citep{raffel2020exploring} and evaluate them in a validation set from C4. 
+
+\textbf{Setting 2:} We train models with $\sim$5B tokens from Gutenberg Books \citep{gutenbergbooks} and evaluate them in the same validation set as Setting 1. In this setting, the language distribution is different between the validation set and the training set, which can further evaluate the generalization ability of different methods.
+
+\textbf{Results of Perplexity.} (See Fig \ref{fig:c4_512}.b \& \ref{fig:books_512}) In both settings, FoPE shows a significant advantage over RoPE. But FoPE is slightly worse than ALiBi, as there is an issue when ALiBi meets this training corpus, which is also mentioned in other papers \citep{peng2023yarn, chen2024clex}. On the one hand, the corpus in C4 and Books mainly have short-distance dependency, thus the information from a short context window is enough for the prediction of almost all tokens. On the other hand, AliBi uses linear declined attention to eliminate long-distance information, and only pays attention to short-distance dependency. Based on these two reasons, ALiBi does not have any decline in perplexity as the context length increases. 
+
+\begin{figure}
+    \centering
+    \includegraphics[width=\linewidth]{figures/books_512_overall.pdf}
+    \caption{Training with max\_seq\_length=512 on Gutenberg Books and evaluating on a validation set of C4, FoPE also demonstrates its ability to generalize across different data distributions.}
+    \label{fig:books_512}
+\end{figure}
+
+\begin{figure*}[t]
+    \subfloat[Ablation for different sub-methods]{
+        \includegraphics[width=0.32\textwidth]{figures/books_512_ablation_scale_method.pdf}
+        \label{subfig:ablation-sub-methods}
+    }
+    \hfill
+    \subfloat[Ablation for different $\sigma$]{
+        \includegraphics[width=0.32\textwidth]{figures/books_512_ablation_var.pdf}
+        \label{subfig:ablation-sigma}
+    }
+    \hfill
+    \subfloat[Ablation for different $D$]{
+        \includegraphics[width=0.32\textwidth]{figures/books_512_ablation_dim.pdf}
+        \label{subfig:ablation-D}
+    }
+    \caption{Ablation Studies. (a)(b) evaluate $\text{PPL Ratio}=\text{PPL}_{\text{c4}}/\text{PPL}_{\text{books}}$, (c) evaluate accuracy on Passkey.}
+\end{figure*}
+
+\textbf{Results of Passkey.} (See Fig \ref{fig:c4_512}.a) In this task, FoPE demonstrates a significant advantage over both RoPE and ALiBi. RoPE’s accuracy drops sharply to zero at twice the training length and remains at zero for longer sequences. ALiBi shows a linear decline in accuracy, further illustrating that its linearly declining attention is unable to capture information from long distances. In contrast, FoPE maintains stable retrieval accuracy for passkeys at any position, demonstrating a strong ability to extract subtle information from long sequences.
+
+\subsection{Length Generalization after Fine-Tuning}
+\label{subsec:fine-tuning}
+Beyond the use of positional embeddings during the pre-training phase, several post-pre-training extrapolation methods \citep{peng2023yarn, chen2024clex} have been proven critical for enhancing length generalization. Thus, we investigate two key aspects of FoPE: 1) whether existing extrapolation methods are also effective for FoPE; 2) whether FoPE can enable extrapolation on RoPE-based models, thereby allowing seamless integration with existing open-source models. In this sub-experiment, we select a representative extrapolation method, YARN \citep{peng2023yarn}, as our baseline. We fine-tune the last checkpoint from pre-training for $\sim$ 1B tokens in this setting.
+
+\textbf{Results (See Fig \ref{fig:length-extrapolation}).} Compared to RoPE+YARN, FoPE+YARN achieves significantly better length generalization performance, as demonstrated by lower perplexity on the C4 dataset and higher accuracy in the Passkey Retrieval task. Moreover, FoPE outperforms YARN in length extrapolation for both RoPE-based and FoPE-based models. These findings underscore the effectiveness and practical utility of FoPE, which holds the potential to enhance all RoPE-based open-source models.
+
+\subsection{Ablation Studies}
+\label{subsec:ablation}
+We also conduct ablation studies on various hyper-parameters to observe their effects on our algorithm.
+Considering the consistent performance of FoPE across different parameter scales, we only evaluate the 60M models in ablation studies. 
+
+\textbf{Both sub-methods of FoPE are useful} (See Fig \ref{subfig:ablation-sub-methods}). FoPE is constitutive of two parts, called \textit{Fourier Series (FS)} and \textit{Clip Floor to Zero (CF)}. Although these two sub-methods are both useful for length generalization, combining them together brings a more significant improvement. On one hand, FS contributes more to length generalization, which demonstrates that the Spectrum Damage have a significant influence on length generalization. On the other hand, CF contributes more to fitting the current dataset and sequence length, which implies the zero-frequency component is the most informative and indispensable component.
+
+\textbf{Increasing the dimension of attention heads is more beneficial than increasing the number of attention heads or layers} (See Fig \ref{subfig:ablation-sub-methods}). More dimensions introduce more frequency components, making attention more robust to Spectral Damage. In contrast, adding more attention heads and layers aggravates Spectrum Damage, which diminishes the benefits of expanding the parameter scale.
+
+\textbf{Variance $\sigma$ of $\{a_\omega\}$} (See Fig \ref{subfig:ablation-sigma}). We keep $D=16$ to only evaluate $\sigma$'s influence. By grid searching $\sigma$ from 0 to 0.5, we find that setting $\sigma=0.3$ for 60M model can obtain the best perplexity, especially for long context length. The best $\sigma$ implies the estimated strength of Spectrum Damage in 60M models, and the estimation may become larger as the parameter scale increases.
+
+\textbf{Number $D$ of $\{\omega\}$.} We keep $\sigma=0.3$ to only evaluate $D$'s influence. By grid searching $\sigma$ from 16 to 128, we find that $D$ does not significantly influence the perplexity, but it is important for Passkey Retrieval. Setting $D=64$ can obtain the best accuracy for Passkey Retrieval. The best $D$ is the estimated number of strong enough noisy components of each model, and this number may become larger as the parameter scale increases. The harmonic frequencies tend to be weaker than the base frequencies, and this phenomenon is more significant to the higher-order harmonics. Thus, there are limited noisy frequency components that have enough intensity to disturb the passing of the base wave, paying attention to not important components hinders the effectiveness of the model.
+
+\begin{figure}[t]
+    \centering
+    \includegraphics[width=\linewidth]{figures/qk.pdf}
+    \caption{Average activations of $q$,$k$ vectors.}
+    \label{fig:qk}
+\end{figure}
+
+\begin{figure}[t]
+    \centering
+    \includegraphics[width=\linewidth]{figures/rope-pos-attn_weight-sample.pdf}
+    \caption{The statistical average contribution of RoPE to attention scores. We sample 1k Q and K vectors from Gaussian distributions with mean of 0, 0.1, and 1.0. The long-distance decay effect weakens as the mean decreases, disappearing entirely when the mean is 0.}
+    \label{fig:decay}
+\end{figure}
+
+\begin{table}[t]
+    \centering
+    \begin{adjustbox}{width=0.48\textwidth}
+    \begin{tabular}{l|c|c|c|c|c}
+        \toprule
+        \textbf{Sequence Length} & \textbf{512} & \textbf{1024} & \textbf{2048} & \textbf{4096} & \textbf{8192} \\
+        \midrule
+        RoPE & 5.50 & 6.01 & 6.58 & 6.99 & 7.16\\
+        RoPE + QK\_Norm & \underline{5.46} & \underline{5.56} & \underline{5.89} & \underline{6.32} & \underline{6.66} \\
+        \midrule
+        RoPE-A & 5.72 & \underline{5.86} & \underline{6.18} & \underline{6.46} & \underline{6.67}\\
+        RoPE-A + QK\_Norm & \underline{5.69} & 5.89 & 6.27 & 6.59 & 6.81 \\
+        \midrule
+        NoPE & 5.65 & \underline{6.03} & \underline{6.60} & \underline{6.81} & \underline{6.99} \\
+        NoPE + QK\_Norm & \underline{5.59} & 6.18 & 6.87 & 7.10 & 7.43 \\
+        \bottomrule
+        \end{tabular}
+    \end{adjustbox}
+    \caption{The loss of 20M toy models trained on a sequence length of 512. We consider three types of position embeddings, among which only RoPE has frequencies that cannot complete full cycles. For RoPE-A, all frequencies are adjusted from RoPE to the nearest values that exactly complete full cycles.}
+    \label{tab:qk_norm}
+\end{table}
+
+\subsection{The Necessity to Zero-Out Undertrained Components}
+\label{subsec:analysis}
+To further explain the negative influence of the extremely low-frequency components and demonstrate the necessity to zero-out them, we also investigate their properties in the time domain.
+
+By visualizing the numerical expectations of the $q$ and $k$ vectors in each dimension (details in Appendix \ref{appendix:visualize-of-qk}), we observe that the absolute values of the dimensions corresponding to undertrained frequencies are noticeably greater than zero, whereas those of adequately trained dimensions are close to zero.
+On the other side, the components that do not complete a full cycle during pre-training introduce weights with non-zero means when applied to $q$,$k$ vectors. Thus, these components introduce positional bias (shown in Fig \ref{fig:decay}) and may adversely affect robustness to out-of-domain rotation matrix values during length generalization.
+
+To verify this hypothesis, we normalized the $q$,$k$ vectors (enforcing a mean of 0 and variance of 1) before applying the rotation matrix to eliminate the positional bias. Based on the results in Table \ref{tab:qk_norm}, normalization on naive RoPE showed a positive impact on length generalization. However, if all frequency components are pre-trained to complete full cycles, such normalization does not improve generalization. These experimental results validate our hypothesis.
+Additionally, the normalization completely disrupts the decay property of RoPE's attention scores with respect to token distances. This suggests that the locality induced by long-distance decay is not critical for length generalization.
+
+\section{Related Work}
+\textbf{Frequency-Domain Embedding.}
+Discrete Fourier Transform (DFT) \citep{oppenheim1982signal} has been widely used in various areas having periodic signals \citep{edfors2000analysis, sanchez2010cluster}.
+In machine learning, \citep{uteuliyeva2020fourier, lin2024cyclenet, tancik2020fourier, tamkin2020language, lee2022fnet, gillman2024fourier} employed Fourier features into neural networks to enhance performance on NLP or CV tasks.
+S4 \citep{gu2021efficiently} also leveraged FFT and IFFT to shift its core computation into the frequency-domain, delivering more efficient computation.
+\citep{wang2019encoding, su2024roformer} improved the attention mechanism by defining position embedding with complex number, while "phase" used in these methods is a typical concept in frequency-domain.
+
+\textbf{Length Generalization.}
+Due to resource constraints, LMs are trained on limited-length corpus chunks and struggle with longer contexts \citep{voita2023neurons, dong2024exploring, hong2024token}.
+While absolute position embeddings \citep{vaswani2017attention} restrict the general use of positional information, methods as \citep{shaw2018self, yang2019xlnet} directly adjust the attention mechanism, 
+another intuitive method is to redesign the position embedding \citep{press2021train, chi2022kerple, kazemnejad2024impact, su2024roformer, wang2024length, choromanski2024learning}. 
+Among these, RoPE \citep{su2024roformer} encodes positional information using the phase of complex numbers, leveraging their periodicity to enhance access to long-distance dependencies.
+Several training-free or fine-tuning-based methods can also improve the LM's length generalization by refining RoPE \citep{peng2023yarn,chen2024clex,jin2024llm,lin2024mixture}. However, these works mainly address the drawbacks of RoPE in attention mechanism, neglecting the influence of other components in LMs.
+
+\section{Conclusion}
+
+In this paper, we analyze RoPE-based attention by modeling it in the frequency domain using \textit{Discrete Signal Processing (DSP)} theory. 
+Our analysis reveals that RoPE achieves periodic attention by implicitly performing \textit{Non-Uniform Discrete Fourier Transform (NUDFT)}, corrupted by the non-ideal spectrum properties brought by other parts in LMs.
+We propose \textbf{\textit{Fourier Position Embedding (FoPE)}} to enhances attention's periodic extension and length generalization. FoPE models each dimension as Fourier Series and zero-out inadequately-trained frequency components. Experiments demonstrate that FoPE significantly improves length generalization compared to baselines across diverse tasks and datasets. Our ablation studies and visualizations provide further support for our method and theoretical modeling.
+
+\section{Limitations}
+Our DSP-based modeling in the frequency domain provides a novel perspective for LMs to enhance length generalization and explore broader applications, such as kv-cache compression and multi-model collaboration.
+However, our work only pay attention to the undesirable frequency domain properties hindering length generalization. Extending the applicability of this modeling to areas such as other tasks may require additional effort. 
+
+\section{Discussion}
+Recently, we found \citet{barbero2024round} and \citet{chen2024hope} also mentioned the need to zero-out the relatively low-frequency components in RoPE. While our work focus on the improvement of attention's robustness in frequency domain, with "zeroing-out" being only a sub-method, these works focus entirely on this sub-method driven by different motivations.
+
+\citet{barbero2024round} visualized attention patterns to show that low-band and high-band frequencies correspond to semantic and positional information, respectively. To bring a more robust semantic channel, they truncate the low-band components to zero-frequency. 
+However, they did not analyses the effectiveness of their method on length generalization and pre-training phase. 
+
+\citet{chen2024hope} claimed that the relatively low-frequency components bring U-shape attention pattern, which is harmful for length generalization. However, they provided insufficient evidence linking the U-shape pattern to length generalization. Also, they claimed that their method relies on high-band frequencies, which is factually incorrect, as the highest frequency in RoPE remains within the low-band of discrete frequency domain (shown in Appendix \ref{appendix:lowpass}). 
+
+In contrast, we demonstrate that the \textit{Spectrum Damage} is a key factor in ineffective length generalization for RoPE-based Transformer, supported by both theoretical and empirical evidence. Thus, we propose FoPE to improve the robustness of attention in the frequency domain, leading to better length generalization.
+
+\newpage
+
+\end{document}

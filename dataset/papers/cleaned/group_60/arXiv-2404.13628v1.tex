@@ -1,0 +1,488 @@
+\title{Mixture of LoRA Experts}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+Low-Rank Adaptation (LoRA)~\citep{lora} has emerged as a pivotal technique for fine-tuning large pre-trained models, renowned for its efficacy across a wide array of tasks. The modular architecture of LoRA has catalyzed further research into the synergistic composition of multiple trained LoRAs, aiming to amplify performance across various tasks. However, the effective composition of these trained LoRAs presents a formidable challenge:
+(1) Linear arithmetic composition can lead to the diminution of the generative capabilities inherent in the original pre-trained models or the distinctive attributes of the individually trained LoRAs, potentially resulting in suboptimal outcomes.
+(2) Reference tuning-based composition exhibits limitations in adaptability and incurs significant computational costs due to the requirements to retrain a large model.
+In response to these challenges, we propose \textbf{M}ixture \textbf{o}f \textbf{L}oRA \textbf{E}xperts (\textbf{\our{}}). 
+\our{} treats each layer of trained LoRAs as a distinct expert and implements hierarchical weight control by integrating a learnable gating function within each layer to learn optimal composition weights tailored specifically to the objectives of a given domain. 
+\our{} not only demonstrates enhanced performance in LoRA composition but also preserves the essential flexibility necessary for effective composition of trained LoRAs with minimal computational overhead. Extensive experiments conducted in both Natural Language Processing (NLP) and Vision \& Language (V\&L) domains validate the effects of \our{}. Our code are available at~\href{https://github.com/yushuiwx/MoLE.git}{\texttt{https://github.com/yushuiwx/MoLE.git}}.
+\end{abstract}
+
+\section{Introduction}
+\begin{wrapfigure}{R}{0.45\textwidth}
+\vspace{-8mm}
+\centering
+\includegraphics[width=\linewidth]{worflow.pdf}
+\vspace{-6mm}
+\caption{\textbf{Workflow of \our{}}. In the training phase, \our{} predicts weights for multiple LoRAs. In the inference phase, \our{} can allocate weights to multiple LoRAs, or, without altering the gating weights, achieve a more flexible LoRA composition by masking out undesired LoRAs and recalculating and distributing weights proportionally.}
+\label{fig:workflow}
+\vspace{-5mm}
+\end{wrapfigure}
+Recent advances in deep learning have been driven by large-scale pre-trained models such as OPT~\citep{opt}, LLaMA~\citep{llama} in the Natural Language Processing~(NLP) domain and CLIP~\citep{clip}, DALL·E 2~\citep{dell2} in the Vision \& Language~(V\&L) domain.
+These models show outstanding performance across various tasks when fine-tuned on down-stream datasets, but their increasing size entails significant computational costs for full fine-tuning.
+\begin{figure*}[t]
+\centering
+\includegraphics[width=\linewidth]{LoRA_fusion.pdf}
+\\
+\makebox[0.32\linewidth]{(a)}
+\makebox[0.32\linewidth]{(b)}
+\makebox[0.32\linewidth]{(c)}
+\vspace{-2mm}
+\caption{Overview of LoRA composition methods:~(a) Linear arithmetic composition (Eq.\ref{Eq.Normalize-Combination}), which commonly applies the same composition weight $\boldsymbol{W}_i$ to all layers of the $i^{th}$ LoRA. (b) Reference tuning-based composition involves retraining a large model by integrating outputs from multiple LoRAs using manually-crafted mask information. (c) Our \our, which learns a distribution $\Upsilon^{j}$ for the $j^{th}$ layer of LoRAs to determine the composition weight $\boldsymbol{W}^{j}_i$.}
+\label{fig:main_motivation}
+\vspace{-3mm}
+\end{figure*}
+To mitigate this, LoRA~\citep{lora} is introduced.
+By freezing the pretrained model weights and injecting trainable rank decomposition matrices, LoRA is proven to be an effective fine-tuning methodology in scenarios with constrained computational resources~\citep{lester2021power,an2022input}.
+
+While LoRA serves as plug-and-play plugins for pre-trained models, recent initiatives explores the composition of separate trained LoRAs to achieve joint generation of learned characteristics~\citep{huang2023lorahub,zhang2023composing,ruiz2023dreambooth}. However, these efforts may encounter several challenges.
+As shown in Figure~\ref{fig:main_motivation} (a), linear arithmetic composition~\citep{zhang2023composing,huang2023lorahub,han2023svdiff} composes trained LoRAs directly. However, composing multiple LoRAs (typically $\geq$ 3) can impair the generative performance of pre-trained models. To mitigate this, weight normalization is applied prior to the composition, but may erase the unique characteristics of individual trained LoRAs as the composing weight of each LoRA is reduced (refer to Observation 1 in \S~\ref{Sec:Observation}). 
+Another approach, as depicted in Figure~\ref{fig:main_motivation} (b), known as reference tuning-based composition~\citep{gu2023mix}, is tailored for the V\&L domain and achieves superior performance. However, it is limited in terms of LoRA flexibility due to the utilization of manually-designed masks and involves substantial training costs, necessitating a full model retraining.
+In light of the above situation, an important question arises:
+
+\begin{tcolorbox}[colback=gray!20, colframe=gray!50, sharp corners, center title]
+\centering
+\textit{\small How can multiple trained LoRAs be composed dynamically and efficiently, while preserving \\ all their individual characteristics?}
+\end{tcolorbox}
+
+To address that issues, we introduce \textbf{M}ixture \textbf{o}f \textbf{L}oRA \textbf{E}xperts~(\textbf{\our{}}). Recognizing that individual layers of a trained LoRA exhibit distinct characteristics, which collectively define the overall characteristic of the trained LoRA (refer to Observation 2 in \S~\ref{Sec:Observation}), \our{} involves modulating the weights of different trained LoRAs within each layer, which we refer to as ``hierarchical weight contro''. As shown in Figure~\ref{fig:main_motivation}~(c), \our{} views each layer of trained LoRAs as a individual expert and incorporates a gating function within each layer to learn the optimal composition weights based on a specified domain objective. This dynamically enhances desirable characteristics while mitigating less favorable ones, ultimately achieving a more effective composition of LoRAs and prevents the loss of desirable LoRA characteristics that may occur in linear arithmetic composition.
+
+Additionally, unlike reference tuning-based composition~\citep{gu2023mix}, our \our{} maintains flexibility in composing multiple trained LoRAs with reduced computational costs.
+As the workflow of \our{} shown in Figure~\ref{fig:workflow}, during training, \our{} learns the gating function for multiple trained LoRAs and keep all other parameters frozen, resulting in minimal computational costs. During inference, \our{} has two inference modes:
+In the first mode, \our{} utilizes all trained LoRAs with the learned gating function, preserving their individual characteristics with allocated weights.
+During the second mode, \our{} allows manual masking of unwanted LoRAs and recalculates and distributes weights proportionally without the need for retraining.
+These two modes enable \our{} to adapt to different scenarios, providing a versatile and flexible approach for effective LoRA composition.
+
+We validate the effects of \our{} in both NLP and V\&L domains. Our findings, encompassing both qualitative and quantitative results, demonstrate that \our{} outperforms existing LoRA composition approaches.
+The contributions of our paper are the following:
+\begin{itemize}
+\vspace{-1mm}
+    \item We introduce a significant and intricate problem: how to dynamically and efficiently compose multiple trained LoRAs while preserving all their individual characteristics, to further investigate the applicability of LoRA in real-world scenarios.
+    \item We introduce Mixture of LoRA Experts (\our{}), a method that achieves a more efficient and flexible composition of multiple trained LoRAs by employing hierarchical weight control through learnable gating functions within each layer of trained LoRAs.
+    \item Extensive experiments on both V\&L and NLP domain demonstrate that \our{} can enhance LoRA composition performance and mitigates issues associated with existing composition methods.
+\end{itemize}
+
+\section{Background}
+
+\subsection{LoRAs Composition}
+\label{Sec:LoRA Merging}
+LoRA~\citep{lora} is a parameter-efficient fine-tuning method to adapt large models to novel tasks and shows superior performance~\citep{lora,huang2023lorahub,zhang2023composing,sung2022vl}.
+In practical applications, a individual LoRA often fall short of meeting user expectations. A common solution is to compose multiple trained LoRAs, each specialized in specific aspects (e.g., clothing or facial features), with the aim of creating a comprehensive character representation.
+Research on LoRA composition is limited and primarily concentrates on two distinct methodologies as follows:
+
+\noindent\textbf{Linear arithmetic composition}. 
+As shown in Figure~\ref{fig:main_motivation}~(a), the most commonly employed composition method is directly composing multiple LoRAs,~i.e., 
+\begin{equation}
+\vspace{-1mm}
+\hat{\boldsymbol{W}} = \boldsymbol{W} + \sum_{i=1}^N \Delta \boldsymbol{W}_i, 
+\vspace{-1mm}
+\label{Eq.Direcly-Combination}
+\end{equation}
+where $\boldsymbol{W}$ indicates the original parameter of pre-trained model and $\Delta\boldsymbol{W}_i$ denotes the $i^{th}$ trained LoRA.
+However, this manner may affect the original weight $\boldsymbol{W}$ when $N$ increasing, thereby diminishing the model's generative capabilities.
+So, it is common practice to normalize the composition weights, termed as normalized linear arithmetic composition, ~i.e., 
+\begin{equation}
+\vspace{-1mm}
+\hat{\boldsymbol{W}} = \boldsymbol{W} + \sum_{i=1}^N w_i \cdot \Delta \boldsymbol{W}_i,
+\vspace{-1mm}
+\label{Eq.Normalize-Combination}
+\end{equation}
+where $\sum_{i=1}^N w_i = 1$. This manner prevents any adverse impact on the embedding of the original model, but leading to the loss of individual LoRA characteristics, as the composing weight $w_i$ for each trained LoRA is reduced~\citep{gu2023mix}. 
+
+In NLP domain, PEMs~\citep{zhang2023composing} first  define arithmetic operators for LoRA, and explore the effectiveness of composing multiple LoRAs in several scenarios. LoRAhub~\citep{huang2023lorahub} utilizes a gradient-free manner to estimate the composition weights of trained LoRAs and achieves adaptable performance on unseen tasks. In V\&L domain, SVDiff~\citep{han2023svdiff} introduces a arithmetic-based manner to compose multiple visual concepts into a single image.
+
+\noindent\textbf{Reference tuning-based composition}. As shown in Figure~\ref{fig:main_motivation}~(b), reference tuning-based composition~\citep{gu2023mix} tackles the limitations of linear arithmetic composition by introducing gradient fusion and controllable sampling. However, it suffers from compositional inflexibility due to manually designed masks, which necessitates retraining when incorporating different LoRAs or creating new masks. Moreover, this approach entails retraining large models, resulting in substantial computational costs.
+
+It is important to note that reference tuning-based composition relies on position masks, which distinguishes it from our model. Consequently, direct comparisons may not be appropriate due to the fundamentally different underlying principles. Therefore, our primary focus in this paper is to compare \our{} with linear arithmetic composition.
+
+\subsection{Mixture-of-Experts}
+Mixture-of-Experts~(MoE)~\citep{moec} is a promising approach to scale up the number of parameters within the same computational bounds. 
+Different from standard transformer models, each MoE layer consists of $N$ independent feed-forward networks $\{\boldsymbol{E}_i\}^{N}_{i=0}$ as the experts, along with a gating function $\alpha \left(\cdot\right)$ to model a probability distribution indicating the weights over these experts' outputs.
+For the hidden representation $\boldsymbol{h} \in \mathbb{R}^{d}$ of input token, the gate value of routing $\boldsymbol{h}$ to expert $\boldsymbol{E}_i$ is denoted as:
+\begin{equation}
+\vspace{-2mm}
+\alpha \left(\boldsymbol{E}_i\right) = \exp\left(\boldsymbol{h}\cdot\boldsymbol{e}_i\right) / \sum_{j=0}^{N}\exp\left(\boldsymbol{h}\cdot\boldsymbol{e}_j\right),
+\end{equation}
+where $\boldsymbol{e}_i$ denotes the trainable embedding of $\boldsymbol{E}_i$. Then, the corresponding $k$ experts, according to the top-$k$ gated values, are activated and the output $\boldsymbol{O}$ of the MoE layer is
+\begin{equation}
+\vspace{-2mm}
+\boldsymbol{O} = \boldsymbol{h} + \sum_{i=0}^{N}\alpha \left(\boldsymbol{E}_i\right) \cdot \boldsymbol{E}_i\left(\boldsymbol{h}\right).
+\vspace{-2mm}
+\end{equation}
+
+\begin{figure*}[!tb]
+\centering
+\includegraphics[width=\linewidth]{main_motivations.pdf}
+\vspace{-2mm}
+\caption{\textbf{Left:} Results of (a) linear arithmetic composition~(Eq.~\ref{Eq.Direcly-Combination}) and~(b) normalized linear arithmetic composition~(Eq.~\ref{Eq.Normalize-Combination}) based on Dreambooth~\citep{ruiz2023dreambooth}. \textbf{Right:} Visualization of the effects for different layers in LoRA by selectively activating specific parameters from the network, moving from the beginning to the end. 
+}
+\label{fig:Observation}
+\vspace{-4mm}
+\end{figure*}
+
+\section{Method}
+In this section, we first introduce some motivating observations in \S~\ref{Sec:Observation}. Then, we introduce the structure details and training objectives of \our{} in \S~\ref{Sec:MOLE} and \S~\ref{Sec:training}, respectively.
+\subsection{Motivating Observation}
+\label{Sec:Observation}
+
+\begin{tcolorbox}[colback=gray!20, colframe=gray!50, sharp corners, center title]
+\textit{\small \textbf{Observation 1}: \textit{Directly composing multiple trained LoRAs~(Eq.~\ref{Eq.Direcly-Combination}) impacts the model's generative ability, whereas applying weight normalization~(Eq.~\ref{Eq.Normalize-Combination}) preserves this capacity but may sacrifice LoRA characteristics.}}
+\end{tcolorbox}
+
+Specifically, in V\&L domain, as depicted in left of Figure~\ref{fig:Observation}, we observe that directly composing multiple trained LoRAs into the original embedding led to significant parameter variations, resulting in meaningless output. Furthermore, when normalization was applied, some of the original characteristics of these trained LoRAs are indeed compromised. These observations align with those elaborated upon in~\citep{gu2023mix}.
+
+In NLP domain, when composing four or more LoRAs within the FLAN-T5~\citep{flant5} model, we observed that the model's output became disordered.
+Furthermore, implementing weight normalization for LoRAs trained across five datasets, as presented in Table~\ref{tb: NLP_motivation1}, led to a decreased performance of the composition model. This suggests that while weight normalization preserves generative capacity, it adversely affects the intrinsic qualities of these trained LoRAs.
+
+\begin{tcolorbox}[colback=gray!20, colframe=gray!50, sharp corners, center title]
+\textit{\small \textbf{Observation 2}: \textit{Individual layers of a trained LoRA exhibit unique traits, which cumulatively define the LoRA's overall attributes.}}
+\end{tcolorbox}
+
+Inspired by the findings of~\citep{voynov2023p+}, which revealed that different layers in text-to-image models govern various attributes, such as style and color, we investigate the features learned by different layers within LoRA.
+In V\&L domain, as illustrated in the right of Figure~\ref{fig:Observation}, we observed that different layers of LoRA encode distinct features, such as dog coat color and facial features.
+In NLP domain, we trained a single LoRA on a combined dataset comprising ANLI-R1~\citep{ANLI}, ANLI-R2~\citep{ANLI}, and QNLI~\citep{QNLI} datasets, as depicted in Table~\ref{tb: NLP_motivation2}. Notably, when evaluated on these sub-datasets, we observed significant variations in performance across different layers of this LoRA. Specifically, the layers ranging from 0\% to 20\% performed best on QNLI, the layers spanning from 40\% to 60\% excelled on ANLI-R2, and the layers covering 80\% to 100\% outperformed others on ANLI-R1.
+\begin{wrapfigure}{R}{0.45\textwidth}
+\vspace{-10mm}
+\centering
+\includegraphics[width=\linewidth]{main_MoLE.pdf}
+\vspace{-6mm}
+\caption{\textbf{Illustration of proposed \our{}}. \our{} employs a learnable gating function that utilizes the outputs of multiple LoRAs at each layer to determine composition weights.}
+\label{fig:Mole_structure}
+\vspace{-13mm}
+\end{wrapfigure}
+This observation inspires that we can dynamically optimizes the layer-specific weights according to a defined domain objective, enhancing desirable characteristics while suppressing less favorable ones, thereby achieving a more effective composition of trained LoRAs.
+
+\subsection{Mixture of Lora Experts}
+\label{Sec:MOLE}
+Drawing inspiration from above observations, we introduce the Mixture of LoRA Experts.
+
+Referring to Figure~\ref{fig:Mole_structure}, consider a transformer block within the pre-trained model, parameterized by $\theta$ (encompassing both the multi-head attention layer and the feed-forward neural network), and a set of corresponding trained LoRAs $\Omega = \{\Delta\theta_i\}^{N}_{i=0}$ where $N$ represents the number of trained LoRA candidates, when given a input $\boldsymbol{x} \in \mathbb{R}^{L\times d}$, the output of the pre-trained model block $\theta$ is presented as $\boldsymbol{F}_{\theta} \in \mathbb{R}^{L\times d}$:
+\begin{align}
+\boldsymbol{x}^{'}_{\theta} &= \boldsymbol{x} + f_{\text{Attn}}\Big(\text{LN}\big(\boldsymbol{x}\big)\big|\theta\Big), \\
+\boldsymbol{F}_{\theta}\big(\boldsymbol{x}\big) &= \boldsymbol{x}^{'}_{\theta} + f_{\text{FFN}}\Big(\text{LN}\big(\boldsymbol{x}^{'}_{\theta}\big)\big|\theta\Big),
+\end{align}
+where $L$ and $d$ indicate the sequence length and the dimension of $\boldsymbol{x}$, respectively. $f_{\text{Attn}}\left(\cdot\right)$ and $f_{\text{FFN}}\left(\cdot\right)$ denotes the multi-head attention layer and feed-forward neural network, respectively. LN refers to layer normalization.
+The output of each LoRA is presented as $\boldsymbol{E}_{\Delta\theta_i}\left(\boldsymbol{x}\right) \in \mathbb{R}^{L\times d}$,
+\begin{align}
+\boldsymbol{x}^{'}_{\Delta\theta_i} &= \boldsymbol{x} + f_{\text{Attn}}\Big(\text{LN}\big(\boldsymbol{x}\big)\big|\Delta\theta_i\Big), \\
+\boldsymbol{E}_{\Delta\theta_i}\big(\boldsymbol{x}\big) &= \boldsymbol{x}^{'}_{\Delta\theta_i} + f_{\text{FFN}}\Big(\text{LN}\big(\boldsymbol{x}^{'}_{\Delta\theta_i}\big)\big|\Delta\theta_i\Big).
+\end{align}
+
+After that, \our{} applies a learnable gating function $\mathcal{G}\left(\cdot\right)$ to model the optimal distribution of composition weights for outputs of these trained LoRAs.
+Specifically, by taking $\{\boldsymbol{E}_{\Delta\theta_i}\left(\boldsymbol{x}\right)\}_{i=0}^{N}$ as input, $\mathcal{G}\left(\cdot\right)$ first apply concatenation (denoted as $\oplus$) and normalization (for training stability),~i.e.
+\begin{equation}
+    \boldsymbol{E}_{\Omega}\left(\boldsymbol{x}\right) =  \text{Normalization}\Big(\boldsymbol{E}_{\Delta\theta_0}\left(\boldsymbol{x}\right)\, \oplus \,\ldots\, \oplus \,\boldsymbol{E}_{\Delta\theta_{N-1}}\left(\boldsymbol{x}\right)\Big),
+\end{equation}
+where $\boldsymbol{E}_{\Omega}\left(\boldsymbol{x}\right) \in \mathbb{R}^{\xi}$ and $\xi = N\times L\times d$. $\oplus$ indicates the concatenation operation.
+Then we flatten and reduce the $\boldsymbol{E}_{\Omega}\left(\boldsymbol{x}\right)$ to $N$-dimensions by a dot-product operation with the learnable parameter $\boldsymbol{e} \in \mathbb{R}^{\xi \times N}$ in the gating function $\mathcal{G}\left(\cdot\right)$, 
+\begin{equation}
+\varepsilon = \text{Flatten}\Big(\boldsymbol{E}_{\Omega}\left(\boldsymbol{x}\right)\Big)^{\top} \cdot \boldsymbol{e}, \quad \varepsilon \in \mathbb{R}^{N},
+\end{equation}
+The gate value for each LoRA is computed as
+\begin{equation}
+\label{EQ. temp}
+\mathcal{G}\big(\varepsilon_i\big) = \frac{\exp\big(\varepsilon_i / \tau\big)}{\sum_{j=1}^{N} \exp\big(\varepsilon_j / \tau\big)},
+\end{equation}
+the temperature scalar $\tau$ is learnable.
+The final output $\Tilde{\boldsymbol{E}}_{\Omega}(\boldsymbol{x})$ of the gating function $\mathcal{G}\left(\cdot\right)$ is obtained by multiplying the output of each LoRA expert with the corresponding gating values, presented as
+\begin{equation}
+\Tilde{\boldsymbol{E}}_{\Omega}(\boldsymbol{x}) = \sum_{i=0}^{N}\mathcal{G}_i\left(\varepsilon_i\right)\cdot\boldsymbol{E}_{\Delta\theta_i}\left(\boldsymbol{x}\right),
+\end{equation}
+in which $\Tilde{\boldsymbol{E}}_{\Omega}(\boldsymbol{x}) \in \mathbb{R}^{L\times d}$ and $\mathcal{G}_i\left(\cdot\right)$ represents the weight of the $i^{th}$ trained LoRA. So, the final output of this block is computed by adding the output of the gating function to the output of the pre-trained network:
+\begin{equation}
+\boldsymbol{O}\left(\boldsymbol{x}\right) = \boldsymbol{F}_{\theta}\left(\boldsymbol{x}\right) + \Tilde{\boldsymbol{E}}_{\Omega}\left(\boldsymbol{x}\right).
+\end{equation}
+Besides, we conducted an exploration of \our's performance when employing gating functions at different hierarchical levels~(layer-wise and matrix-wise, etc). Please refer to Section~\ref{Sec:detailed_analysis}.
+
+\subsection{Training Objective}
+\label{Sec:training}
+\noindent\textbf{Gating Balancing Loss}.
+As shown in Figure~\ref{fig:gating_imbalance_compare}~(a), we observed that the average entropy of the distribution probabilities from the gating functions gradually decreases as the number of training steps increases,~i.e., the gating function tends to converge to a state where it always produces large weights for a early-stage well-performing LoRA~(e.g., shown in Figure.~\ref{fig:gating_imbalance_compare}~(b), 68\% gating probability for LoRA $\beta$ among three LoRAs), leading to only a handful of LoRAs having a significant impact in the end and a loss of the characteristics of other LoRAs.
+\begin{wrapfigure}{R}{0.45\textwidth}
+\vspace{-10mm}
+\centering
+\includegraphics[width=0.6\linewidth, height=0.6\linewidth]{gating_imbalance_compare.png}
+\hspace{-5mm}
+\includegraphics[width=0.39\linewidth, height=0.6\linewidth]{gating_imbalance_bar_compare.png}
+\\
+\vspace{-1mm}
+\makebox[0.6\linewidth]{\small (a)}
+\hspace{-5mm}
+\makebox[0.39\linewidth]{\footnotesize (b)}
+\vspace{-2mm}
+\caption{(a) The average gating entropy of all gating functions varies with the training steps. (b) The average weight distribution (\%) of three LoRAs w and w/o $\mathcal{L}_{\text{balance}}$.}
+\label{fig:gating_imbalance_compare}
+\vspace{-14mm}
+\end{wrapfigure}
+To alleviate this, we propose a gating balancing loss $\mathcal{L}_{\text{balance}}$ as
+\begin{equation}
+ \mathcal{L}_{\text{balance}} = - \log\left(\prod_{i=0}^{N} \textbf{q}^{(i)}\right),
+\end{equation}
+where 
+\begin{equation}
+\textbf{q}^{(i)} = \frac{1}{M}\sum_{k=1}^M \frac{\exp\left(\varepsilon_i^k / \tau\right)}{\sum_{j=1}^{N} \exp\left(\varepsilon_j^k / \tau\right)},
+\end{equation}
+and $M$ represents the number of blocks where gating functions are placed and $N$ denotes the number of LoRAs. This balanced loss encourages balanced gating because it is minimized when the dispatching is ideally balanced.
+
+\noindent\textbf{Domain-specific Loss}. 
+Additionally, for adaptation to different domains, we employ distinct domain-specific training objectives denoted as $\mathcal{L}_{\text{D}}$.
+In V\&L domain. we employ unsupervised training with both local and global guidance from CLIP~\citep{radford2021learning} to optimize \our{}.
+In NLP domain, we follow the loss function in FLAN-T5~\citep{flant5}.
+\begin{table*}[t]
+\centering
+\setlength{\tabcolsep}{6pt}
+\caption{Text-alignment and image-alignment results for multiple LoRAs composition in CLIP feature space. NLA denotes normalized linear arithmetic composition (Eq.~\ref{Eq.Normalize-Combination}). The best performance is in bold.}
+\vspace{-3mm}
+\resizebox{\linewidth}{!}{
+\begin{tabular}{cccc|ccc|ccc|ccc}
+\toprule[1pt]
+\# Visual Concepts & \multicolumn{3}{c}{Text-alignment} & \multicolumn{3}{c}{\shortstack[c]{Image-alignment, \\ (Concept 1)}} & \multicolumn{3}{c}{\shortstack[c]{Image-alignment, \\ (Concept 2)}} & \multicolumn{3}{c}{\shortstack[c]{Image-alignment, \\ (Concept 3)}} \\
+ \cmidrule(lr){2-4} \cmidrule(lr){5-7} \cmidrule(lr){8-10} \cmidrule(lr){11-13}
+ & NLA & SVDiff & \our & NLA & SVDiff & \our & NLA & SVDiff & \our & NLA & SVDiff & \our \\
+\midrule
+\small Fancy boot + Monster + Clock & 0.754 & 0.742 & 0.832%
+& 0.781 & 0.758 & 0.784 %
+& 0.791 & 0.749 & 0.801 %
+& 0.763 & 0.812 & 0.809 \\
+
+\small Emoji + Car + Cartoon & 0.610 & 0.607 & 0.696 %
+& 0.619 & 0.734 & 0.839 %
+& 0.711 & 0.702 & 0.709 %
+& 0.652 & 0.686 & 0.679 \\
+
+\small Vase + Wolf plushie + Teapot & 0.752 & 0.812 & 0.863 %
+& 0.687 & 0.807 & 0.835 %
+& 0.705 & 0.782 & 0.746 %
+& 0.653 & 0.694 & 0.721 \\
+
+\small White Cat + Wolf plushie + Can & 0.704 & 0.772 & 0.780 %
+& 0.801 & 0.804 & 0.802 %
+& 0.678 & 0.763 & 0.825 %
+& 0.650 & 0.729 & 0.714 \\
+
+\small Shiny sneaker + Wolf plushie + Teapot & 0.778 & 0.789 & 0.791 %
+& 0.812 & 0.783 & 0.690 %
+& 0.723 & 0.751 & 0.790 %
+& 0.688 & 0.676 & 0.721 \\
+
+\small Car + Wolf plushie + Teapot & 0.635 & 0.681 & 0.684 %
+& 0.652 & 0.763 & 0.713 & %
+0.601 & 0.664 & 0.745 %
+& 0.685 & 0.612 & 0.707 \\
+
+\small Can + Wolf plushie + backpack & 0.601 & 0.782 & 0.754 %
+& 0.653 & 0.705 & 0.767 %
+& 0.602 & 0.755 & 0.782 %
+& 0.681 & 0.738 & 0.723 \\
+
+\small Golden Retriever + Wolf plushie + Teapot & 0.670 & 0.716 & 0.784 
+& 0.713 & 0.784 & 0.790 %
+& 0.601 & 0.802 & 0.809 %
+& 0.678 & 0.761 &  0.748 \\
+
+\small Golden Retriever + Boot + Monster & 0.614 & 0.762 & 0.755%
+& 0.665 & 0.662 & 0.620 %
+& 0.748 & 0.832 & 0.862 %
+& 0.723 & 0.719 & 0.735 \\
+
+\small Backpack dog + Bowl + Teapot & 0.607 & 0.712 & 0.703
+& 0.653 & 0.672 & 0.756 %
+& 0.734 & 0.720 & 0.755 %
+& 0.692 & 0.688 & 0.701 \\
+
+\small Backpack dog + White Cat + Emoji & 0.648 & 0.703 & 0.717
+& 0.674 & 0.692 & 0.812 %
+& 0.719 & 0.741 & 0.701 %
+& 0.742 & 0.720 & 0.796 \\
+
+\small Dog + Wolf + Backpack & 0.717 & 0.738 & 0.722 
+& 0.547 & 0.565 & 0.552 %
+& 0.679 & 0.681 & 0.707 %
+& 0.766 & 0.795 & 0.831\\
+
+\small Cat + Sunglasses + Boot & 0.770 & 0.791 & 0.837 & 0.845 & 0.793 & 0.815 & 0.845 & 0.793 & 0.815 & 0.845 & 0.793 & 0.815 \\
+
+\small Table + Can + Teapot & 0.836 & 0.827 & 0.810 & 0.753 & 0.770 & 0.741 & 0.751 & 0.799 & 0.806 & 0.818 & 0.771 & 0.829 \\
+
+\small Robot + Dog + Clock & 0.663 & 0.638 & 0.693 & 0.689 & 0.764 & 0.797 & 0.645 & 0.674 & 0.710 & 0.661 & 0.715 & 0.717\\
+
+\hc Average & 0.678 & 0.728 & \textbf{0.759}& 0.715 & 0.746 & \textbf{0.783} & 0.682 & 0.731 & \textbf{0.756} & 0.686 & 0.708 & \textbf{0.732} \\
+\bottomrule[1pt]
+\end{tabular}
+}
+\label{tb: VL_main_tab2}
+\vspace{-3mm}
+\end{table*}
+The overall training objective $\mathcal{L}$ is the weighted sum of the above-mentioned two losses, represented as:
+\begin{equation}
+   \mathcal{L} = \mathcal{L}_{\text{D}} + \alpha\mathcal{L}_{\text{balance}},
+\end{equation}
+where $\alpha$ is a coefficient for weight balancing.
+
+\noindent\textbf{Optimization Gating Function Only.}
+We freeze all trained LoRAs and pre-trained model parameters, optimizing only the gating function's parameters. This helps preserve characteristics of trained LoRAs, particularly when training data is limited.
+
+\section{Experiments}
+\label{sec:experiment}
+\subsection{\our{} on V\&L domain}
+\noindent\textbf{Experimental Setup.} For V\&L domain, we apply \our{} to multi-subjects text-to-image generation task and choose DreamBooth~\citep{ruiz2023dreambooth}~(built on Stable Diffusion V2.1) as the base generator. 
+Following the common setting~\citep{han2023svdiff, TI}, where 2 to 3 concepts are typically composed into a new multi-concept image, we conduct experiments by composing three separate trained LoRAs.
+During training \our, we process the image resolution to 512$\times$512 and set learning rate as 1e-5. We use DDPM sampler~\citep{DDPM} with 50 steps in each case and train 400 iterations for each required composition with batch size 2 and $\alpha$ as 0.5.
+
+\noindent\textbf{Metrics and Compared Baselines.} Following~\citep{ruiz2023dreambooth, han2023svdiff}, we evaluate our method on (1) Image alignment. The visual similarity of generated images with the individual composed concepts, using similarity in CLIP~\citep{clip} image feature space, (2) Text-alignment of the generated images with given text prompts, using text-image similarity in CLIP feature space~\citep{clip}. For each composition, we calculated the average scores among 200 generated images per prompt using 5 text prompts.
+We compared our \our{} with normalized linear arithmetic composition (Eq.~\ref{Eq.Normalize-Combination}) and SVDiff~\citep{han2023svdiff}. Additionally, to further validate the effectiveness of \our, we also compare \our{} with state-of-the-art multi-subjects generation methods (full-parameters training based), which can be found in Section~\ref{Sec:detailed_analysis}.
+\begin{table*}[t]
+\centering
+\setlength{\tabcolsep}{4pt}
+\caption{Text-alignment and image-alignment results for multiple LoRA experts composition in CLIP feature space. The best performance is in bold and \underline{the second-best value} is indicated with an underline. NLA denotes normalized linear arithmetic composition (Eq.~\ref{Eq.Normalize-Combination}). \emph{SOTA full-parameter training methods are highlighted by} \textcolor{white}{\colorbox{purple!10}{\quad}}.}
+\vspace{-3mm}
+\resizebox{\linewidth}{!}{
+\begin{tabular}{ccccccccccc}
+\toprule
+\multirow{2}{*}{\shortstack{\# Number of Concepts}} & \multicolumn{5}{c}{Text-alignment} & \multicolumn{5}{c}{Average Image-alignment} \\
+\cmidrule(lr){2-6} \cmidrule(lr){7-11}
+\tiny & NLA & \cellcolor{purple!10} Custom & \cellcolor{purple!10} Textual Inversion & SVDiff & \our & NLA & \cellcolor{purple!10} Custom & \cellcolor{purple!10} Textual Inversion & SVDiff & \our \\
+\midrule
+3 & 0.678 & \underline{0.751} & 0.709 & 0.728 & \textbf{0.759} %
+& 0.694 & \textbf{0.761} & 0.720 & 0.719 & \underline{0.757} \\
+
+4 & 0.681 & \textbf{0.735} & 0.721 & 0.717 & \underline{0.725} %
+& 0.712 & \textbf{0.760} & 0.736 & 0.721 & \underline{0.742} \\
+
+5 & 0.652 & \underline{0.731} & 0.704 & 0.723 & \textbf{0.762} %
+& 0.682 & \textbf{0.798} & 0.710 & 0.708 & \underline{0.737} \\
+
+6 & 0.678 & 0.722 & \textbf{0.735} & 0.709 & \underline{0.727} %
+& 0.698 & 0.721 & \textbf{0.747} & 0.712 & \underline{0.736} \\
+
+\hc Average & 0.672 & \underline{0.734} & 0.717 & 0.719 & \textbf{0.752} & 0.692 & \textbf{0.760} & 0.728 & 0.715 & \underline{0.743} \\
+\bottomrule
+\end{tabular}
+}
+\label{tb: VL_compare_IT_custom}
+\vspace{-5mm}
+\end{table*}
+
+\noindent\textbf{Main Results.} As shown in Table~\ref{tb: VL_main_tab2}, this study involves 15 different compositions of three visual subjects.
+The overall results show that our method significantly outperforms other comparative methods in terms of Text-alignment score, with a 0.031 average improvement compared to SVDiff, as well as the Image-alignment score associated with three visual concepts~(e.g., 0.037 average improvement compared to SVDiff in concept 1), providing evidence of of our \our's superior capability in accurately capturing and depicting the subject information of user-provided images, as well as displaying multiple entities concurrently within a single image.
+Significantly, prior research~\citep{kumari2023multi,gal2022image} indicates a trade-off between Text-alignment and Image-alignment scores in multi-subjects generation. Excelling in both scores is challenging, highlighting the strength of our \our{}.
+Additionally, as shown in Figure~\ref{fig:VL_main_pic},~\ref{fig:VL_main_pic2} and~\ref{fig:VL_main_pic3}, our approach outperforms two other methods in preserving subject fidelity in generated images. The comparative methods often omit a subject, as seen in the NLA composition's failure to include elements like ``cat'' in Figure~\ref{fig:VL_main_pic} (line 2) and ``barn'' in Figure~\ref{fig:VL_main_pic2}, and SVDiff's inability to precisely represent ``dog'' and ``cat'' in Figure~\ref{fig:VL_main_pic2}. Furthermore, while these methods can generate images with three subjects, there's a noticeable leakage and mixing of appearance features, resulting in lower subject fidelity compared to user-provided images. In contrast, our method effectively retains the subjects specified by the user, with each accurately depicted.
+
+\begin{wrapfigure}{R}{0.55\textwidth}
+\vspace{-4mm}
+\centering
+\resizebox{\linewidth}{!}{
+\setlength{\tabcolsep}{3pt}
+\begin{tabular}{lcccc}
+\toprule
+\# Task & Metric & LoRAHub & PEMs & \our\\
+\midrule
+\underline{\textbf{Translation}} \\
+WMT '14 En$\rightarrow$Fr & BLEU & \underline{27.4} & 25.6 & \textbf{29.1} \\
+WMT '14 Fr$\rightarrow$En & BLEU & \underline{29.4} & 27.1 & \textbf{31.3} \\
+WMT '16 En$\rightarrow$De & BLEU & 24.6 & \underline{24.9} & \textbf{27.7} \\
+WMT '16 De$\rightarrow$En & BLEU & \textbf{29.9} & 28.0 & \underline{29.1} \\
+WMT '16 En$\rightarrow$Ro & BLEU & \underline{17.7} & 15.2 & \textbf{18.9} \\
+WMT '16 Ro$\rightarrow$En & BLEU & \underline{23.5} & 21.7 & \textbf{25.1} \\
+\hc Average &  & \underline{25.4} & 24.2 & \textbf{26.9}\\
+\midrule 
+\underline{\textbf{Struct to Text}} \\
+CommonGen & Rouge-1 & \underline{53.7} & 48.8 & \textbf{55.1} \\
+& Rouge-2 & \textbf{23.1} & 22.4 & \underline{23.1} \\
+& Rouge-L & \underline{49.7} & 47.2 & \textbf{53.9} \\
+DART & Rouge-1 & 45.3 & \underline{46.2} & \textbf{48.8} \\
+& Rouge-2 & \underline{22.6} & 18.9 & \textbf{23.5} \\
+& Rouge-L & 35.1 & \textbf{37.6} & \underline{36.0} \\
+E2ENLG & Rouge-1 & \underline{41.1} & 40.7 & \textbf{42.0} \\
+& Rouge-2 & \underline{26.3} & 24.2 & \textbf{29.0} \\
+& Rouge-L & 38.8 & \textbf{42.1} & \underline{41.8} \\
+WebNLG & Rouge-1 & \underline{52.1} & 52.0 & \textbf{54.5} \\
+& Rouge-2 & 23.9 & \underline{24.6} & \textbf{26.8} \\
+& Rouge-L & 45.2 & \underline{47.8} & \textbf{49.3} \\
+\hc Average & & \underline{38.1} & 37.7 & \textbf{40.3} \\
+\midrule
+\underline{\textbf{Closed-Book QA}} \\
+ARC-c & EM & \underline{51.7} & 50.4 & \textbf{52.9} \\
+ARC-e & EM& \underline{69.7} & 65.7 & \textbf{70.3} \\
+NQ & EM& \underline{17.3} & 16.1 & \textbf{23.5} \\
+TQA & EM & \textbf{54.5} & 53.9 & \underline{54.0} \\
+\hc Average & & \underline{48.3} & 46.5 & \textbf{50.2} \\
+\midrule 
+\underline{\textbf{Big-Bench Hard~(BBH)}} \\
+Boolean Expressions & EM & \underline{55.1} & 53.0 & \textbf{57.3} \\
+Causal Judgement & EM & \underline{57.6} & 51.1 & \textbf{57.9} \\
+Date Understanding & EM & \textbf{31.0} & 29.3 & \underline{30.7} \\
+Disambiguation & EM & 46.6 & \underline{47.2} & \textbf{49.3} \\
+Penguins in a Table & EM & \underline{41.4} & 39.8 & \textbf{45.0} \\
+Reasoning Objects & EM & \underline{35.2} & \textbf{37.5} & 33.7 \\
+Ruin Names & EM & \underline{19.9} & 19.3 & \textbf{21.2} \\
+\hc Average &  & \underline{38.4} & 33.2 & \textbf{42.2} \\
+\midrule 
+\underline{\textbf{Natural Language Inference~(NLI)}} \\
+ANLI-R1 & EM & \underline{81.0} &  80.3 & \textbf{82.7} \\
+ANLI-R2 & EM & \underline{80.9} & 80.2 & \textbf{82.4} \\
+ANLI-R3 & EM & \underline{77.4} & 76.6 & \textbf{78.9} \\
+QNLI & EM & 77.6 & \underline{78.0} & \textbf{78.1}\\
+\hc Average &  & \underline{79.2} & 78.8 & \textbf{80.5}\\
+\bottomrule
+\end{tabular}
+}
+\vspace{-2mm}
+\captionof{table}{Evaluation results on Translation, Struct to Text, Closed-Book QA, NLI and BBH. The \textbf{best value} is in bold and \underline{the second-best value} is underlined.}
+\label{tab:NLP_Main}
+\vspace{-15mm}
+\end{wrapfigure}
+\subsection{\our{} on NLP domain}
+\noindent\textbf{Experimental Setup.} For NLP domain,~following~\citep{huang2023lorahub}, we employ Flan-T5~\citep{flant5} as our chosen LLM and created several LoRAs based on FLAN datasets. 
+We conducted extensive experiments across various tasks, including Translation, Natural Language Inference~(NLI), Struct to Text, Closed-Book QA, and multiple subtasks within the Big-Bench Hard (BBH)~\citep{ghazal2013bigbench} dataset.
+We train 800 iterations for each required composition of LoRAs with an initial learning rate of 1e-5, batch size 12 and $\alpha$ as 0.5.
+
+\noindent\textbf{Compared Baselines.} We compared our \our{} with recently released state-of-the-art LoRA composition methods: LoRAhub and PEMs.
+
+\noindent\textbf{Main Results.} The corresponding experimental results are encapsulated in the Table~\ref{tab:NLP_Main}. In summary, our \our{} surpasses state-of-the-art LoRA composition methods on five distinct datasets. Notably, on the BBH dataset, our \our{} achieves an average performance improvement of 3.8 over LoRAHub and outperforms PEMs by a notable margin of 9.0.
+Furthermore, in the realm of generation tasks, specifically in Translation and Struct to Text categories, \our{} consistently outshines its counterparts. In the Translation task set, it surpasses LoRAHub by an average margin of 1.5 and PEMs by 2.7. Correspondingly, within the Struct to Text task set, our model boasts an average performance superiority of 2.1 over LoRAHub and 2.6 over PEMs. These findings underscore the efficacy and versatility of our \our{} in handling language generation tasks.
+
+\section{Analysis}
+\label{Sec:detailed_analysis}
+\vspace{-1mm}
+\noindent\textbf{The effectiveness of gating balancing loss}. Figure~\ref{fig:gating_imbalance_compare} (a) and (b) illustrate how our $\mathcal{L}_{\text{balance}}$ function mitigates the reduction in entropy rates within gating functions, leading to a more uniform composition weight distribution.
+The performance comparison between \our{} and \our{} $_{w/o~\mathcal{L}_{\text{balance}}}$ in Table~\ref{tb: NLP_tempare} underscores the performance enhancement achieved with the inclusion of $\mathcal{L}_{\text{balance}}$.
+Additionally, we conducted an experiment wherein we solely increased the temperature $\tau$ in Eq.~\ref{EQ. temp}, as an alternative to adding $\mathcal{L}_{\text{balance}}$. Results in Table~\ref{tb: NLP_tempare} shows declining performance in \our{} variants \our$^{\tau_1}$, \our$^{\tau_2}$, \our$^{\tau_3}$ ($\tau_1 \prec \tau_2 \prec \tau_3$) with increasing temperature. While temperature rise addresses gating imbalance, it restricts dynamic LoRA exploration in \our, leading to inferior outcomes.
+
+\noindent\textbf{Further comparison with SOTA multi-concept generation methods}. In the absence of comparable LoRA composition methods in the V\&L domain, we incorporated two leading multi-concept generation algorithms that do not utilize LoRA: Custom~\citep{kumari2023multi} and Textual Inversion~\citep{TI}, both of which emphasize full-parameter training for enhanced results.
+As presented in Table~\ref{tb: VL_compare_IT_custom}, \our{} outperforms Textual Inversion in both image and text alignment and excels over Custom in text alignment. Furthermore, it's worth noting that our MoLE is more lightweight compared to these full-parameter training methods. These comparisons underscore the superior effectiveness of our MoLE relative to methods that involve extensive parameter tuning.
+
+\noindent\textbf{Scale to a larger number of LoRAs}. We explore the performance as the number of LoRAs increases. 
+In the NLP domain, experiments were conducted with varying numbers of LoRA (8, 24, 48, 128), as detailed in Table~\ref{tb: NLP_large_number_lora}. Our \our{} demonstrated optimal performance across these configurations, notably excelling with larger LoRA counts of 48 and 128, surpassing LoRAHub by \textbf{2.5} and \textbf{3.0}, respectively. Analysis revealed that LoRAHub's optimization algorithm often zeroes out many LoRA weights in larger arrays, thus underutilizing the potential of all LoRA. Conversely, \our{} effectively overcomes this limitation. However, all methods, including \our, showed performance declines with an extremely large number of LoRA (128), highlighting a need for further research in this area.
+In the V\&L domain, Table~\ref{tb: VL_large_lora} shows experiments with increased composed LoRAs. While typical composition involve 3-4 visual concepts, our range was 3-6 to avoid ambiguity in outputs. Results indicate that \our{} consistently outperforms other LoRA composition models in text and image alignment as the number of LoRAs increases, underscoring its robustness and superior composition capabilities.
+
+\noindent\textbf{Coarse-to-fine gating analysis}. To examine the impact of different granularity levels in gating functions, we delineated four levels in \our: matrix-wise (\our, gating at the parameter matrix level), layer-wise (\our), block-wise (\our), and network-wise (\our), abbreviated as m-\our, l-\our, b-\our, and n-\our{} respectively.
+Table~\ref{tb: c-to-f MOLE} reveals that intermediate granularities, b-\our{} and l-\our, achieved the highest performance. In contrast, the coarsest level, n-\our, which involves minimal optimizable parameters (a single gating for the entire network), showed suboptimal outcomes.
+Additionally, the finest granularity, m-\our, underperformed, potentially due to its excessive control interfering with inherent relationships in LoRA parameters.
+
+\noindent\textbf{Generalization to new datasets}. To further validate the effectiveness of our \our, we conducted generalization experiments. Specifically, all LoRA candidates and LoRA composition variants, including \our, PEMs and LoRAHub, were trained on NLI tasks~(ANLI-R1, ANLI-R2, ANLI-R3, QNLI, and WNLI, among others). Subsequently, we evaluated these methods on the BBH dataset.
+As illustrated in Table~\ref{tab:NPL_generalization}, our \our{} achieves an average performance advantage of 2.4 over LoRAHub and 3.7 over PEMs, underscoring its superior generalization ability.
+
+\noindent\textbf{Flexibility of \our}. As discussed in Section~\ref{Sec:LoRA Merging}, a well-designed LoRA composition method should not only achieve effective LoRA composition but also retain the characteristics of individual LoRA. It should be versatile enough to function as a standalone LoRA generator, ensuring its practical applications are flexible and widespread.
+Figure~\ref{fig:retain_ability} displays a comparison of the qualitative results for the retaining ability of several composition methods, we find that our \our{} can generate images that closely resemble the original features of the LoRA experts (e.g., dog ears, the color of the backpack), while other composition methods tend to produce confusion and loss of LoRA characteristics.
+Besides, as shown in Figure~\ref{fig:workflow}, we can also degrade \our{} by masking out the LoRA experts we do not wish to use, transforming it into a \our{} that merges fewer LoRAs without affecting the composition effect of the remaining LoRAs. As shown in Figure~\ref{fig:retain_ability2}, our \our{} can achieve the same flexible LoRA composition as linear arithmetic composition method without altering the weights of \our{}, while reference tuning-based composition~\citep{gu2023mix} can not accomplish.
+
+\noindent\textbf{Hierarchical control analysis}. \our{} aims to achieve improved LoRA composition effects through finer-grained hierarchical control. As illustrated in the Figure~\ref{fig:gating_div_vis}, we visualize the weight distributions assigned by the gating functions learned by \our{} at different levels in both NLP and V\&L domains. 
+We observe that \our{} adaptively assigns weights to different LoRA experts at various layers. Consequently, finer-grained weight combination methods lead to superior results.
+
+\vspace{-1mm}
+
+\section{Conclusion and Limitations}
+\vspace{-2mm}
+In this study, we introduce the Mixture of LoRA Experts (\our) as a versatile and dynamic approach for composing multiple trained LoRAs. The key innovation of \our{} lies in its learnable gating functions, which utilize the outputs of multiple LoRAs at each layer to determine composition weights. Our comprehensive evaluation in both the both NLP and V\&L domains establishes that \our{} outperforms existing LoRA composition methods.
+
+\noindent\textbf{Limitations}. As described in Section~\ref{Sec:detailed_analysis}, when the number of LoRAs increases to a very large value (e.g., 128), despite our \our~exhibiting superior performance, the performance of all LoRA composition methods, including our \our, tends to decrease. This suggests that our \our~still faces challenges when performing large-scale LoRA composition. It also highlights the significance of researching better approaches for handling large-scale LoRA composition effectively.
+
+\clearpage
+
+\end{document}

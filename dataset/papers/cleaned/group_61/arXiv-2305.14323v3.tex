@@ -1,0 +1,513 @@
+\title{ChatCoT: Tool-Augmented Chain-of-Thought Reasoning on\\ Chat-based Large Language Models}
+
+\begin{document}
+
+\maketitle
+\begin{abstract}
+Although large language models (LLMs) have achieved excellent performance in a variety of evaluation benchmarks, they still struggle in complex reasoning tasks which require specific knowledge and multi-hop reasoning.
+To improve the reasoning abilities, we propose \textbf{ChatCoT}, a tool-augmented chain-of-thought reasoning framework for chat-based LLMs (\eg ChatGPT).
+In ChatCoT, we model the chain-of-thought~(CoT) reasoning as multi-turn conversations, to utilize tools in a more natural way through chatting.
+At each turn, LLMs can either interact with tools or perform the reasoning. 
+Our approach can effectively leverage the multi-turn conversation ability of chat-based LLMs, and integrate the thought chain following and tools manipulation in a unified way. 
+Specially, we initialize the early turns of the conversation by the knowledge about tools, tasks, and reasoning format, and propose an iterative \emph{tool-augmented reasoning} step to perform step-by-step tool-augmented reasoning.
+The experiment results on two complex reasoning datasets (MATH and HotpotQA) have shown the effectiveness of ChatCoT on complex reasoning tasks, achieving a 7.9\% relative improvement over the state-of-the-art baseline.
+Our code and data are available at:   \url{https://github.com/RUCAIBOX/ChatCoT}.
+\end{abstract}
+
+\section{Introduction}
+
+Recently, large language models~(LLMs)~\cite{LLMsurvey} have shown great potential as general-purpose task solvers in a variety of real-world applications. 
+With excellent few-shot and zero-shot ability, LLMs, such as  GPT-4~\cite{GPT-4} and LLaMA~\cite{LLaMA},  can even outperform full-data supervised-tuned models on many tasks with suitable prompting strategies. 
+
+Among these prompting strategies, chain-of-thought~(CoT)  prompting~\cite{CoT, zero-shot-cot} has been a prominent approach to eliciting the reasoning abilities of LLMs.  
+It incorporates the intermediate reasoning steps of exemplars into the input prompt, to instruct LLMs to solve a question step by step.  Despite the remarkable improvement by CoT prompting, LLMs still have difficulties in solving complex reasoning tasks that involve specific functionalities, such as arithmetic calculation and information retrieval~\cite{Lu-arxiv-2022-A, Qian-arxiv-2022-Limitations}. 
+To address this issue, external tools (\eg calculator, search engine) have been employed to fulfill the basic  functionalities~\cite{Toolformer,paranjape2023art}, easing the burden of LLMs. 
+With proper interfaces, LLMs can be guided by prompts to manipulate tools when necessary. 
+
+However, as tools are not intrinsically integrated with LLMs, incorporating external tools would have to interrupt the CoT reasoning process of LLMs.  
+Such an issue would become more intractable on complex reasoning tasks that frequently invoke the use of tools.  
+To address it, existing work either relies on LLMs to prearrange the tool use plan for subsequent execution~\cite{Least-to-Most, Self-planning}, or needs to design formal actions pertaining to specific tasks~\cite{Sccessive-Prompting,dsp,jiang2023structgpt}. 
+Despite the effectiveness, the two types of methods still suffer from potential issues: the former one cannot interact with tools after generating the plan,  even seeing obvious mistakes; while the latter one has to frequently switch between reasoning with LLMs and taking actions, hurting the continuity of the CoT reasoning process.
+
+To overcome these disadvantages, we seek a more unified way to integrate CoT reasoning and tool manipulation. 
+As the key idea, we consider tools manipulation by LLMs as the \emph{interaction} between LLMs and tools, in which LLMs send the use requests and tools respond to support specific functions.  
+Further, inspired by the recent progress of ChatGPT-like LLMs (called  \emph{chat-based  LLMs}), we model the interaction process between LLMs and tools as a multi-turn conversation, and leverage the excellent chatting capacities for manipulating tools by LLMs. 
+At each turn, the LLM can freely interact with tools when in need, otherwise perform the reasoning by itself. 
+The conversation continues until the final answer is derived by LLMs. 
+In this process, as chat-based LLMs can well understand the multi-turn context, they can follow the thought chain in the whole conversation and naturally invoke the tools accordingly, thus keeping the continuity of the reasoning process.
+
+To this end, in this paper, we propose ChatCoT, a tool-augmented chain-of-thought reasoning strategy for chat-based LLMs. As the major merit, 
+ChatCoT can perform the CoT reasoning across multi-turn conversation, and freely interact with tools at immediate steps.
+Concretely, we first store the useful knowledge at early turns of the conversation, including tools, tasks, and multi-turn reasoning format, to help LLMs utilize task-specific knowledge to perform reasoning or manipulate tools.
+Then, we iterate a specially designed  \emph{tool-augmented reasoning} step in which LLMs interact with tools, to perform step-by-step tool-augmented reasoning, until obtaining the final answer.
+
+To evaluate the effectiveness, we implement ChatCoT on ChatGPT, and conduct experiments on two complex reasoning benchmarks, \ie MATH~\cite{MATH} and HotpotQA~\cite{HotpotQA}.
+Experimental results show that ChatCoT achieves very promising performance on MATH with 7.9\% relative improvement in average over the SOTA baselines (\ie PHP~\cite{PHP}).
+Besides, our approach can also be integrated with other strategies, \eg self-consistency, and ChatCoT can achieve better performance by incorporating these strategies.
+
+\section{Related Work}
+
+\paratitle{Tool-Augmented Large Language Models.}
+With the large-scale parameters and pre-training corpus, large language models (LLMs) (\eg Flan T5~\cite{flant5}, ChatGPT~\cite{ChatGPT} and LLaMA~\cite{LLaMA}) have demonstrated strong zero-shot and few-shot ability in NLP tasks (\eg language generation, reasoning).
+However, LLMs have still struggled with complex reasoning tasks requiring task-specific knowledge and multi-step reasoning (\eg mathematical problem solving).
+Previous work~\cite{jz1,jz2,wizardmath} has constructed task-specific corpus and utilized continue pre-training and instruction tuning to inject relative knowledge into LLMs and enhance the complex reasoning ability of LLMs.
+In order to further reduce the mistakes made by LLMs, existing methods have explored to augment LLMs with external tools.
+They can be roughly categorized into the following two types.
+The first type of methods~\cite{Atlas, talm, TRICE} train the model parameters to support the utilization of the external tools, where they collect or synthesize the tool-augmented examples to tune the model parameters~\cite{Toolformer, gorilla, toolkengpt}.
+Another type of methods~\cite{PAL, ReAct, carp} utilize carefully designed prompts to guide LLMs to use external tools. They focus on devising proper prompts or tools manipulation ways to select and use tools when necessary~\cite{TaskMatrix, hugginggpt, ReAct}.
+In this work, we follow the second type of methods and propose a tool-augmented chain-of-thought reasoning strategy that can better solve complex reasoning tasks.
+
+\paratitle{Chain-of-Thought Reasoning.}
+To further enhance the reasoning capacity of LLMs, Chain-of-Thought (CoT) prompting strategy~\cite{CoT,zero-shot-cot} has been proposed to guide LLMs to generate intermediate reasoning steps which can boost the performance of LLMs.
+Through special instructions (\eg \emph{``Let us think step by step''}) and in-context exemplars with detailed intermediate reasoning steps, LLMs can perform step-by-step reasoning to reach the final answer.
+Based on CoT, recent work has also proposed several methods to further improve the performance, including problem decomposition~\cite{Least-to-Most, Sccessive-Prompting}, appropriate exemplars selection~\cite{ye2022Complementary, Shi2023Large}, results post-processing~\cite{self-consistency, self-refine, PHP}, and changing the reasoning format~\cite{tree-of-thought, mathchat}.
+However, as the generation process of CoT is one-pass, the utilization of tools in intermediate steps would have to interpret it, hurting the continuity of the generation process.
+In this work, we propose a unified way to integrate CoT reasoning and tool manipulation, which utilizes the excellent multi-turn chatting capacity of LLMs to perform CoT reasoning across multi-turn conversations.
+
+In this section, we present the task setting, then introduce the Chain-of-Though prompting strategy and the tool manipulation in reasoning tasks.
+
+\paratitle{Task Setting.}
+In this work, we focus on improving the reasoning ability of large language models~(LLMs) on complex tasks, \eg solving mathematics competition problems.
+Unlike tasks that can be solved by humans via straightforward skills or tools, complex tasks require advanced knowledge (\eg mathematical theorem) and multi-step reasoning to reach the answer.
+Typically, a complex problem includes three types of texts, namely problem statement, solution text, and answer key, denoted as $Q$, $S$ and $A$, respectively.
+The problem statement $Q$ introduces the background and description of a complex problem, and the solution text illustrates the detailed solving process to obtain the answer key.
+All of them are composed of a sequence of tokens, where each token is either a text word or a mathematical symbol.
+Formally, given the problem statement $Q$, we aim to utilize LLMs to perform multi-step reasoning, to finally generate its accurate answer $A$.
+
+\paratitle{Chain-of-Thought Prompting.}
+To elicit the powerful reasoning ability of LLMs for complex tasks, Chain-of-Thought (CoT) prompt strategy~\cite{CoT} has been widely used to guide LLMs for performing step-by-step reasoning.
+Generally, the CoT prompt consists of few exemplars whose a series of intermediate reasoning steps $\{I_1, \cdots, I_n \}$ are also involved.
+Each exemplar can be denoted as $E=\langle Q, \{ I_1, \cdots, I_n \}, A \rangle$.
+Formally, given the question and few exemplars, a CoT prompt is composed by integrating them as a long input of the LLM, which can prompt the LLM to generate a similar thought chain that leads to the final answer.
+
+\paratitle{Tool Manipulation.}
+\label{tool_manipulation}
+Previous work has revealed that LLMs are struggling with basic functionality (\eg arithmetical calculation~\cite{Toolformer}), which can be solved by using specific external tools (\eg calculator), denoted as $\{T_1, \dots, T_n\}$. 
+To manipulate tools, existing work mostly relies on writing a detailed prompt for describing how to use available tools for the LLM, then incorporates it to guide the selection of useful tools and generate the tool arguments, and finally calls the tool API to obtain the result.
+Following this way, in this work, we focus on three useful tools that have been widely used by humans to solve complex problems:
+
+$\bullet$ \emph{Calculator:} Given a mathematical expression, the calculator can compute the value of it or simplify it according to arithmetic rules (\eg combining like terms and reduction of fractions). 
+
+$\bullet$ \emph{Equation Solver:} Given the equations system and unknown variables, the equation solver can automatically calculate the value of the contained unknown variables through relative algorithms.
+
+$\bullet$ \emph{Retriever:} Given a query, the retriever aims to extract the most relevant information (\eg documents) from a number of candidates. According to the types of the retrieved corpus, it can be implemented by specialized models, \eg dense retrieval model. 
+
+We implement the first two tools by using different functions of \emph{SymPy}~\cite{sympy}, 
+a Python library for mathematical symbolic calculation.
+For the retriever, we adopt SimCSE~\cite{SimCSE}, a sentence embedding model to measure the text semantic similarity.
+Note that when the input expression or equation is ill-formed or unsolved, the above tools would return an error.
+
+    \centering
+    \includegraphics[width=\textwidth]{figure/framework.pdf}
+    \caption{The comparison of vanilla CoT and ChatCoT, illustrated for a mathematical problem. For vanilla CoT, the content underlined are generated by LLMs. For ChatCoT, the conversational knowledge memory is initialized to provide tools, task and reasoning format knowledge. Then, the tool-augmented reasoning step is iterated multiple times to perform step-by-step reasoning, until obtaining the answer.}
+    \label{framework}
+\end{figure*}
+
+\section{Approach}
+In this section, we present our proposed ChatCoT, a new chain-of-thought~(CoT) prompting framework based on multi-turn conversations, for improving chat-based LLMs on complex reasoning tasks with tools. 
+The overall illustration of our proposed ChatCoT is shown in Figure~\ref{framework}.
+
+\subsection{Overview}
+For complex tasks (\eg advanced mathematical problems), LLMs require to frequently manipulate the tools when in need, to fulfill the intractable intermediate issues. % and achieve better performance.
+However, as tools are not intrinsically integrated with LLMs, previous work mostly relies on the LLM to generate the plan of manipulating tools and then execution~\cite{PAL,lu2023chameleon}, or immediately call tools by stopping the continuous generation of LLMs~\cite{ReAct}.
+The above both ways are not suitable for the frequent interactions between LLMs and tools, due to the error accumulation in planning and frequent interruptions in LLM generation.
+
+In our approach, we decompose the chain-of-thought reasoning process of LLMs into a multi-round conversation. % where LLMs can interact with tools multiple times in corresponding rounds until finally obtain the answer.
+In each turn, LLMs just require to concentrate on manipulating tools or accomplishing reasoning in the current step, and the whole reasoning process would keep on pushing without premature planning and sudden interruption.
+In this way, the whole reasoning process would be converted to a conversation between LLMs and an agent, which follows pre-defined rules to guide LLMs and manipulate the tool.
+By designing proper chatting strategies, the agent would automatically elicit LLMs to perform reasoning and select a tool, or invoke the tool for execution.
+
+In our approach, we first initialize the multi-turn conversation by feeding chat-based LLMs with the background knowledge, \ie the description of tools, relevant task exemplars, and the demonstration of decomposed chain-of-thought in chat, which are the \emph{conversational knowledge memory} for supporting the following reasoning.
+Then, we propose the \emph{tool-augmented reasoning} procedure that leverages LLMs to perform reasoning with tools in the current step and iterate it to fulfill all sub-tasks in the whole reasoning process, until reaching the answer.
+We introduce the details of the two components in the following.
+
+\subsection{Initializing Conversational Knowledge Memory}
+To guide chat-based LLMs to follow our proposed ChatCoT using external tools, it is essential to design proper prompts in context.
+In our approach, as we reformulate the chain-of-thought reasoning into a decomposed multi-turn conversation, we can also feed the essential prompts into LLMs at early turns as the context, to initialize the conversation background knowledge.
+It can be seen as the in-context \emph{knowledge memory} in the format of dialogue that stores useful knowledge for helping chat-based LLMs manipulate tools or perform reasoning.
+Here, we consider three types of knowledge about tools, task, and multi-turn reasoning format, respectively.
+The details of prompts are in Appendix~\ref{conversation_memory_prompt}.
+
+\paratitle{Tools Knowledge.} 
+As LLMs have never seen tools during pre-training, %it is necessary to introduce the detailed functionality of all available tools and the way tools are used, to LLMs.
+for each tool in Section~\ref{tool_manipulation}, we hand-craft its description in the following pattern: ``\emph{[$T$] can help you [$Y$]}'', where \emph{[$T$]} is the tool name and \emph{[$Y$]} shows its detailed functionality.
+Then, we merge all the descriptions and design the input prompt to tell LLMs about the knowledge of all tools.
+We also hand-craft the expected response of the LLM. It will be also fed into the LLM, to indicate the LLM that it has accepted our prompt and should follow it.
+
+\paratitle{Retrieval-Augmented Task Knowledge.}
+Since LLMs can learn the task knowledge from in-context exemplars, we leverage a retriever to select the most relevant instance from the training dataset, to provide more useful knowledge for the given question.
+Concretely, we train SimCSE~\cite{SimCSE}, a sentence embedding method that can measure the semantic similarity of texts, via the unsupervised training strategy on the training set.
+Then, we leverage it to retrieve the top-$k$ most semantically similar exemplars, and concatenate their problem statement $Q$ and solution $S$ to compose the input prompt.
+Similarly, we also feed it with our expected response into the LLM. 
+
+\paratitle{Multi-turn Reasoning Format.}
+To elicit LLMs following multi-turn reasoning format, we manually annotate the whole multi-round dialogue $I_1, \cdots, I_n$ of randomly sampled five questions from the training set, to create the exemplars.
+Then, we feed the dialogues of all the exemplars into the chat-based LLM round by round, as the context to guide LLMs to follow it for performing reasoning.
+
+\paratitle{Summary.} The above three types of multi-turn utterances are pre-defined with corresponding contents and formats, which compose the \emph{conversational knowledge memory} of our approach.
+It would be leveraged to initialize the conversational context, and support the following step-by-step reasoning for answering the question.
+
+\ignore{
+\begin{algorithm}
+  \caption{RSE procedure}\label{RSE}
+\small
+    \SetKwData{Left}{left}\SetKwData{This}{this}\SetKwData{Up}{up}
+    \SetKwFunction{Union}{Union}\SetKwFunction{Sample}{Sample}\SetKwFunction{MaskMLM}{MaskMLM}\SetKwFunction{MaskDAE}{MaskDAE}
+    \SetKwInOut{Input}{Input}\SetKwInOut{Parameter}{Parameter}
+    \SetKwRepeat{Do}{do}{while}
+
+    \Input{The history of dialogue $H$}
+    \BlankLine
+    LLMs generate the reasoning step\;
+    Ask LLMs about which tools they need\;
+    \If {LLMs do not need tools} {
+        Encourage LLMs continue reasoning;\
+    }
+    \Else {
+        \Do {Results are not useful} {
+            Ask LLMs about parameters of tools\;
+            Obtain the results of tools\;
+            Ask LLMs whether the results are useful\;
+        }
+        Encourage LLMs continue reasoning\;
+    }
+\end{algorithm}}
+
+\subsection{Iterative Tool-augmented Reasoning}
+Based on the above conversational knowledge memory, we iterate the tool-augmented reasoning step to perform step-by-step tool-augmented reasoning, until finally obtain the answer.
+
+\subsubsection{Tool-augmented Reasoning Step}
+The tool-augmented reasoning step can be iterated in multiple times. 
+In each iteration, based on the current results, we first leverage LLMs to perform reasoning, then select the proper tool by LLMs, and finally execute the selected tool to obtain the intermediate result in the current step.
+
+\paratitle{LLM for Reasoning.}
+Guided by the exemplars in the conversation history, LLMs are able to decompose the whole reasoning process into multi-turn chat.
+Specially, LLMs would be elicited by the contextual exemplars to directly perform reasoning in natural language based on the current result, without specialized prompts or instructions.
+Consequently, LLMs can rely on the retrieval-augmented task knowledge in context, to generate the natural language solution till the point that needs the functionality of tools.
+
+\paratitle{LLM for Tools Selection.}
+After reasoning, we utilize the LLM to select a useful tool (\eg calculator), which will be employed to provide the required functionality for the LLM.
+Here, the input prompt of the LLM is ``\emph{To solve this sub-problem, which tool can we use?}''
+After feeding it into the LLM, if the LLM requires to utilize tools, it will select a suitable one, and then we further ask the LLM to formulate the input arguments of the tool, \eg mathematical expression.
+Otherwise, it will answer ``\emph{Do not use tool}'', and the LLM will continue to perform reasoning.
+
+\paratitle{Tools Execution.}
+Given the selected tool and formulated arguments by LLMs, we can execute the tool with the arguments to obtain the result in the current iteration.
+Here, we also consider that the results from the tool may be not satisfied by the LLM, \eg irrelevant retrieved documents.
+In this case, we can also add several feedback rounds where the LLM judges if the result is useful or expected, and then reuse the tool to acquire a new result.
+
+\subsubsection{Iteration for Step-by-Step Reasoning}
+We iterate the above step based on the in-context conversation knowledge memory, to perform step-by-step reasoning on the given question $Q$.
+We start the whole iteration process using the following prompt:
+``\emph{You should solve the problem step by step and you should follow the react in the history [$Q$]}''.
+Then, after reaching the answer key, the iteration process will be stopped by LLMs.
+In practice, we find that chat-based LLMs are prone to continue chatting although the answer key has appeared in the reasoning process.
+Thus, we set the maximum chat turns, and devise the following prompt to force LLMs to stop reasoning and conclude the answer:
+``\emph{Base on the context, what is the answer?}''.
+
+As our proposed approach only decomposes the one-pass chain-of-thought reasoning into multi-turn chat and adds the utilization of tools, it is agnostic to the task types and tools implementation.
+Therefore, it is a general framework that can be applied to a variety of complex reasoning tasks that require suitable tools.
+Besides, our approach also supports the recently proposed improvement strategies based on the chain-of-thought method, \eg self-consistency~\cite{self-consistency}.
+We conduct corresponding experiments in Section~\ref{sec-analysis} to validate it.
+
+\ignore{
+\subsection{Multi-step reasoning via multi-round dialogue}
+
+The major advantage of multi-round dialogue is that it can convert a single reasoning process into several steps more natural than traditional CoT.
+By leveraging the chatting ability of LLMs, we design an assistant based on rule which communicates with LLMs to guide LLMs reasoning step by step and help LLMs interact with external tools.
+In ChatCot, each reasoning step can be view as one round of dialogue, and the full reasoning path $S$ can be transform into dialogue history $H$.
+Through multi-round dialogue with rule based assistant, LLMs reason step by step and finally solve the problem.
+For details, given a reasoning problem $D$, assistant will ask LLMs to decompose this problem and solve the sub-problem.
+According to the problem and prompt, LLMs decompose the problem and generate corresponding reasoning step $s_i$.
+Then, assistant utilize template to construct prompt to encourage LLMs to continue reasoning.
+By analogy, LLMs decompose the complex problem into sub-problems and solve it step by step.
+The right part of Figure~\ref{comparison} is an example of problem decomposing and reasoning step by step in ChatCoT.
+
+Formally, the full reasoning process can be represented by follow equations.
+\begin{align}
+\text{Assistant}&:~\texttt{Prompt}(D) \nonumber \\
+\text{LLMs}&:~s_1 = \{t_{1,1}, t_{1, 2}, \dots, t_{1, l_1}\} \nonumber \\
+\text{Assistant}&:~\texttt{Prompt}(s_1) \nonumber \\
+\dots&:~\dots \nonumber \\
+\text{LLMs}&: s_n = \{t_{n,1}, t_{n, 2}, \dots, t_{n, l_n}\},~A \nonumber
+\end{align}
+The speaker is on the left of colon, and the content of dialogue is on the right of colon.
+$\texttt{Prompt}(x)$ is a function to select template by rule based method and generate prompt according to the input $x$.
+Given the description of problem $D$, assistant utilize function $\texttt{Prompt}(D)$ to obtain the prompt of problem and feed it into LLMs.
+Then, LLMs generate reasoning steps and interact with assistant until reach the final answer.
+Once reaching the final answer, LLMs will generate the answer $A$ in specific template, and assistant will extract the final answer from response of LLMs and finish dialogue process.}
+
+\ignore{
+\subsection{Discussion}
+
+In this part, we have a discussion about detailed implement of ChatCoT including prompt construction and adaption to classical modules.
+
+\subsubsection{Augment modules adaption}
+
+Although ChatCoT guide LLMs reasoning step by step through multi-round dialogue which is different from classical CoT, ChatCoT can also adapt to the augment modules which are designed for CoT, such as self-consistency and self-refine.
+Besides, with decomposing reasoning, the methods about decoding strategy~\cite{Xie-arxiv-2023-Decomposition} can also be used in ChatCoT to boost the performance.
+In this section, we introduce the methods to adapt ChatCoT to augment modules, and take self-consistency and self-refine as representative works.
+
+\paratitle{Consistency}
+The main idea of self-consistency is generating diversified reasoning path to get several answers and selecting the most confident answer through voting.
+Formally, the score the each answer can be calculated by follow equation, and the answer getting the highest score will be chosen as the final answer.
+$$
+\text{Score}(A_i) = \sum_{p=1}^{k}{\mathbbm{1}[A_p == A_i]}
+$$
+Where $k$ denotes the number to generated reasoning path, and $A_i$ is the answer of $i$-th reasoning path.
+ChatCoT can also generate diversified multi-round dialogue which has similar function with reasoning path in CoT via adjusting the temperature parameters.
+By leveraging diversified multi-round dialogue, ChatCoT can obtain several answers and get the final answer by ensemble.
+Empirical study shows that ChatCoT adapts to self-consistency better than classical CoT method.
+
+\paratitle{Refinement}
+For refinement, a convenient method is converting mulit-round dialogue into a paragraph of reasoning in natural language.
+First, to convert dialogue history into a paragraph of natural language, the prompt and instruction which guide LLMs to decompsing reasoning and manipulating external tools is not necessary.
+Therefore, we delete these content containing useless information and keep the content including reasoning steps and results from external tools.
+By connecting the remaining content together without the name of speaker, the reasoning path in natural language will be obtained and can be used in refinement.
+By converting multi-round dialogue into reasoning path in natural language, it can easily adapt to the refinement methods like self-refine.}\section{Experiment}
+
+In this section, we conduct experiments to evaluate the effectiveness of ChatCoT.
+The implementation details can be found in Appendix~\ref{Implementation}.
+
+\begin{table}[]
+    \centering
+    \begin{tabular}{cccc}
+        \bottomrule
+        \textbf{Dataset} & \textbf{Category} & \textbf{Train} & \textbf{Dev}/\textbf{Test}  \\
+        \hline
+        \multirow{7}*{MATH} & Algebra & 1744 & 1187 \\
+            & CP & 771 & 474 \\
+            & Precalculus & 746 & 546 \\
+            & Prealgebra & 1205 & 871 \\
+            & Geometry & 870 & 479 \\
+            & IA & 1295 & 903 \\
+            & NT & 869 & 540 \\
+        \hline
+        \multirow{1}*{HotpotQA} & Distractor & 90477 & 7405 \\        
+        \bottomrule
+    \end{tabular}
+    \caption{Statistics of the two complex reasoning datasets. CP, IA, and NT denote \emph{Counting and Probability}, \emph{Intermediate Algebra}, and \emph{Number Theory}, respectively.}
+    \label{dataset}
+\end{table}
+
+\subsection{Experimental settings}
+
+\paratitle{Datasets.}
+We consider two complex reasoning datasets for evaluation, \ie MATH~\cite{MATH} and HotpotQA~\cite{HotpotQA}.
+The details of these two datasets are shown in Table~\ref{dataset}.
+We adopt accuracy as the evaluation metric.
+
+$\bullet$ \emph{MATH} is composed of challenging competition mathematical problems which require advanced mathematical knowledge. It is divided into seven categories, \ie Algebra, Counting and Probability, Precalculus, Prealgebra, Geometry, Intermediate Algebra, and Number Theory.
+We adopt the calculator and an equation solver as external tools to help LLMs.
+
+$\bullet$ \emph{HotpotQA} is a multi-hop question answering dataset, where each question is associated with a collection of paragraph candidates containing several golden contents which are useful for reasoning.
+We use the development set under the distractor setting of HotpotQA for evaluation, where the annotation of golden paragraphs is not aware to LLMs.
+We employ the retriever as the external tool.
+
+\paratitle{Baselines.}
+We mainly compare our approach with the following prompting strategies based on ChatGPT~\cite{ChatGPT}: 
+
+$\bullet$ \emph{Chain-of-Thought (CoT)}~\cite{CoT} is a prominent method to boost the performance of LLMs in reasoning tasks.
+In CoT, LLMs are prompted to generate the intermediate reasoning path and reasoning step by step to reach the final answer.
+Previous work has shown that the utilization of external tools and similar exemplars improves the performance of CoT.
+Therefore, we implement external tools to help LLMs reason and retrieve to help LLMs select exemplars, which are named \emph{CoT w/ Tool}, and \emph{CoT w/ Retri}, respectively.
+
+$\bullet$ \emph{Learning-to-Program (LP)}~\cite{LP} guides LLMs to program in natural language by learning solutions in the training set, and elicits LLMs to solve tasks following the program.
+
+$\bullet$ \emph{Progressive-Hint Prompting (PHP)}~\cite{PHP} proposes to iteratively refine the solution based on the answer hints from previous trials. The iterative method achieves SOTA on MATH.
+
+To provide a more complete evaluation, we also report the performance of various LLM backbones with the vanilla CoT prompting, including PaLM~\cite{PaLM}, PaLM 2~\cite{PaLM-2}, Minerva~\cite{Minerva}, Galactica~\cite{Galactica}, LLaMA~\cite{LLaMA} and GPT-3~\cite{GPT-3}.
+
+\begin{table*}
+    \centering
+    \begin{tabular}{cccccccccc}
+        \bottomrule
+        \multirow{2.5}*{\textbf{Models}} & \multirow{2.5}*{\begin{tabularx}{0.08\textwidth}{@{}X@{}}\textbf{Prompt}\\\textbf{Strategy}\\ \end{tabularx}} & \multicolumn{8}{c}{\textbf{MATH}} \\
+        \cmidrule(r){3-10}
+         &  & Algebra & CP & PC & PA & Geometry & IA & NT & Avg.  \\
+        \hline
+        GPT-3 & CoT & 6.0 & 4.7 & 4.0 & 7.7 & 3.1 & 4.4 & 4.4 & 5.2 \\
+        PaLM & CoT & 9.7 & 8.4 & 4.4 & 19.2 & 7.3 & 3.5 & 6.0 & 8.8 \\
+        LLaMA & CoT & - & - & - & - & - & - & - & 10.6 \\
+        Galactica & CoT & 29.0 & 13.9 & 12.8 & 27.2 & 12.3 & 9.6 & 11.7 & 20.4 \\
+        Minerva & CoT & 51.3 & 28.0 & 18.0 & 55.0 & 26.8 & 13.7 & 21.2 & 33.6 \\
+        PaLM 2 & CoT & - & - & - & - & - & - & - & 34.3 \\
+        \hline
+        \multirow{6}*{ChatGPT} & CoT & 48.1 & 31.4 & \underline{21.1} & 56.6 & 22.3 & 18.3 & 29.1 & 35.1 \\
+         & CoT w/ Tool & 35.9 & 22.6 & 9.3 & 40.5 & 13.6 & 9.4 & 19.4 & 23.8 \\
+         & CoT w/ Retri & \underline{52.7} & 32.7 & 18.9 & \underline{58.4} & \underline{29.2} & \textbf{19.9} & 31.7 & \underline{37.7} \\
+         & LP & 49.6 & 30.2 & 16.3 & 52.3 & 22.5 & 16.9 & 29.8 & 34.0 \\
+         & PHP & 51.1 & \underline{33.7} & 16.1 & 57.7 & 25.4 & 17.1 & \textbf{35.1} & 36.5 \\
+         & ChatCoT & \textbf{56.1} & \textbf{34.2} & \textbf{23.8} & \textbf{59.2} & \textbf{29.9} & \underline{19.5} & \underline{32.6} & \textbf{39.4} \\
+        \bottomrule
+    \end{tabular}
+    \caption{Experimental results on MATH dataset. PC and PA denote \emph{Precalculus} and \emph{Prealgebra}, respectively. Avg. is the average value of all categories. The best are denoted in bold and the second-best are underlined.}
+    \label{main_results}
+\end{table*}
+
+\begin{table}
+    \centering
+    \begin{tabular}{cc}
+        \bottomrule
+        \textbf{Methods} & \textbf{HotpotQA} \\
+        \hline
+        CoT & 38.0 \\
+        CoT w/ Tool & 31.4 \\
+        ChatCoT w/o Feedback & \underline{53.8} \\
+        ChatCoT & \textbf{59.2} \\
+        \bottomrule
+    \end{tabular}
+    \caption{The results on HotpotQA. We report the results of the development set under the distractor setting.}
+    \label{hotpotqa}
+\end{table}
+
+\subsection{Main Results}
+
+We present the evaluation results of our approach on MATH and HotpotQA datasets in Table~\ref{main_results} and Table~\ref{hotpotqa} respectively.
+
+First, for the comparison of backbones for CoT prompting, ChatGPT achieves the best performance, demonstrating its outstanding mathematical reasoning ability.
+Our method elicits the reasoning process by leveraging the strong multi-turn dialogue ability of ChatGPT, thus leading to a better release of the reasoning ability from ChatGPT.
+
+Second, retrieval-augmented methods (\eg ChatCoT, CoT w/ Retri) outperform other baselines.
+The reason is that retrieved exemplars may contain more relevant knowledge and reasoning steps that are beneficial to solve the given problem.
+On Geometry tasks of MATH, CoT w/ Retri achieves the largest improvement over vanilla CoT than other sub-tasks.
+Another possible reason is that ChatGPT is more unfamiliar to the knowledge and symbol of geometry than others.
+Without similar exemplars, it is difficult for LLMs to well understand them.
+
+Third, given the results of CoT and CoT w/ Tool on MATH and HotpotQA, we can find that directly utilizing external tools during reasoning is not a suitable way, which may hurt the performance of LLMs.
+The reason may be that injecting tool usage into the CoT reasoning process will hurt the continuity of reasoning. %and make LLMs confused about the reasoning step.
+
+Finally, ChatCoT achieves state-of-the-art performance on MATH dataset based on ChatGPT and outperforms other baselines on HotpotQA.
+Compared with the previous SOTA method PHP, ChatCoT outperforms six of seven sub-tasks on MATH dataset and achieves 7.9\% relative improvement on average accuracy over the PHP method.
+The experiment results have verified the effectiveness of ChatCoT on complex reasoning tasks.
+By leveraging conversational knowledge memory and multi-round dialogue to reasoning, ChatCoT has the advantage to utilize plug-and-play tools.
+Moreover, on the Number Theory tasks of MATH, we can find that PHP achieves the best performance.
+The reason may be that there are fewer equations that need to be computed or simplified.
+Thus, the advantage of the utilization of tools becomes less obvious.
+
+\begin{table}
+    \centering
+    \begin{tabular}{cccccc}
+        \bottomrule
+        \multicolumn{3}{c}{\textbf{Methods}} & \multicolumn{3}{c}{\textbf{MATH}} \\
+        \cmidrule(r){1-3}\cmidrule(r){4-6}
+        TK & RATK & MRF & PC & Geo & NT \\
+        \hline
+        \ding{52} & \ding{52} & \ding{52} & \textbf{23.8} & \textbf{29.9} & \textbf{32.6}  \\
+        \ding{55} & \ding{52} & \ding{52} & 23.3 & 29.2 & 30.6 \\
+        \ding{52} & \ding{55} & \ding{52} & 20.0 & 27.4 & 31.0 \\
+        \ding{52} & \ding{52} & \ding{55} & 21.6 & 24.2 & 32.2 \\
+        \ding{55} & \ding{55} & \ding{52} & 16.7 & 21.1 & 29.3 \\
+        \bottomrule
+    \end{tabular}
+    \caption{The results of ablation study. TK, RATK, and MRF denote if using tool knowledge, retrieval-augmented task knowledge, and multi-turn reasoning format at early turns of the conversation, respectively. Geo is the abbreviation of \emph{Geometry}.} %\ding{55} indicates the removing of corresponding memory while \ding{52} indicates the usage of memory. The best results are in bold.}
+    \label{ablation}
+\end{table}
+
+\subsection{Detailed Analysis}
+\label{sec-analysis}
+
+In order to further verify the effectiveness of each component in ChatCoT, we conduct experiments about ablation, adaption, tools utilization and expense.
+We present the case study in Appendix~\ref{case_study_illustration}.
+
+\paratitle{Ablation Study.}
+In the ablation study, we evaluate the effectiveness of conversational memory, including tool knowledge memory, retrieval-augmented knowledge memory, and multi-turn reasoning format memory.
+As shown in Table~\ref{ablation}, removing any type of conversational memory will reduce the performance of ChatCoT, which indicates the effectiveness of these memories in complex reasoning.
+In particular, removing retrieval-augmented knowledge memory or multi-turn reasoning format memory will lead to a large drop, which shows that mathematical knowledge and reasoning format knowledge is important for LLMs in reasoning tasks, while LLMs can learn the usage of external tools from exemplars without descriptions.
+
+\begin{table}
+    \centering
+    \begin{tabular}{ccc}
+        \bottomrule
+        \textbf{Methods} & \textbf{CP} & \textbf{NT} \\
+        \hline
+        CoT + SC & $35.2_{+3.8\%}$ & $34.4_{+5.3\%}$ \\
+        ChatCoT + SC & $40.1_{+5.9\%}$ & $38.3_{+5.7\%}$ \\
+        \bottomrule
+    \end{tabular}
+    \caption{The evaluated accuracy of combining our approach with self-consistency. SC denotes self-consistency. We also report the absolute improvement compared with vanilla methods on subscripts.}
+    \label{comb_classical}
+\end{table}
+
+\begin{table}
+    \centering
+    \begin{tabular}{ccc}
+        \bottomrule
+        \textbf{Methods} & \textbf{Frequency} & \textbf{Success}  \\
+        \hline
+        CoT w/ Tool & 3.0\% & 85.7\% \\
+        ChatCoT w/o TK & 56.0\% & 93.0\% \\
+        ChatCoT w/o MRF & 10.0\% & 64.2\% \\
+        ChatCoT & 70.0\% & 92.0\% \\
+        \bottomrule
+    \end{tabular}
+    \caption{Frequency and success rate of tool manipulation on Number Theory task of MATH. TK, MRF denote tool knowledge, multi-turn reasoning format at early turns of the conversation respectively.}
+    \label{tool_ratio}
+\end{table}
+
+\begin{table}[t]
+    \centering
+    \begin{tabular}{ccc}
+        \bottomrule
+        \textbf{Methods} & \textbf{Generated Tokens} \\
+        \hline
+        CoT & 224.6 \\
+        CoT w/ Tool & 296.2 \\
+        Self-Consistency & 1017.4 \\
+        ChatCoT & 355.2 \\
+        \bottomrule
+    \end{tabular}
+    \caption{The comparison of the number of generated tokens from LLMs among different prompt strategies.}
+    \label{generated_tokens}
+\end{table}
+
+\paratitle{Combination with Improvement Strategies.}
+ChatCoT is a general method to enhance the ability of tool manipulation of LLMs.
+It can be integrated with improvement strategies and further boost the performance of LLMs on reasoning tasks.
+To evaluate the applicability of ChatCoT to improvement strategies designed for CoT, we compare ChatCoT with CoT on two subtasks of MATH, where both methods are augmented with self-consistency~\cite{self-consistency}, a representative improvement strategy for CoT prompting. 
+Concretely, we sample 5 outputs for majority voting in self-consistency.
+As shown in Table~\ref{comb_classical}, self-consistency brings improvement in both CoT and ChatCoT.
+In particular, the absolute improvement of ChatCoT is slightly higher than CoT, showing that ChatCoT can adapt to self-consistency well.
+The reason is that, with the decomposing of reasoning procedures, the intermediate steps of ChatCoT are more confident, and small mistakes will be corrected easily.
+Moreover, we construct the case study about the combination with ChatCoT and Self-Refine~\cite{self-refine} in Appendix~\ref{case_study_sr}.
+
+\paratitle{Tools Utilization Analysis.}
+As we mentioned above, in complex reasoning tasks, infrequently or incorrectly utilizing external tools might lead to wrong answers.
+Thus, we conduct the experiment about whether LLMs can frequently or correctly leverage based on different methods.
+Table~\ref{tool_ratio} expresses the performance of tools utilization in the Number Theory task of MATH of baseline and our approach.
+``Frequency'' denotes the ratio of problems where LLMs correctly leverage tools. 
+``Success'' denotes the rate of LLMs utilizing tools successfully among all the times of invoking tools.
+We can observe that ChatCoT achieves a balance of frequency and ratio of success.
+Tool knowledge provides the function of tools for LLMs and improves the frequency that LLMs utilize the tools.
+LLMs can learn how to leverage external tools through the multi-turn reasoning format and boost the ratio of successful utilization of tools. 
+Without any of them, the frequency and ratio of success will drop which might not be conducive to reasoning.
+
+\paratitle{Number of Generated Tokens Analysis.} 
+Despite guiding LLMs to reason through multi-turn dialogue, the computation expense of ChatCoT is not significantly larger than the CoT method.
+In Table~\ref{generated_tokens}, we present the average number of generated tokens from LLMs in several methods on MATH dataset, which reflects the computation expense to a certain degree.
+We can observe that ChatCoT is on the same order of magnitude with other baselines (\eg CoT and CoT w/ Tool).
+Therefore, ChatCoT does not bring significant expenses compared to existing prompting methods.
+
+\section{Conclusion}
+
+In this paper, we have proposed ChatCoT, a new framework to  manipulate the tools  for the CoT reasoning. 
+It naturally integrates the reasoning process  and manipulating tools through a form of  multi-turn conversations. 
+At each turn, LLMs can either interact
+ with tools or perform the reasoning by itself. Our approach can effectively leverage the multi-turn
+ conversation ability of chat-based LLMs.  
+Experimental results on two complex reasoning tasks including MATH and HotpotQA have verified the effectiveness of ChatCoT.
+
+Currently, our experiments are mainly conducted on mathematical reasoning tasks, and we will test the effectiveness of the proposed approach to more types of reasoning tasks. Besides, we will also consider extending the number of available tools for solving different tasks. 
+\section*{Limitations}
+
+In this section, we discuss the limitations of our work.
+First, we do not utilize GPT-4 in our experiment or evaluate the performance of GPT-4 in the ChatCoT framework. That is because our application for GPT-4 has not been accepted.
+Second, ChatCoT is designed for chat-based LLMs and it is hardly compatible with other LLMs. However, most LLMs support multi-turn conversation currently and they perform well on reasoning tasks.
+Besides, although LLMs have achieved strong ability in reasoning tasks, the requirement of computation expense and GPU resource is higher than other pre-trained language models which have millions of parameters. The utilization of LLMs will produce more carbon dioxide and pollute the environment.
+
+\section*{Acknowledgement}
+This work was partially supported by National Natural Science Foundation of China under Grant No. 62222215, Beijing Natural Science Foundation under Grant No. L233008 and 4222027, and Beijing Outstanding Young Scientist Program under Grant No. BJJWZYJH012019100020098. And this work is also partially supported by the Outstanding Innovative Talents Cultivation Funded Programs 2021 of Renmin University of China. Xin Zhao is the corresponding author.
+
+\newpage
+
+\end{document}

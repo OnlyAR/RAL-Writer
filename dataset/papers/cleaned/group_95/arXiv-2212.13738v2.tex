@@ -1,0 +1,325 @@
+\title{Temporal Alignment Representation with Contrastive Learning}
+
+\begin{document}
+
+\maketitle
+\let\thefootnote\relax\footnotetext{$^\dagger$Equal contribution. Code Link: \url{https://github.com/yyuncong/TempCLR} }
+
+\begin{abstract}
+
+Video representation learning has been successful in video-text pre-training for zero-shot transfer, where each sentence is trained to be close to the paired video clips in a common feature space. For long videos, given a paragraph of description where the sentences describe different segments of the video, by matching all sentence-clip pairs,  the paragraph and the full video are aligned implicitly. However, such unit-level comparison may ignore global temporal context, which inevitably limits the generalization ability. In this paper, we propose a contrastive learning framework TempCLR to compare the full video and the paragraph explicitly. As the video/paragraph is formulated as a sequence of clips/sentences, under the constraint of their temporal order, we use dynamic time warping to compute the minimum cumulative cost over sentence-clip pairs as the sequence-level distance. To explore the temporal dynamics, we break the consistency of temporal succession by shuffling video clips w.r.t. temporal granularity. Then, we obtain the representations for clips/sentences, which perceive the temporal information and thus facilitate the sequence alignment. In addition to pre-training on the video and paragraph, our approach can also generalize on the matching between video instances. We evaluate our approach on video retrieval, action step localization, and few-shot action recognition, and achieve consistent performance gain over all three tasks. Detailed ablation studies are provided to justify the approach design.
+
+\end{abstract}
+
+\section{Introduction}
+
+Representation learning on videos has achieved success~\citep{goroshin2015unsupervised,feichtenhofer2021large} in detecting actions in short periods. Recent work has extended it on video-text data~\citep{miech2019howto100m,radford2021learning} to learn a common feature space for zero-shot transfer. In particular, given a paragraph of description, the understanding of \longvideo{s} is increasingly important and may facilitate AI-assistant applications~\citep{grauman2022ego4d,lin2022learning,chen2022weakly}.
+
+A \longvideo{} is usually formulated as a sequence of \shortclip{s}. Given a paragraph, each sentence is used to describe, \ie, paired with, the consecutive video clips in a video segment. 
+By matching all sentence-clip pairs~\citep{miech2020end}, the full video and the paragraph can be aligned implicitly.
+However, maximizing the agreement between clips and sentences individually (\emph{unit-level}) ignores the context of temporal dynamics, which limits the generalization~\citep{goyal2017something}. 
+After all, within one video segment, as the action/event progress at each clip varies, the similarity between the clips and the sentence can be naturally different. 
+As such, strictly aligning the sentence with all paired clips, serving as the hard-label, may not always result in an optimal solution. 
+
+To incorporate the temporal correlation across clips, \citet{xu2021videoclip} propose to first fuse the representations over a short period for sentences and video clips separately and then align the fused representations. 
+However, such methods only incorporate the \textit{local} temporal information but still does not model the \textit{global} temporal correlation.
+As a paragraph is essentially a sequence of sentences, as shown in Fig.~\ref{fig:concept}, the whole \longvideo{} and the paragraph should be explicitly compared and aligned (\emph{sequence-level}).
+For a video consisting of multiple steps, \eg, instructional video, the temporal dependence between two distant video clips still exists.
+In this way, for a challenging case where two clips are visually similar but are from different segments (clips $\{a,b,d\}$ in Fig.~\ref{fig:concept}), the global context of order can be utilized to avoid the potential mismatching in unit-level matching.
+
+In this work, we study video-paragraph pre-training and propose a framework \approach{} based on sequence-level comparison to explore temporal dynamics.
+We directly calculate the distance between full video and paragraph.
+Without loss of generality, for the paragraph (anchor) and its paired video (positive sample), the sequence-level distance is the minimum cumulative matching cost over the sentences and clips under the constraint of temporal order and is obtained via dynamic time warping (DTW)~\citep{muller2007dynamic}.
+Then we emphasize the unit order which is naturally exhibited within a sequence, and consider the cases where the temporal consistency between video and paragraph is not met.
+As a sentence is paired with a segment consisting of multiple clips, we design a negative sampling strategy based on \negkey{}, which shuffles the clips at both unit level and segment level in the paired video. 
+Finally, we apply contrastive learning to maximally align paired video and paragraph.
+In this way, we can learn representations for clips and sentences which can perceive global temporal context. Then, from the optimal matching with minimum sequence-level distance, we can pair clips with sentences without being confused by visual similarity.
+
+\begin{figure}
+    \centering
+    \includegraphics[width=0.9\textwidth]{result/concept.pdf}
+    \caption{(Left) Given a video and a paired paragraph where the sentences can describe the content in different parts, the temporal orders within the video and the paragraph are consistent. (Right) Conventional methods perform unit-level comparison between sentences and clips pair-wisely and mismatch may occur due to visual similarity. Instead, we directly compare the sequences by considering temporal order such that the temporal succession can be used to align clips and captions.}
+    \label{fig:concept}
+\end{figure}
+
+In addition to video-paragraph pre-training, our \approach{} can also be generalized on few-shot action recognition (\votype{}) where each video is classified through the nearest neighbor search according to the sequence distance. 
+In summary, the contributions are:
+\begin{itemize}[leftmargin=*]
+    \item We propose a contrastive learning framework \approach{} to explore temporal dynamics where the learned representation for clips and sentences can facilitate the alignment between sequences.  
+    \item Given an anchor, we design a negative sampling strategy based on \negkey{} and shuffle the units in the positive sequence at both segment-level and unit-level. Notably, our method can be generalized to learn representation for both \vltype{} data and \votype{} data.
+    \item We conduct extensive experiments on three tasks (\ie, video retrieval, action step localization, and few-shot action recognition) and achieve consistent performance gain to demonstrate the effect of our training strategy. Detailed ablation studies are provided to justify the approach design.
+\end{itemize}
+
+\section{Related Work}
+
+\bitem{Contrastive learning} (CT) has achieved success on images~\citep{chen2020improved,he2020momentum} and can cluster samples in the feature space properly.
+The main idea is to group different views of the same image/video instance by minimizing the InfoNCE loss~\citep{oord2018representation} while \citet{wang2020understanding} explains it from the aspect of uniformity. Besides, it can be applied on imbalanced dataset~\citep{caron2020unsupervised} and different feature spaces~\citep{grill2020bootstrap,ma2021partner}.
+
+\bitem{Self-supervision on Video} has been studied to learn a good feature extractor. 
+Following the idea of temporal jigsaw~\cite{huo2020self}, the order of frames~\citep{misra2016shuffle,lee2017unsupervised} and clips~\citep{xu2019self} can be used for supervision. However, the length of tuple is fixed and too small (\eg, 4) to model temporal context over the full video and may ignore semantic information.
+Besides, contrastive learning is also applied for video pre-training where the positive samples can be built by randomly selecting shot video clips~\citep{feichtenhofer2021large}, adjusting the time span~\citep{recasens2021broaden}, and performing spatial-temporal augmentation~\citep{jenni2020video}. In addition, generative approaches~\cite{han2020memory,vondrick2016generating} has also been studied.
+
+\bitem{Multi-modal pre-training for zero-shot transfer} has been studied to connect vision and language. CLIP~\citep{radford2021learning} applies contrastive learning on image-caption pairs.
+\citet{yang2022unified} and \citet{li2022grounded} further modify the negative sampling strategy such that the embeddings can be more discriminative at instance-level. 
+Then the pre-training is extended to video understanding~\citet{miech2020end,ging2020coot,gabeur2020multi,alayrac2020self,wang2022object}. To improve the performance,  multi-task training has been studied~\citep{li2020hero,luo2020univl}. 
+As the description of video content can be noisy, TAN~\citep{han2022temporal} proposes a co-training strategy and use mutual agreement for annotation filtering and VideoCLIP~\citep{xu2021videoclip} proposes a sampling strategy to mitigate the impact of noise in long videos labeling.
+Besides video and text, audio is also used to benefit the zero-shot tasks~\citep{chen2021multimodal,shvetsova2022everything} by learning a common feature space.
+As an alternative, the Attention mechanism can also be used to fuse the multi-modal information at each layer~\citep{sun2019videobert,su2019vl,chen2020uniter}.
+
+\bitem{Sequence alignment} For each unit in a sequence, along the temporal order, the indices of matched units from aligned sequence pair shall monotonically increase, and averaged distance over matched units is minimized.
+Dynamic time wrapping~\citep{muller2007dynamic} is first proposed and canonical time warping~\citep{zhou2009canonical} is then used to align sequences with different feature dimensionality and is applied in deep learning~\citep{sargin2007audiovisual}.
+Meanwhile, a pyramid deep architecture~\citep{wang2020alignnet} or attention mechanism~\citep{bishay2019tarn,zhang2020few,ma2019cdsa} can be designed to integrate multi-scale temporal information into a single feature vector.
+Besides, regularized by the sequence alignment, pre-training strategies are designed for visual-audio/rhythms synchronization~\citep{cheng2020look,yu2022self}, and video-text alignment~\citep{xu2021videoclip}. 
+\section{Approach}
+
+We first provide notation and task formulation in Sec.~\ref{sec:formulation}. Then, we detail the paradigm of our method in Sec.~\ref{sec:approach} and explain how to adapt it for different tasks in ~\ref{sec:application}. 
+
+\subsection{Pre-Training Task Formulation}\label{sec:formulation}
+
+Given an anchor instance $\mathbf{S}_a$ (\ie, a paragraph or a video), we aim to learn a network that can minimize its distance with a positive instance $\mathbf{S}_p$ (\ie, a video paired with the paragraph or a video of the same semantic class).
+For each paragraph/video, since its time span can be long, it is typically formulated as a sequence of sentences/video clips. Then, a network is trained to extract a feature for each sentence/video clip, resulting in a sequence of feature embeddings, \ie, $\mathbf{S}_a = \{\mathbf{s}_a^i\}_{i=1}^{N_a}$ and $\mathbf{S}_p = \{\mathbf{s}_p^j\}_{j=1}^{N_p}$, where $\mathbf{s}_a^i, \mathbf{s}_p^j \in \mathcal{R}^d$ are the sequence units, $N_a$ and $N_p$ are the sequence lengths, and $d$ is the dimension of the common feature space. 
+In a pair of video and paragraph, the sentence can be mapped with a few consecutive clips, \ie, $\mathbf{s}_a^i$ is matched with $\{\mathbf{s}_p^j\}_{j=t_i^0}^{t_i^1}$ where $\{t_i^0,t_i^1\}$ are the starting and ending feature indexes in $\mathbf{S}_p$ for $\mathbf{s}_a^i$. Then, $N_a$ is not necessarily equal to $N_p$.
+In this way, as the intrinsic temporal orders within $\mathbf{S}_a$ and $\mathbf{S}_p$ are consistent, their distance $d_{\{\mathbf{S}_a,\mathbf{S}_p\}}$ should be small. In contrast, two sequences should be distant from each other if they cannot be aligned.
+
+\subsection{Temporal Alignment Representation with Contrastive Learning}\label{sec:approach}
+
+\begin{figure}
+    \centering
+    \includegraphics[width=0.97\textwidth]{result/approach.pdf}
+    \caption{(Left) For each video-paragraph pair, each sentence describes one segment consisting of consecutive video clips. 
+    (Right) We set the paragraph (\ie, sequence of sentences) as anchor $\mathbf{S}_a$ and set the paired video (\ie, sequence of clips) as positive sample $\mathbf{S}_p$. Then, we shuffle the units in $\mathbf{S}_p$ to generate a negative sequence $\mathbf{S}_n$ as the temporal succession in $\mathbf{S}_n$ is not consistent with $\mathbf{S}_a$. For clip shuffling, we first alter segments and then optionally shuffle the clips in each segment.}
+    \label{fig:approach}
+\end{figure}
+
+\revise{In this section, we explain our contrastive(CT)-based training framework \approach{}. We consider the sequences consisting successive steps of a common topic. Then, we propose our negative sampling strategy and choose to use sequence-level comparison to directly calculate the distance.}
+
+The temporal dynamics exhibited in each sequence (\ie, paragraph or video) are representative. To align two sequences, it is also important to ensure the units within the sequences are properly matched. 
+For example, as $\mathbf{S}_a$ and $\mathbf{S}_p$ are of temporal consistency, when $\mathbf{S}_a$ and $\mathbf{S}_p$ are aligned, each unit $\mathbf{s}_a^i$ in $\mathbf{S}_a$ should also be matched with $\mathbf{s}_p^j$ in $\mathbf{S}_p$ where $\mathbf{s}_a^i$ and $\mathbf{s}_p^j$ are assumed to be semantically close to each other.
+In this way, when two features $(\mathbf{s}_p^i,\mathbf{s}_p^j)$ in $\mathbf{S}_p$ are of two different actions but hard to be distinguished due to visual similarity, the network can still utilize the global temporal order to find a proper unit-level matching between $\mathbf{S}_a$ and $\mathbf{S}_p$ (shown in Fig.~\ref{fig:concept}).
+
+\bitem{Negative Sampling based on \NegKey{}.} In contrast, for a negative sequence $\mathbf{S}_n = \{\mathbf{s}_n^j\}_{j=1}^{N_n}$ which does not preserve temporal consistency with $\mathbf{S}_a$ where $N_n$ is the sequence length, the distance $d_{\{\mathbf{S}_a,\mathbf{S}_n\}}$ between $\mathbf{S}_a$ and $\mathbf{S}_n$ should be high. After all, when $\mathbf{S}_a$ cannot be aligned with $\mathbf{S}_n$, considering the global temporal order, each unit $\mathbf{s}_n^j$ is also distant from any units $\mathbf{s}_a^i$ in $\mathbf{S}_a$ though $\mathbf{s}_a^i$ and $\mathbf{s}_n^j$ can be visually similar (\eg, similar background or foreground objects). 
+
+As such, to mitigate the impact from spatial information, we consider preserving temporal order and aim to obtain representations that facilitates the alignment.
+In detail, as shown in Fig.~\ref{fig:approach}, we propose to generate negative sequence $\mathbf{S}_n$ by randomly shuffling $\mathbf{S}_p$ and breaking temporal consistency.
+Since the segment-level matching also exists in the paired sequences, we first alter the segment order and then shuffle the units within each segment.
+To effectively compare $\mathbf{S}_n$ and $\mathbf{S}_p$ with $\mathbf{S}_a$, we propose a training framework \approach{} based on contrastive learning.
+
+\bitem{Contrastive learning} (\ctloss{}) is a self-supervision approach by learning to group the samples with high correlation. \ctloss{} treats different views of the same instance as correlated (positive) and builds negative pairs by sampling views from different instances. 
+As each instance is an image in~\citet{chen2020simple}, each view can be generated by performing augmentation on the low-level pixels, \ie, adding effects such as flipping and color distortion.
+In practice, given a set $\mathcal{B}$ with $N_B$ instances, for each instance with one single view $I \in \mathcal{B}$, another view $I'$ is generated and is then used to build a positive pair with $I$ where the view of other instances in $\mathcal{B}$ are used to build negative pairs with $I$. Then, the training objective is to minimize the InfoNCE loss~\citep{oord2018representation},
+\begin{equation}\label{eq:Con}
+    \conloss{}(I,I',\mathcal{B}_n) = -\log \frac{\exp(\mathbf{z}_{I} \cdot \mathbf{z}_{I'} / \tau )}{\exp(\mathbf{z}_{I} \cdot \mathbf{z}_{I'} / \tau ) + \sum\nolimits_{X \in \mathcal{B}_n} \exp( \mathbf{z}_{I} \cdot \mathbf{z}_{X}  / \tau )}.
+\end{equation}
+\noindent where $\mathcal{B}_n = \mathcal{B} \setminus \{I\}$, $\mathbf{z}_{X} \in \mathcal{R}^d$ is the feature for instance $X$ after $l_2$-normalization and $\tau$ is a hyperparameter to rescale the affinity scores. 
+In this way, \ctloss{} is performing pair-wise comparison where the disagreement between $\mathbf{z}_{I}$ and $\mathbf{z}_{I'}$ is induced by the variation of augmentation.
+
+Note, for our approach \approach{}, $\mathbf{S}_a$ and $\mathbf{S}_p$ served as \emph{two different views} and the \emph{pattern of temporal order that is consistent between $\mathbf{S}_a$ and $\mathbf{S}_p$ is treated as the instance from which the views are augmented}.
+Then, we can derive the training objective, \ie, 
+\begin{equation}\label{eq:approach}
+    \seqloss{}(\mathbf{S}_a,\mathbf{S}_p,\mathcal{S}_n) = - \log \frac{\exp(d_{\{\mathbf{S}_a,\mathbf{S}_p\}} / \tau )}{exp(d_{\{\mathbf{S}_a,\mathbf{S}_p\}} / \tau ) + \sum\nolimits_{\mathbf{S}_n \in \mathcal{S}_n} \exp( d_{\{\mathbf{S}_a,\mathbf{S}_n\}}  / \tau )}
+\end{equation}
+\noindent where $\mathcal{S}_n = \{\mathbf{S}_{n}^{(i)}\}_{i=1}^{N}$ is the set of $N$ negative sequences derived from $\mathbf{S}_p$.
+As a complementary component, the sequences generated from other instances unpaired or uncorrelated with $\mathbf{S}_a$ can also be included in $\mathcal{S}_n$. However, it introduces more computation workload but does not improve performance effectively (analyzed in Sec.~\ref{sec:negative}). As such, for each $\mathbf{S}_a$, we only use the shuffling strategy for negative sample generation. 
+By minimizing $\seqloss{}$, $\mathbf{S}_a$ and $\mathbf{S}_p$ are trained to be close to each other while both of them are pushed away from all negative sequences in $\mathcal{S}_n$. Meanwhile, comparing with unit-level comparison between captions and clips, our approach provides a soft supervision on unit-level comparison and we provide detailed comparison in Sec.~\ref{sec:gradient}.
+
+\bitem{Sequence-level distance.} To jointly consider the unit-level matching in sequence alignment, we choose to use Dynamic Time Wrapping (DTW, \citet{muller2007dynamic}), which calculates the minimum cumulative matching costs over units as the sequence distance. The set of matched units is called optimal alignment and is recorded in a matching matrix $M \in \mathcal{R}^{N_a \times N_p}$ with binary indicators.
+
+There are two constraints in DTW, 1) $\forall \mathbf{s}_p^j \in \mathbf{S}_p$ is supposed to be matched with at least one unit in $\mathbf{S}_a$, \ie, $\sum_{1 \leq i \leq N_a} \matchmat{i,j} \geq 1$ for $\forall j \in \{1...N_p\}$, and vice versa; 2) Following the exhibited temporal order, the index of matched units should be monotonously increasing, \ie, if $\mathbf{s}_p^n$ matches $\mathbf{s}_a^m$ where $1 \leq m \leq N_a$ and $1 \leq n < N_p$, $\mathbf{s}_p^{n+1}$ cannot match with any unit in $\{\mathbf{s}_a^i\}_{i=1}^{m-1}$ and $\sum_{1 \leq i < m} \matchmat{i,j} = 0$.
+Thus, for $\mathcal{S}_a$ and $\mathcal{S}_p$, when $\matchmat{i,j}=1$, $\mathbf{s}_a^i$ and $\mathbf{s}_p^j$ are matched and assumed to be semantically close to each other. For implementation, we first calculate the pair-wise matching costs $D \in \mathcal{R}^{N_a \times N_p}$ where $D(i,j)$ is the cost, \ie, cosine distance~\citep{singhal2001modern}, between $\mathbf{s}_a^i$ and $\mathbf{s}_p^j$. 
+Then, DTW employs dynamic programming and sets a matrix $C \in \mathcal{R}^{N_a \times N_p}$ to record the minimum cumulative cost between $\{\mathbf{s}_a^i\}_{i=1}^{n_a}$ and $\{\mathbf{s}_p^j\}_{j=1}^{n_p}$~\citep{wang2020alignnet,dixit1990optimization}, \ie,
+\begin{equation}\label{eq:dtw}
+    C(n_a,n_p) = D(n_a,n_p) + \text{min} \{C(n_a-1, n_p-1),~C (n_a-1,n_p),~C(n_a,n_p-1)\}.
+\end{equation}
+where $1 \leq n_p \leq N_p$ and $1 \leq n_a \leq N_a$. Then, the sequence distance is $d_{\{\mathbf{S}_a,\mathbf{S}_p\}} = C(N_a,N_p)$.
+Besides, \citet{cao2020few} propose OTAM, a variant of DTW, to avoid restrict boundary constraint DTW~\citep{muller2007dynamic}. The effect of DTW and OTAM in \approach{} are also studied in Sec.~\ref{sec:experiment} \& \ref{sec:discussion}.
+
+\subsection{Adaptation for Pretraining Tasks}\label{sec:application}
+
+We briefly explain how to apply the paradigm to align the video and paragraph in one semantically-correlated pair (\vltype{}) or videos of the same class (\votype{}) during network training.
+
+\textbf{Video-Paragraph.} For each \longvideo{}, a paired paragraph consisting of short sentences is provided and every sentence, \ie, caption, describes the visual content within a temporal segment. 
+Firstly, for paragraph, we learn a text encoder to extract feature $\mathbf{s}_a^{i}$ for each sentence.
+Then, for the video, all frames are grouped into non-overlapping consecutive video clips and each clip, serving as a visual token, has $n_f$ frames. Thus, each sentence is paired with multiple consecutive clips.
+We use a backbone to extract token embedding for each clip.
+Then, a video encoder is trained to map each clip embedding to the clip feature where all clip features for all sentences are concatenated as $\mathbf{S}_p$.
+As the segments for different sentences may have overlap, during training, we will sub-select the sentences to have $\mathbf{S}_a$ such that there is no repeating clips in $\mathbf{S}_p$.
+
+\textbf{Video-only.} Since the duration of action is usually short, we formulate the video as the sequence of frames. As there is no temporal segmentation within each action, we generate the negative sequences by directly shuffling the frames.
+In this way, the network is learned in a self-supervised manner.
+
+We first conduct experiments on video retrieval and action step localization to explain the benefit of \approach{} for zero-shot transfer in long video understanding.
+Then, we explain the experiments on few-shot action recognition to indicate the generalization ability from global temporal modelling on new classes.
+For the convenience of description, we interchangeably use caption and sentence.
+
+\subsection{Implementation Details of Video-Text Pre-Training}
+
+We follow \citet{xu2021videoclip} and use HowTo100M (HT100M)~\citep{miech2019howto100m} for pre-training. 
+As HT100M is too large (~1.2M videos), due to limited computation resource, we build our model on top of the VideoCLIP~\citep{xu2021videoclip} \ie, initialize the VideoCLIP network with its fully-trained model, and randomly select 90k videos (7.5\%) of HT100M to update the network by minimizing $\seqloss{}$. 
+VideoCLIP consists of two Transformers~\citep{vaswani2017attention} as encoders for video and paragraph separately. For each clip, they use its S3D feature~\citep{xie2018rethinking} as embedding.
+For each sentence, the token embeddings are obtained via a lookup table~\citep{devlin2018bert}.
+One MLP layer is set to map clip embeddings and align the dimension of sentence embeddings. 
+During pre-training, all encoder parameters are updated.
+More experiment details can be found in Appendix.
+
+\subsection{Video-Text Downstream Evaluation}
+
+\subsubsection{Video Retrieval}
+
+\subfile{../result/table_fullvideo}
+\subfile{../result/table_retrieval}
+
+\bitem{Setup and Metric.} We evaluate our approach under two settings \setup{Full-Video} and \setup{Caption-Clip}. (\setup{Full-Video}) Given a paragraph which contains a set of sentence queries, describing multiple parts of an entire \longvideo{}, the full video should be directly retrieved. To represent the full video, we can either concatenate all clips which have paired captions (\ie, remove background), or directly use the full video with background. 
+For retrieval, we can use DTW to measure the distance between the full video and the paragraph directly. Meanwhile, we can still utilize the unit-level comparison, \ie, each caption can be used to match the clip first and the video with the most matched clips will be retrieved, \ie, Cap. Avg.
+(\setup{Caption-Clip}) given a sentence description as a query, we retrieve the video clips directly.
+For both setups, we use recall as metrics, \ie, R@1, R@5, R@10.
+
+\bitem{Dataset.} We evaluate the model pretrained with our \approach{} on YoucookII\citep{zhou2018towards} without any finetuning (\ie, zero-shot). The evaluation set consists of 3350 caption-clip pairs from 436 videos in total.
+The videos existing in YouCookII have been removed from HT100M.
+
+\bitem{Result.} 
+(\setup{Full-Video}) 
+As summarized in Table~\ref{tab:full-retrieval}, with Cap. Avg as measurement, when background is removed, VideoCLIP has already outperformed MCN clearly (\tablerow{3,4}). However, as VideoCLIP is not trained to explore the global temporal context, the performance drops when DTW is used as measurement.
+In contrast, though our approach is only trained with 7.5\% of HT100M full set, benefiting from temporal modelling, \approach{} can effectively improve the performance (\tablerow{5,7}) without hurting the retrieval between clips and captions (\tablerow{4,6}).
+Then, we assume no temporal annotation is provided for full-video retrieval and retrieve full video containing background.
+As the spatial information in background may distract the sentence features, comparing with the scenario when background is removed, the recall by \approach{} drops. 
+However, from Table~\ref{tab:full-retrieval} and~\ref{tab:metric}, by using either OTAM or DTW for video-paragraph comparison, our \approach{} can outperform the VideoCLIP baseline consistently.  
+(\setup{Caption-Clip}) As summarized in Table~\ref{tab:unit-retrieval}, by minimizing $\seqloss{}$, the attention mechanism in Transformer is trained to embed global temporal information into each clip feature, which may then facilitate the such unit-level retrieval and achieves slight gain over strong baseline VideoCLIP. For MMFT, the extra audio information can be used to benefit the retrieval.
+
+\subfile{../result/table_loc}
+
+\subsubsection{Action Step Localization}
+
+\bitem{Setup and Metric.} Each video is associated with a \underline{T}ask consisting of multiple steps (\ie, sentences). 
+Then, each video frame should be assigned with the corresponding step and we use recall as metric. 
+
+\bitem{Dataset.} We perform evaluation on CrossTask~\citep{zhukov2019cross} and the test set contains 1690 annotated videos over 18 \underline{T}asks.
+We first apply our model pre-trained on HT100M on CrossTask test set for zero-shot evaluation.
+Then, following \citet{xu2021videoclip}, we finetune the VideoCLIP model on 540 videos with our $\mathcal(L)_{seq}$ and then evaluate the finetuned model on test set (\setup{Supervised}).
+
+\bitem{Result.} (\setup{Zero-shot}) As shown in Table~\ref{tab:localization}, when we update VideoCLIP with the 7.5\% subset using its original loss (\tablerow{8}), the model overfits and the performance drops slightly. However, for \approach{}, by adding loss $\seqloss{}$, we can still improve the recall from 33.9 to 36.9.
+(\setup{Supervised}) VideoCLIP has shown strong performance, but \approach{} can still increase the recall to 52.5.
+Furthermore, by finetuning on only 100 videos (20\% of train set), our approach can effectively improve the performance, which also demonstrates the benefit from exploring the temporal order modelling.
+
+\subsection{Few-shot Action Recognition}
+
+\begin{minipage}{\textwidth}
+  \begin{minipage}[]{0.47\textwidth}
+  \bitem{Setup and  Metric.} Given a \underline{T}ask where each class has only $N_s$ labeled video as reference (\ie, $N_s$-shot), we classify a test video by comparing its average distance with labeled videos of each class through nearest neighbor search.
+  Following the protocol \citep{zhu2018compound}, we first pre-train the model on a dataset of classes $\mathcal{C}_{b}$ and directly evaluated on few-shot tasks which are sampled from another dataset of classes $\mathcal{C}_{n}$ and $\mathcal{C}_{b} \cap \mathcal{C}_{n} = \O$.
+  \end{minipage}
+  \hfill
+  \begin{minipage}[]{0.5\textwidth}
+    \centering
+    \captionof{table}{Performance (\%) on action recognition.}
+    \resizebox{0.95\textwidth}{!}
+    {
+        \begin{tabular}{l|cc}
+            \hlineB{3}
+            Approach & 1-shot & 5-shot \\
+            \hline
+            TSN++*   & 33.6 & 43   \\
+            CMN++*   & 34.4 & 43.8 \\
+            RTRN++*  & 38.6 & 48.9 \\
+            OTAM~\citep{cao2020few}    & 42.8 & 52.3 \\
+            TRX~\citep{perrett2021temporal}     & 42.0   & 64.6 \\
+            MTFAN~\citep{wu2022motion}   & {45.4} & 60.4 \\
+            \approach{} (Ours) & \textbf{47.8} & \textbf{67.7} \\
+            \hlineB{3}
+            \multicolumn{3}{l}{*:Results are reported in \citet{cao2020few}}
+        \end{tabular}\label{tab:fsar}
+    }
+  \end{minipage}
+\end{minipage}
+\bitem{Dataset}. We use sth-sth V2 \citep{goyal2017something} for experiment and follow the subset split in \citet{cao2020few}.
+The subset contains 100 classes where $|\mathcal{C}_{b}| = 64$ and $|\mathcal{C}_{n}|$ is 24 (12) classes are for evaluation (validation).
+During evaluation, each \underline{T}ask contains 5 classes and has 15 test videos per class while $N_s = \{1,5\}$.
+Finally, we report the mean accuracy over 10k \underline{T}asks. As only using spatial content is unreliable, temporal modelling is thus specifically required for correct prediction.
+
+\bitem{Results} For fair comparison, we first use a ResNet50 model pretrained on ImageNet~\citep{deng2009imagenet} to extract embedding for each frame which are fed into a Transformer to obtain features in $\mathbf{S}_a$. As for $\mathbf{S}_p$, we set a linear layer to process each frame embedding. Then, we use the pre-trained model as initialization and follow the training of OTAM and TRX. More details can be found in Sec.~\ref{sec:downstream-supp}. \approach{} differs from \citet{cao2020few} by applying self-supervision and using a shuffled version of $\mathbf{S}_p$ as $\mathbf{S}_n$, while they apply meta-training~\citep{snell2017prototypical} between video instances. TRX also employs a Transformer but only learns the temporal order between a pair/triple of frames and the learning efficiency is limited. In contrast, TempCLR directly models the temporal context.
+
+\section{Discussion}\label{sec:discussion}
+
+\subsection{Unit Matching in Sequence Alignment}\label{sec:unit-seq} 
+When we directly measure the global distance between video and paragraph, it is also very important to ensure the matched caption-clip pairs are semantically close to each other.
+As visualized in Fig.~\ref{fig:visualization-main}, for the full video directly retrieved by a paragraph, our approach can also correctly match all captions with the video clips. 
+However, if we only rely on the unit-level similarity, the high visual similarity can cause false prediction. More visualization can be found in appendix.
+
+In addition, as shown in Table~\ref{tab:ablation}(a), we check percentage of correctly matched clip-caption pairs averaged over all videos.
+Then, our \approach{} can correctly match more caption-clip pairs than VideoCLIP when the video is compared with paragraph using DTW.
+In this way, given a paragraph, our approach can also mitigate the distraction from unpaired videos.
+
+\subfile{../result/table_ablation2}
+
+\subsection{Negative Sample Selection}\label{sec:negative}
+
+For each anchor sequence $\mathbf{S}_a$, we generate negative samples $\mathbf{S}_n$ from the positive sample $\mathbf{S}_p$ by 1) considering the difference regarding temporal granularity and 2) shuffling the order to break the temporal consistency. Then, we discuss alternative strategies.
+
+\bitem{Video-Paragraph.} For each paragraph (anchor), in addition to shuffle the segments first and then shuffle the clip embeddings within each segment (\textit{seg-unit}), we can also only shuffling the segments while maintaining the clip order within each segment (\textit{seg-only}).
+Meanwhile, an intuitive strategy is to use the video unpaired with the anchor to build negative samples (\textit{unpaired}) or combine it with \textit{seg-unit} \textit{joint}.
+In addition, we can aggressively shuffle all clips embeddings in $\mathbf{S}_p$ (\textit{all-unit}), or only shuffle the clip embeddings within each segment (\textit{within-seg}).
+
+As shown in Table~\ref{tab:negative}, we compare the performance on CrossTask under \textit{Supervised}. 
+(1) Since we use VideoCLIP as initialization and the model has been trained to distinguish clips from different video instances, the sequence-level distance of negative samples in \textit{unpaired} has already been high. Furthermore, as the temporal consistency hardly exists between video and unpaired paragraph, the gain by \textit{unpaired} is inevitably limited.
+(2) According to \tablerow{2-4}, since each caption is supposed to align with all of the clips in the paired segment, breaking the order of segments in $\mathbf{S}_p$, \ie, \textit{seg-only} and \textit{seg-unit}, is essential in facilitating model training.
+From Sec.~\ref{sec:unit-seq}, \textit{when two sequences are aligned using DTW, the matched units are also semantically close to each other}. Thus, when 
+\begin{minipage}{\textwidth}
+  \begin{minipage}[]{0.68\textwidth}
+  $\mathbf{S}_a$ is compared with $\mathbf{S}_n$, the matched units can indicate the clip features which may cause the most confusion in caption-clip matching due to high visual similarity. In this way, by minimizing $\seqloss{}$, the network is then trained to distinguish those clip features which may hurt the alignment between $\mathbf{S}_p$ and $\mathbf{S}_a$.
+  Then, when the segment order is preserved, comparing with VideoCLIP baseline (\ie, 47.3), \textit{within-seg} results in worse generalization as the confusing clips across segments are not detected and the model can be trained to overfit to trivial difference between clips under the same segment. In contrast, when the segment order is broken, shuffling the clip
+  \end{minipage}
+  \hfill
+  \begin{minipage}[]{0.3\textwidth}
+    \centering
+    \captionof{table}{Ablation study (\%) of negative sampling.}
+    \resizebox{\textwidth}{!}
+    {
+        \renewcommand{\arraystretch}{0.93}
+        \begin{tabular}{lc|c}
+            \hlineB{3}
+            Exp. & Strategy & Recall \\
+            \hline
+            1 & un-paired & 48.0\\
+            2 & within-seg & 46.4 \\
+            3 & seg-only & \underline{52.1} \\
+            4 & seg-unit & \textbf{52.5} \\
+            5 & all-unit & 49.3 \\
+            6 & joint & \textbf{52.5} \\
+            7 & visual-anchor & 52.0 \\
+            \hlineB{3}
+        \end{tabular}\label{tab:negative}
+    }
+  \end{minipage}
+\end{minipage}
+order within each segment further can serve as data augmentation, which can improve the recall slightly from 52.1 to 52.5. Furthermore, (3) 
+\textit{all-unit} only introduce limited gain since the continuity across clips in one segment is broken and it is too hard for the model to learn. Combining \textit{unpaired} and \textit{seg-unit} in \textit{joint} does not provide clear gain over \textit{seg-unit}. However, we think the main reason is that VideoCLIP has been well-trained for instance discrimination and believe \textit{joint} is still necessary when \approach{} is trained from scratch.
+Lastly, we can also shuffle the sentence embeddings w.r.t a video (\textit{visual-anchor}) which is equivalent to \textit{seg-only} and achieve reasonably high performance.
+
+\bitem{Video-Only.} As an alternative, we can also shuffle the frame features of other videos as $\mathbf{S}_n$ and keep training the model in a self-supervised manner. 
+However, since the distance between different video instances has already been high, the model is not well learned and the accuracy is 38.2. 
+
+\subsection{Component Analysis and Ablation Study}\label{sec:ablation}
+
+\bitem{Modelling of global temporal context} has been studied for long-video understanding. A popular way is to employ Transformer architecture to model the correlation between clips automatically.
+However, by explicitly modelling the temporal orders, as demonstrated in Sec.~\ref{sec:experiment}, \approach{} is capable to provide consistent gain over three tasks under six different setups from the strong baseline.
+Thus, the comparison with VideoCLIP already serves as ablation studies to demonstrate the importance of explicit regularization for temporal modelling.
+After all, the Attention mechanism may require many data to fully understanding the temporal correlation. 
+In addition, specifically for videos, the labels are noisy such as misalignment between ASR transcription and long video~\citep{miech2020end}, the attention modelling can also be distracted by background which hurts the training efficiency.
+As such, our approach provides a general framework aiming to utilize temporal context.
+
+\bitem{\textit{Supervised} on CrossTask}. As summarized in Table~\ref{tab:ablation}, we use CrossTask study the effect of $\seqloss{}$ in pre-training (PT) stage and downstream finetuning (DS) stage. 
+For \approach{}, \ie, with $\seqloss{}$ in PT, as the model has been trained to model global temporal order, finetuning without $\mathcal{L}_{seq}$ can also improve the recall.
+Meanwhile, though the temporal pattern learned PT may not exactly the same of data in DS, as finetuning with $\mathcal{L}_{seq}$ in DS is very important for down-stream evaluation, the performance are comparable when either VideoCLIP or \approach{} is used for initialization. 
+
+\bitem{DTW Vs. OTAM}. From Table.~\ref{tab:metric}, as the temporal annotation is given in video-paragraph pretraining, using DTW or OTAM achieves similar performance. However, even when annotation is not given in Video-only task, employing either OTAM or DTW does not impact the performance significantly (47.7 for 1-shot). More details can be found in the appendix.
+
+\section{Conclusion}
+In this paper, we have proposed \approach{}, a contrastive learning framework to align the temporal dynamics exhibited in video-paragraph pre-training, where the paragraph/video can be represented as a sequence of sentences/clips and are learned to match their global content following the consistent temporal order. Specifically, to encourage temporal modeling over the full sequences and the effectiveness of explicit sequence comparison, we propose to generate negative samples by shuffling clips of the paired video from different temporal granularities. In this way, we can adjustably maximize the agreement between sequences with temporal order consistency and maximize the distance between unaligned sequences with different temporal coherency. Our \approach{} achieves consistent performance gain on three tasks under six different setups, which experimentally demonstrated the effectiveness of our framework. We also provide analysis to validate our design choice of negative sampling, which is shown to both benefits the sequence-level alignment and the unit-level matching.
+
+\noindent{\bf Acknowledgement}
+\noindent This material is based on research sponsored by Air Force Research Laboratory (AFRL) under agreement number FA8750-19-1-1000. 
+The U.S. Government is authorized to reproduce and distribute reprints for Government purposes notwithstanding any copyright notation therein. 
+The views and conclusions contained herein are those of the authors and should not be interpreted as necessarily representing the official policies or endorsements, either expressed or implied, of Air Force Laboratory, DARPA or the U.S. Government.
+
+\newpage
+
+\end{document}

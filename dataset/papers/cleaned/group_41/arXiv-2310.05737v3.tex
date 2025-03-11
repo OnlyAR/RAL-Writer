@@ -1,0 +1,503 @@
+\title{Language Model Beats Diffusion\\---  Tokenizer is Key to Visual Generation}
+
+\begin{document}
+
+\maketitle
+\vspace{-3mm}
+\begin{abstract}
+\vspace{-3mm}
+While Large Language Models (LLMs) are the dominant models for generative tasks in language, they do not perform as well as diffusion models on image and video generation.
+To effectively use LLMs for visual generation, one crucial component is the visual tokenizer that maps pixel-space inputs to discrete tokens appropriate for LLM learning.
+In this paper, we introduce \modelname{}, a video tokenizer designed to generate concise and expressive tokens for both videos and images using a common token vocabulary.
+Equipped with this new tokenizer, we show that LLMs outperform diffusion models on standard image and video generation benchmarks including ImageNet and Kinetics. 
+In addition, we demonstrate that our tokenizer surpasses the previously top-performing video tokenizer on two more tasks: (1) video compression comparable to the next-generation video codec (VVC) according to human evaluations, and (2) learning effective representations for action recognition tasks.
+\end{abstract}
+
+\vspace{-4mm}
+\section{Introduction}
+\vspace{-2mm}
+
+Large transformer-based language models, commonly referred to as LMs or LLMs, are the de facto models for natural language generation~\citep{openai2023gpt4,googlepalm2,touvron2023llama}. Over time, LMs have expanded their capabilities to generate content in various modalities, asserting their dominance in other domains like audio~\citep{agostinelli2023musiclm}, speech~\citep{rubenstein2023audiopalm}, code generation~\citep{li2023starcoder}, medical applications~\citep{singhal2023towards} and robotics~\citep{brohan2023rt}.
+
+LMs are capable of generating images and videos. To do so, the image pixels are mapped into a sequence of discrete tokens by a visual tokenizer (\cf \cref{sec:background}). These tokens are then fed into the LM transformer, as if they were lexical words, for generative modeling. Despite notable advancements in employing LMs for visual generation~\citep{esser2021taming,chang2022maskgit}, LMs still do not perform as well as diffusion models~\citep{rombach2022high}.
+For instance, when evaluating on the ImageNet dataset, a gold standard benchmark for image generation, the best language model~\citep{lee2022draft} underperforms 
+the diffusion model~\citep{gao2023masked} by a substantial 48\% margin (FID 3.41 \vs 1.79 when generating images at the 256$\times$256 resolution).
+
+\emph{Why do language models lag behind diffusion models in visual generation?} This paper suggests that a primary reason is the lack of a good visual representation, resembling our natural language system, for effectively modeling the visual world.
+To substantiate this hypothesis, this paper shows that, when utilizing a good visual tokenizer, the masked language model~\citep{devlin2019bert,chang2022maskgit,yu2022magvit} surpasses the state-of-the-art diffusion models  in terms of both generation fidelity and efficiency across image and video benchmarks, given the same training data, comparable model size, and training budget. To the best of our knowledge, this provides the first evidence that language models beat diffusion models on the hallmark ImageNet benchmark. 
+
+It is worth emphasizing that our intention is not to assert whether the language model is superior to others, but to promote the exploration of visual tokenization methods for LLMs.
+A fundamental difference of LLMs from other models, such as diffusion models, is that LLMs utilize a discrete latent format: tokens obtained from a visual tokenizer.
+We show that the values of these discrete visual tokens should not be overlooked considering their distinct advantages as follows. \textbf{(1) Compatibility with LLMs.} The main advantage of a token representation is that it shares the same form as language tokens, making it straightforward to leverage the optimizations our community has developed over many years for LLMs. This includes faster training and inference speeds~\citep{shazeer2019fast,lester2021power}, advancements in model infrastructure~\citep{dao2022flashattention,du2022glam}, learning recipes for model scaling~\citep{brown2020language,chowdhery2022palm}, and GPU/TPU optimization, among other innovations. Unifying vision and language by the same token space could set the stage for a true multimodal LLM that can understand, generate, and reason within our visual environment.
+\textbf{(2) Compressed representation.} The discrete token may offer a fresh perspective on video compression. The 
+visual tokens can serve as a new video compression format to reduce disk storage and bandwidth during internet transfers. Unlike compressed RGB pixels, these tokens can be fed directly into generative models, bypassing the conventional decompression and latent encoding steps. This allows for faster processing in generative video applications, especially beneficial in edge computing cases. \textbf{(3) Visual understanding benefits}. 
+Prior research has shown that the discrete tokens are valuable as a pre-training target in self-supervised representation learning, as discussed in BEiT~\citep{bao2021beit} and BEVT~\citep{wang2022bevt}. 
+Additionally, research finds that using tokens as the model inputs improves the robustness and generalization~\citep{mao2021discrete}.
+
+In this paper, we introduce \modelname{}, a video tokenizer designed to map videos (and images) into compact discrete tokens. Our model is built on the state-of-the-art video tokenizer, MAGVIT~\citep{yu2022magvit}, within the VQ-VAE framework~\citep{van2017neural}. We propose two new techniques. First, a novel lookup-free quantization method enables the learning of a large vocabulary that is able to improve generation quality of the language model.
+Second, through extensive empirical analyses, we have identified modifications to the tokenizer that not only enhance generation quality but also enable the tokenization of both images and videos using a shared vocabulary.
+
+We empirically demonstrate that our model outperforms the previously top-performing video tokenizer, MAGVIT, in three key areas. First, our model significantly improves the generation quality of MAGVIT, establishing the state of the art on the common image and video benchmarks. Second, user studies indicate that its compression quality exceeds that of MAGVIT and the current video compression standard, HEVC~\citep{sullivan2012overview}. Moreover, it is on par with the next-generation video codec, VVC~\citep{vvc}.
+Finally, we show that, compared to MAGVIT, our new tokens are stronger for video understanding tasks across two setups and three datasets.
+The main contributions of this work are:
+\vspace{-2mm}
+\begin{itemize}[nosep, leftmargin=*]
+\item A new video tokenizer that outperforms the previously best-performing video tokenizer in three areas: visual generation, video compression, and action recognition.
+\item A novel lookup-free quantization approach that enables improving the visual generation quality of language models by learning a large vocabulary.
+\item To the best of our knowledge, the first evidence suggesting that a language model can outperform diffusion models on ImageNet when provided with the same training data, an equivalent model size, and a similar training budget.
+\item A video compressor with better quality than HEVC and VVC, at similar bit rates, according to user studies. To our knowledge, this is the first successful attempt of a visual tokenizer designed for video generation to achieve comparable results to standard codecs.
+\end{itemize}
+
+\vspace{-4mm}
+\section{Background} \label{sec:background}
+\vspace{-4mm}
+\paragraph{Language Model (LM) for visual generation.}
+LMs have been extended to generate images and videos. A visual tokenizer $f$ is used to first map visual inputs into a sequence of discrete tokens. A video  $\rmV \in \sR^{T \times H \times W \times 3}$ (or image when $T=1$) is tokenized into a discrete representation $\rmX = f(\rmV) \in \{1, 2, \cdots, K\}^{T' \times H' \times W'}$, where $K$ is the codebook (vocabulary) size of the visual tokenizer. $\rmX$ is flattened into a 1D token sequence obtained using raster scan ordering and then fed into an LM transformer for generative modeling. 
+
+Two types of LMs are commonly used for visual generation. The \emph{Autoregressive LM (AR-LM)} includes ImageGPT~\citep{chen2020generative}, DALL-E~\citep{ramesh2021zero}, Parti~\citep{yu2022scaling}, \etc. 
+An AR-LM predicts the next token given the previous tokens along with additional conditioning information $\rvc$ using a categorical distribution for $p_\theta(\ervx_i \mid \rvx_{<i}; \rvc)$. During inference, AR-LMs use the standard autoregressive decoding over the tokens. Finally, the tokens are converted back to pixels by a decoder associated with the visual tokenizer.
+
+The \emph{Masked LM (MLM)} is another type of language model for visual generation, such as: MaskGIT~\citep{chang2022maskgit}, MAGVIT~\citep{yu2022magvit}, Phenaki~\citep{villegas2022phenaki}, and MUSE~\citep{chang2023muse}, among others. An MLM is trained using a masked token objective \citep{devlin2019bert}, where some tokens in the sequence are randomly masked and need to be predicted given the observed tokens. Let $\rvm \in \{0,1\}^n$ be a random binary sequence where $\rvm^\top \vone \in [0, n-1]$. The MLM learns $p_\theta(\ervx_i \mid \{\ervx_j: \ervm_j=1, \forall j\}; \rvc)$ for all $i$ where $\rvm_i=0$. To generate a video or image during inference, the MLM uses the non-autoregressive decoding algorithms
+for images and videos~\citep{chang2022maskgit,yu2022magvit}. 
+The decoding starts with a fully masked sequence, which is iteratively filled by repeating two steps: (1) sample the whole sequence $\hat{\rvx}^{(t)}$ from $p_\theta$ given the non-masked tokens from the previous step, (2) re-mask the $\lfloor\lambda(t)\cdot n\rfloor$ tokens in $\hat{\rvx}^{(t)}$ with the lowest probability, following a decreasing masking ratio schedule $\lambda(t)$, according to timestamp $t$.
+
+\vspace{-4mm}
+\paragraph{Denoising Diffusion Models (DDM).}
+DDMs \citep{sohl2015deep,song2019generative} are regarded as the state-of-the-art in visual generation due to their high-quality image~\citep{dhariwal2021diffusion,ho2022imagen} and video generation~\citep{ho2022video}. For instance, DDPM~\citep{ho2020denoising} learns a denoising process parameterized as conditional Gaussian distributions over image pixels. Recently, diffusion models and language models have displayed a significant overlap. Recent DDMs diffuse over latents rather than raw pixels. These latents are obtained using models similar to the visual tokenizer used by LMs. In fact, the very first latent in diffusion, proposed by \citet{rombach2022high}, is derived from a visual tokenizer. Additionally, the diffusion model's architecture has been shifting from the U-Net to the transformer architecture~\citep{peebles2022scalable}. Consequently, the boundaries between diffusion and language models in visual generation have become less distinct. 
+Yet, a fundamental difference between DDMs and LMs lies in the latent format, \ie, continuous \vs discrete. We have discussed the benefits of having discrete tokens in \cref{sec:intro} and 
+will show that the proposed tokenizer improves in these aspects.
+
+\vspace{-4mm}
+\paragraph{Visual tokenization.}
+Visual tokenization plays an essential role in mapping pixels into a discrete representation suitable for generative modeling. VQ-VAE \citep{van2017neural} is a cornerstone work in image tokenization. A VQ-VAE model consists of a convolutional neural network (CNN) encoder, a vector-quantization (VQ) bottleneck, and a CNN decoder.
+Given a video $\rmV \in \sR^{T \times H \times W \times 3}$, the VQ-VAE's encoder $E$ produces latent embeddings $\rmZ = E(\rmV) \in \sR^{T'\times H'\times W'\times d}$. 
+Each embedding vector $\rvz \in \sR^d$ in $\rmZ$ is then passed through the vector quantizer $q$, which assigns it to the closest entry $\rvc \in \sR^d$ in the learned codebook embedding $\rmC \in \sR^{K \times d}$:
+\begin{equation}
+\vspace{-2mm}
+    q(\rvz) = \rvc_i, \text{ where } i=\underset{j \in \{1,2,\cdots,K\}}{\argmin}\Vert \rvz - \rvc_j \Vert_2.
+\end{equation}
+To get discrete tokens, we drop the embedding dimension and represent $\rmZ$ by its indices $\rmX \in \{1, 2, \cdots, K\}^{T' \times H' \times W'}$. For decoding, embeddings of all image tokens are given as input to the decoder $D$ to reconstruct the input $\hat{\rmV} = D(\rmZ)$. 
+Following VQ-VAE, VQGAN~\citep{esser2021taming} introduces an adversarial loss and feature-level perceptual losses to enhance the image quality.
+
+Video tokenization is more challenging and VQGAN has been adapted to meet this purpose~\citep{ge2022long,villegas2022phenaki,yu2022magvit}. The state of the art in video tokenization is MAGVIT~\citep{yu2022magvit}, which introduces a better 3D architecture, an inflation technique for initialization using image pre-training, and robust training losses. With MAGVIT, the LMs achieve leading generation quality across multiple video benchmarks. However, MAGVIT struggles to tokenize images and often results in noticeable flickering in longer videos.
+
+\vspace{-4mm}
+\section{Method}
+\vspace{-2mm}
+
+We introduce a new \textbf{video tokenizer} designed to map the spatial-temporal dynamics from a visual scene into compact discrete tokens suitable for language models. 
+\cl{Compared with image generation, video generation still faces substantial challenges in generating consistent and realistic motion. We are interested in exploring the capabilities of language models in tackling this unsolved challenge. Therefore, this paper focuses on a video tokenizer that can effectively represent video for generative modeling.}
+Our approach builds upon the state-of-the-art video tokenizer, MAGVIT, as detailed in \citet{yu2022magvit}. 
+This section highlights two new designs: a lookup-free quantizer and a collection of enhancements to the tokenizer model.
+\vspace{-2mm}
+\subsection{Lookup-Free Quantizer}
+\vspace{-2mm}
+
+Although the community has made great progress in developing VQ-VAEs, the relationship between improvements in the reconstruction quality and subsequent generation quality is still not well understood.
+A common misconception is that improving reconstruction equates to improving the generation of the language model.
+For example, enlarging the vocabulary can improve reconstruction quality. However, such improvement only extends to generation when the vocabulary size is small, and a very large vocabulary can actually hurt the performance of the language model. 
+
+As illustrated by the dashed curves in \cref{fig:motivation}, the reconstruction FID, indicated by the right $y$-axis (where a lower value is better), improves as the vocabulary size (the $x$-axis) increases. The orange solid curve in \cref{fig:motivation} represents the LM's generation quality (the left $y$-axis). The generation FID initially improves but deteriorates for larger vocabulary. This may shed light on why the vocabulary size of most language models for visual generation is around 1-8k~\citep{esser2021taming,villegas2022phenaki}, which is significantly smaller than the size of natural language vocabulary, \ie over 200k.
+
+\begin{wrapfigure}{r}{0.5\textwidth}
+\vspace{-4mm}
+    \centering
+    \includegraphics[width=\linewidth,trim={0 0 0 0},clip]{curve.pdf}
+    \vspace{-6mm}
+    \caption{\textbf{Reconstruction and generation quality curves} in FID on ImageNet when scaling the tokenizer's vocabulary size with Vector Quantization (VQ) and Lookup-Free Quantization (LFQ). 
+    Comparison is done at 128$\times$128 resolution using an MLM with 306-372M parameters.
+    }
+    \label{fig:motivation}
+    \vspace{-2mm}
+\end{wrapfigure}
+
+A simple trick for training a larger codebook involves decreasing the code embedding dimension when increasing the vocabulary size~\citep{yu2021vector}.
+This trick captures the intuition of limiting the representational capacity of individual tokens, which in turn facilitates learning over the distribution of a large vocabulary.
+
+\vspace{-4mm}
+\paragraph{Lookup-Free Quantization (\quantizername{}).}
+
+Motivated by the above observation, we reduce the VQ-VAE codebook's embedding dimension to zero. Formally, the codebook $\rmC \in \sR^{K \times d}$ is replaced with an integer set $\sC$ where $|\sC| = K$.
+Recall that in VQ-VAE models, the quantizer must look up all $K$ $d$-dimensional embeddings in the codebook, where $d$ is typically $256$, when computing the closest codebook entry to the encoder output. This new design eliminates the need for such embedding lookup entirely hence we call it \emph{lookup-free quantization (\quantizername{})}.
+We found that \quantizername{} can grow the vocabulary size in a way benefiting the generation quality of language models. As shown by the blue curves in \cref{fig:motivation}, both reconstruction and generation consistently improves as the vocabulary size increases -- a property not observed in current VQ-VAE methods.
+
+While various \quantizername{} methods are available, this paper discusses a straightforward variant that assumes independent codebook dimensions and binary latents. 
+Specifically, the latent space of \quantizername{} is decomposed as the Cartesian product of single-dimensional variables, as $\sC = \bigtimes_{i=1}^{\log_2{K}}C_i$.
+Given a feature vector $\rvz \in \sR^{\log_2{K}}$, each dimension of the quantized representation $q(\rvz)$ is obtained from:
+\begin{equation}
+    q(\ervz_i) = C_{i, j}, \text{ where } j = \argmin_k \|\ervz_i - C_{i, k}\|,
+\end{equation}
+where $C_{i, j}$ is the $j$-th value in $C_i$.
+With $C_i = \{-1, 1\}$, the $\argmin$ can be computed by the sign function as 
+\begin{equation}
+    q(\ervz_i) = \sign(\ervz_i) = -\1\{\ervz_i \le 0\} + \1\{\ervz_i > 0\}.
+\end{equation}
+With \quantizername{}, the token index for $q(\rvz)$ is given by:
+\begin{equation}
+\vspace{-1mm}
+\mathit{Index}(\rvz) = \sum_{i=1}^{\log_2{K}} \argmin_k \|\ervz_i - C_{i, k}\| \prod_{b=0}^{i-1} |C_b| = \sum_{i=1}^{\log_2{K}} 2^{i-1} \1\{\ervz_i > 0\}, \label{eq:tokenid}
+\end{equation}
+where $|C_0|=1$ sets the virtual basis.
+
+We add an entropy penalty during training to encourage codebook utilization:
+\begin{align}
+    \gL_\mathit{entropy} &= \E[H(q(\rvz))] - H[\E(q(\rvz))].
+    \label{eq:entropy}
+\end{align}
+This penalty is inspired by a similar loss used in image VQGAN model~\citep{chang2022maskgit}, which is also found in entropy-based clustering~\citep{jansen2020coincidence}. In \quantizername{}, given the independence among dimensions, we rewrite $H(q(\rvz)) = \sum_{i=1}^{\log_2{K}} H(q (\ervz_i))$ .
+The $H[\E(q(\rvz))]$ term can be approximated with sub-groups of dimensions for $K>2^{18}$ where direct estimation is memory bound. 
+
+We note that there are various other variants of \quantizername{}, \eg, opting for the multivariant over the binary codebook $C_i$ or employing other quantization techniques such as \citet{agustsson2019generative}.
+As the first paper to introduce this concept, we focus on the simplest form with independent binary dimensions, which shows promising improvements. Other \quantizername{} methods merit further research. 
+
+\cl{In addition to the entropy penalty (\cref{eq:entropy}), an \quantizername{}-based tokenizer is trained using the standard combination of \emph{reconstruction},  \emph{GAN}, \emph{perceptual}, and \emph{commitment} losses~\citep{esser2021taming}, excluding the inapplicable codebook loss. Following \cite{yu2022magvit}, we use LeCAM regularization~\citep{tseng2021regularizing} for improved stability. 
+}
+
+\subsection{Visual Tokenizer Model Improvement}\label{sec:tokenizer_improvement}
+\begin{figure}[tp]
+\vspace{-6mm}
+    \centering
+    \begin{subfigure}{1\textwidth} % no visible
+    \refstepcounter{subfigure}\label{fig:arch:a}
+    \refstepcounter{subfigure}\label{fig:arch:b}
+    \refstepcounter{subfigure}\label{fig:arch:c}
+    \end{subfigure}%
+    \includegraphics[width=0.95\linewidth,trim={0 0 0 0},clip]{causal_arch}
+    \vspace{-2mm}
+    \caption{\textbf{Causal tokenizer architecture comparison}.
+    The decoders, which are omitted from the figure, employ an architecture that is symmetric to the encoder.
+    \cl{\scriptsize See detailed architecture diagram in the Appendix.}
+    }
+    \label{fig:arch}
+    \vspace{-6mm}
+\end{figure}
+
+\vspace{-2mm}
+\paragraph{Joint image-video tokenization.}
+A desirable feature of visual tokenization is the capability to tokenize images and videos using a shared codebook. However, the MAGVIT tokenizer, which utilizes the 3D CNN, faces challenges in tokenizing images due to the temporal receptive field. %While replicating an image multiple times to form a static video is possible, this approach introduces redundant code and can potentially alter the training data distribution, resulting in reduced motion.
+
+To build a joint image-video tokenizer, a new design is needed. We begin our discussion by revisiting an existing method C-ViViT~\citep{villegas2022phenaki}. As depicted in \cref{fig:arch:a}, C-ViViT employs full spatial transformer blocks combined with causal temporal transformer blocks. This approach performs reasonably well but has two drawbacks. First, unlike CNNs, the positional embeddings makes it difficult to tokenize spatial resolutions that were not seen during training. Second, empirically we found that 3D CNNs perform better than spatial transformer and produce tokens with better spatial causality of the corresponding patch.
+
+To tackle these drawbacks, we explore two plausible designs. \cref{fig:arch:b} combines C-ViViT and MAGVIT. Assuming a temporal compression ratio of 4, a 3D CNN processes blocks of 4 frames followed by a causal transformer. In \cref{fig:arch:c}, we use the temporally causal 3D convolution to replace the regular 3D CNN. Specifically, the temporal padding scheme for a regular 3D convolution layer with kernel size $(k_t, k_h, k_w)$ includes $\lfloor\frac{k_t-1}{2}\rfloor$ frames before and $\lfloor\frac{k_t}{2}\rfloor$ frames after the input frames.
+In contrast, a causal 3D convolution layer pads with $k_t - 1$ frames before the input and nothing after, so that the output for each frame only depends on the previous frames.
+In consequence, the first frame is always independent of other frames, allowing the model to tokenize single images.
+
+Temporal convolutional subsampling with stride $s$ is sufficient for $s\times$ down-sampling by mapping $1 + s \times t$ frames into $1 + t$.
+After a regular $s \times$ up-sampling, we drop the first $s - 1$ resulting frames, which maps  $1 + t$ frames into $1 + s \times t$ and allows for the tokenization of a single image. \cref{tab:ablation_arch} empirically compares the designs in \cref{fig:arch}, and we find that the causal 3D CNN performs the best.
+
+\vspace{-5mm}
+\paragraph{Architecture modifications.}
+In addition to using causal 3D CNN layers, we made several other architectural modifications to improve upon the MAGVIT model. First, we change the encoder downsamplers from average pooling into strided convolutions to leverage learned kernels, and replace the decoder upsamplers from
+nearest resizing followed by convolution with a depth-to-space operator.
+Second, we defer the temporal downsampling from the first few encoder blocks to the last ones.
+In addition, the downsampling layer in the discriminator now utilizes 3D blur pooling~\citep{zhang2019making} to encourage shift invariance. 
+Finally, we add one adaptive group normalization layer before the residual blocks at each resolution in the decoder to pass in the quantized latents as the control signal following StyleGAN~\citep{karras2019style}.
+\cref{tab:ablation_imagenet,tab:ablation_ucf101} empirically verify these designs.
+
+\vspace{-5mm}
+\paragraph{Token factorization for efficient prediction.}
+The output tokens can be fed into language models to generate videos. To assist smaller transformers predicting in a large vocabulary, we can factorize the \quantizername{} token's latent space into equal subspaces. For instance, rather than predicting using a codebook of size $2^{18}$, we can predict in two concatenated codebooks, each of size $2^9$. We embed each subspace token separately and use their embedding summation as the token embedding for the transformer input. \cl{We find  it beneficial to use weight tying~\citep{press2017using}, a common technique in language modeling, which involves sharing the weights between the embedding and softmax layers.
+For the output layer with a factorized vocabulary}, we use the embedding matrix for each subspace to obtain logits with seperate prediction heads. 
+
+\vspace{-4mm}
+\section{Experiments}
+\vspace{-2mm}
+This section empirically verifies the proposed tokenizer across three distinct tasks: video and image generation, video compression, and action recognition.
+\cref{fig:reconstruction} visually compares the reconstruction quality of our tokenizer with prior works.
+More qualitative samples are shown at \webpage{}.
+
+\vspace{-2mm}
+\subsection{Experimental Setups}
+\vspace{-2mm}
+\paragraph{Datasets.} 
+We use Kinetics-600 (K600)~\citep{carreira2018short} and UCF-101~\citep{soomro2012ucf101} for video generation experiments, along with ImageNet~\citep{deng2009imagenet} for image generaton.
+In addition, MCL-JCV~\citep{wang2016mcl} is used as the testbed for video compression, with Kinetics-400 (K400)~\citep{kay2017kinetics} and SSv2~\citep{goyal2017something} for video understanding. 
+\vspace{-4mm}
+\paragraph{Implementation details}
+We follow the tokenizer training setting and hyperparameters in~\citep{yu2022magvit}, unless stated otherwise. \quantizername{} is used, which eliminates the codebook embedding, to increase the default codebook size to $K=2^{18}$. 
+The weight of $\gL_\mathit{entropy}$ follows an annealing schedule with a $3\times$ higher starting point and linearly decays to a fixed value of $0.1$ within 2k steps.
+We defer details regarding the evaluation setup of each subsection to the Appendix.
+
+\begin{figure}[tp]
+\vspace{-6mm}
+    \centering
+    \includegraphics[width=\linewidth]{figures/reconstruction.pdf}
+    \vspace{-4mm}
+    \caption{\textbf{Image reconstruction samples with different tokenizers}. We compare the VQGAN used in MaskGIT~\citep{chang2022maskgit} with two of our models trained on ImageNet and web images~\citep{chen2022pali}. \mytiny{Original images are by Eric TERRADE and Barth Bailey on Unsplash}.}
+    \label{fig:reconstruction}
+    \vspace{-4mm}
+\end{figure}
+
+\vspace{-2mm}
+\subsection{Visual Generation}\label{sec:gen}
+\vspace{-2mm}
+The masked language model (MLM)~\citep{devlin2019bert} is used in image and video generation. To verify the tokenizer, we employ the same MLM transformers in MAGVIT~\citep{yu2022magvit}. \cl{We select the MLM due to its competitive performance on benchmark datasets~\citep{yu2022magvit,lezama2023discrete}. In the Appendix, we also show that an autoregressive language model (AR-LM) coupled with the proposed tokenizer outperforms the prior work MAGVIT.}
+As we use a smaller MLM ($\sim$300M parameters) with a large codebook ($2^{18}\approx$262K), the token factorization as discussed in \cref{sec:tokenizer_improvement} is applied using two heads with each predicting from a codebook of size $2^9$.
+
+\begin{table}[tp]
+\centering
+\vspace{-6mm}
+\caption{\textbf{Video generation results}: frame prediction on Kinetics-600 and class-conditional generation on UCF-101. We adopt the evaluation protocol of MAGVIT.
+}
+\label{tab:gen_k600}
+\vspace{-2mm}
+\centering
+\begin{tabular}{@{}l@{\hspace{5pt}}l@{\hspace{5pt}}c@{\hspace{5pt}}c@{\hspace{5pt}}c@{\hspace{3pt}}c@{}}
+\toprule
+Type & Method   & K600 FVD$\downarrow$  & UCF FVD$\downarrow$  & \#Params  & \#Steps  \\ \midrule
+GAN & TrIVD-GAN-FP~\citep{luc2020transformation}  & 25.7\mytiny{$\pm$0.7} &  & & 1                \\
+Diffusion & Video Diffusion~\citep{ho2022video}  & 16.2\mytiny{$\pm$0.3} & & 1.1B &   256        \\
+Diffusion & RIN~\citep{jabri2023scalable} & 10.8 & & 411M & 1000 \\
+\hdashline
+AR-LM + VQ & TATS~\citep{ge2022long}  &  & 332\mytiny{$\pm$18} & 321M & 1024 \\
+MLM + VQ & Phenaki~\citep{villegas2022phenaki} & 36.4\mytiny{$\pm$0.2} & & 227M   & 48 \\
+MLM + VQ & MAGVIT~\citep{yu2022magvit}        & 9.9\mytiny{$\pm$0.3} & 76\mytiny{$\pm$2} & 306M   & 12  \\ 
+\midrule
+\cl{MLM + \quantizername{}} & \cl{non-causal baseline} & \cl{11.6\mytiny{$\pm$0.6}} & & \cl{307M} & \cl{12} \\
+\multirow{2}{*}{MLM + \quantizername{}} & \multirow{2}{*}{\emph{\modelname{} (this paper)}} & 5.2\mytiny{$\pm$0.2} &  & \multirow{2}{*}{307M} & 12  \\
+ & & \textbf{4.3\mytiny{$\pm$0.1}}  & \textbf{58\mytiny{$\pm$3}} & & 24  \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\vspace{-4mm}
+\paragraph{Video generation.}
+We consider two standard video benchmarks,
+UCF-101 for class-conditional generation and K600 for frame prediction with 5-frame condition.
+FVD~\citep{unterthiner2018towards} is used as our primary evaluation metric. 
+\cref{tab:gen_k600} shows that our model surpasses all prior arts in both benchmarks.
+Specifically, it outperforms the previous best model MAGVIT by a large margin, while using the same MLM transformer backbone. 
+\cl{In addition, it significantly outperforms the non-causal baseline on frame prediction, highlighting the contribution of the causal tokenizer.}
+These results demonstrate the essential role of a good visual tokenizer in enabling LMs to generate high-quality videos.
+\cref{fig:k600} shows qualitative samples from the model.
+
+\begin{table}[tp]
+\vspace{-2mm}
+\caption{\textbf{Image generation results}: class-conditional generation on ImageNet 512$\times$512.
+Guidance indicates the classifier-free diffusion guidance~\citep{ho2021classifier}.
+$^*$ indicates usage of extra training data.
+We adopt the evaluation protocol and implementation of ADM.
+}
+\label{tab:gen_in512}
+\vspace{-2mm}
+\resizebox{\linewidth}{!}{%
+\begin{tabular}{@{}l@{\hspace{5pt}}l@{\hspace{4pt}}c@{\hspace{2pt}}c@{\hspace{3pt}}c@{\hspace{2pt}}c@{\hspace{2pt}}c@{\hspace{2pt}}c@{}}
+\toprule
+\multirow{2}{*}{Type}  & \multirow{2}{*}{Method}  & \multicolumn{2}{c}{w/o guidance} & \multicolumn{2}{c}{w/ guidance}  & \multirow{2}{*}{\#Params}  & \multirow{2}{*}{\#Steps}  \\
+& & FID$\downarrow$ & IS$\uparrow$ & FID$\downarrow$ & IS$\uparrow$ \\ \midrule
+GAN & StyleGAN-XL~\citep{sauer2022stylegan} & & & 2.41 & 267.8 & 168M & 1 \\
+Diff. + VAE$^*$ & DiT-XL/2~\citep{peebles2022scalable} & 12.03 & 105.3 & 3.04 & 240.8 & 675M  & 250  \\
+Diffusion & ADM+Upsample~\citep{dhariwal2021diffusion}  & 9.96  & 121.8 & 3.85 & 221.7 & 731M & 2000 \\
+Diffusion & RIN~\citep{jabri2023scalable} & 3.95 & 216.0 & & & 320M  & 1000 \\
+Diffusion & simple diffusion~\citep{hoogeboom2023simple} & 3.54 & 205.3 & 3.02 & 248.7 & 2B & 512\\
+Diffusion & VDM++~\citep{kingma2023vdm}  & 2.99 & 232.2 & 2.65 & 278.1  & 2B & 512 \\
+\hdashline
+
+ 
+MLM + VQ & MaskGIT~\citep{chang2022maskgit} & 7.32 & 156.0 & & & 227M & 12  \\
+MLM + VQ & DPC+Upsample~\citep{lezama2023discrete}  & 3.62 & 249.4 & & & 619M & 72    \\
+\midrule
+\multirow{2}{*}{MLM + \quantizername{}} & \multirow{2}{*}{\emph{\modelname{} (this paper)}} & 4.61 & 192.4 & & & \multirow{2}{*}{307M} & 12 \\
+& & 3.07 & 213.1 & \textbf{1.91} & \textbf{324.3} &  & 64 \\
+\bottomrule
+\end{tabular}
+}
+\vspace{-6mm}
+\end{table}
+\vspace{-4mm}
+\paragraph{Image generation on ImageNet.}
+We evaluate \modelname{} on image generation under the standard ImageNet class-conditional setting.
+We present results for resolution 512$\times$512 in \cref{tab:gen_in512} and refer to the Appendix for 256$\times$256 results. FID~\citep{heusel2017gans} and Inception Score (IS)~\citep{salimans2016improved} are used as evaluation metrics. Our model surpasses the best performing diffusion models both in sampling quality (FID and IS) and inference-time efficiency (sampling steps). 
+
+It is worth noting that all the models compared are trained using the same ImageNet training data, with a comparable model size and training budget. Therefore, the performance primarily evaluates the model's capabilities. The masked language model, equipped with our tokenizer, exhibits a notable improvement in FID over the best diffusion model baseline at 512$\times$512 (FID=1.91 \vs 2.65, 28\%$\downarrow$). While this margin narrows at 256$\times$256 resolution, the MLM uses a 50\% reduced model size and needs much fewer decoding steps (\eg, 64 \vs 250) to get the image generation quality.
+Qualitative samples in comparison with other models are shown in \cref{fig:imagenet}.
+
+\begin{figure}[tp]
+\vspace{-4mm}
+    \centering
+    \includegraphics[width=\linewidth,trim={0 0 0 0},clip]{figures/k600.pdf}
+    \vspace{-7mm}
+    \caption{\textbf{Frame prediction samples on Kinetics-600}.}
+    \label{fig:k600}
+    \vspace{-2mm}
+\end{figure}
+\begin{figure}[tp]
+    \centering
+    \includegraphics[width=\linewidth]{figures/ImageNet512.pdf}
+    \vspace{-7mm}
+    \caption{\textbf{Class-conditional generation samples on ImageNet 512$\times$512}. We compare with each of the previous works with a random sample from the same image class.}
+    \label{fig:imagenet}
+    \vspace{-6mm}
+\end{figure}
+
+\setlength\intextsep{20pt}
+\begin{wrapfigure}{r}{0.45\textwidth}
+\vspace{-2mm}
+    \centering
+    \includegraphics[width=\linewidth]{figures/elo_2.pdf}
+    \vspace{-6mm}
+    \caption{\textbf{Video compression rater study}.
+    }
+    \label{fig:compression}
+    \vspace{-28mm}
+\end{wrapfigure}
+\vspace{-8mm}
+\leavevmode\subsection{Video Compression}
+
+We conduct a subjective rater study to assess the compression quality of \modelname{}. The study is conducted on the 30 videos of the MCL-JCV dataset, resized to a resolution of 640$\times$360.
+Sixteen raters are engaged, each providing responses to an average of roughly 800 pairwise-preference questions.
+\newpage
+
+We calculate Elo scores~\citep{elo1978rating} based on pairwise preferences to quantify the relative visual quality between the models. The study compares our model with MAGVIT as well as the current video compression standard HEVC (H.265) video codec~\citep{sullivan2012overview} and the next-generation codec VVC (H.266)~\citep{vvc}. As shown in \cref{fig:compression}, raters prefer our model to the compared methods at multiple bit rates.
+
+\begin{wraptable}{r}{0.45\textwidth}
+\vspace{-10mm}
+    \centering
+    \caption{\textbf{Video compression metrics}.
+    }
+    \label{tab:compression}
+    \vspace{-2mm}
+    \resizebox{\linewidth}{!}{%
+    \begin{tabular}{l@{\hspace{5pt}}c@{\hspace{5pt}}c@{\hspace{5pt}}c@{\hspace{5pt}}c}
+    \toprule
+    Method  & LPIPS$\downarrow$ & PSNR$\uparrow$ & MS-SSIM$\uparrow$ \\
+    \midrule
+    HEVC~\citep{sullivan2012overview} & 0.199& 30.10 & 0.943 \\ 
+    VVC~\citep{vvc} & 0.153 & \textbf{32.65} & \textbf{0.966} \\
+    \midrule
+    MAGVIT~\citep{yu2022magvit} & 0.144 & 23.70 & 0.846 \\ 
+    \emph{\modelname{} (this paper)} & \textbf{0.104} & 26.18 & 0.894 \\
+    \bottomrule
+    \end{tabular}
+    }
+    \vspace{-8mm}
+\end{wraptable}
+
+We also compare the compression quality using common distortion metrics (LPIPS, PSNR, and MS-SSIM). 
+\cl{\cref{tab:compression} compares at 0.0384 bpp, the bit rate of MAGVIT, with full curves in the Appendix}.
+The results show that our model outperforms MAGVIT on all metrics, and it outperforms all methods on LPIPS, a metric which correlates more closely with subjective quality assessments.
+\cl{
+At equal bit rates, standard codecs may render local details
+ more accurately than neural models but  also introduce block
+ artifacts,  detrimental to  perceptual quality yet not captured by PSNR and MS-SSIM~\citep{agustsson2019generative}.
+}
+\cl{Despite promising results with TPUs, further research is needed to adapt our model to run efficiently on CPUs like standard codecs.}
+
+\setlength\intextsep{20pt}
+\begin{wraptable}{r}{0.5\textwidth}
+\centering
+\caption{\textbf{Video action recognition performance}\\(classification accuracy$\uparrow$ $\times$100).}
+\label{tab:understanding}
+\vspace{-2mm}
+\resizebox{\linewidth}{!}{%
+\begin{tabular}{@{}l@{\hspace{5pt}}c@{\hspace{10pt}}c@{\hspace{5pt}}c@{\hspace{5pt}}c@{}}
+\toprule
+\makecell[r]{Token as transformer's:} & Output & \multicolumn{3}{c}{Input}  \\
+Tokenizer & SSv2 & SSv2 & K400 & K600 \\ \midrule
+3D VQ-VAE & 64.13 & 41.27 & 44.44 & 45.67 \\
+MAGVIT~\citep{yu2022magvit} & 67.22 & 57.34 & 72.29 & 74.65 \\
+\emph{\modelname{} (this paper)} & \textbf{67.38} & \textbf{62.40} & \textbf{75.34} & \textbf{77.93} \\ \midrule
+\textcolor{gray}{Raw pixel} & \textcolor{gray}{\cl{64.83}} & \textcolor{gray}{63.08} & \textcolor{gray}{76.13} & \textcolor{gray}{78.92} \\ 
+\textcolor{gray}{\cl{HoG descriptor~\citep{wei2022masked}}} & \textcolor{gray}{\cl{65.86}} & \textcolor{gray}{\cl{n/a}} & \textcolor{gray}{\cl{n/a}} & \textcolor{gray}{\cl{n/a}} \\
+\bottomrule
+\end{tabular}
+}
+\vspace{-14mm}
+\end{wraptable}
+\vspace{-8mm}
+\leavevmode\subsection{Video Understanding}
+\vspace{-2mm}
+In this subsection, we assess the tokenizer's capability to learn a video understanding model for action recognition. Two setups are examined: (1) using tokens as prediction targets for the transformer's output, and (2) using tokens as the input to the transformer. For the former setup, we use a similar architecture following the BEVT~\citep{wang2022bevt} pre-training. For the tokens as inputs, to work with the ViViT backbone~\citep{arnab2021vivit}, we detokenize the tokens to pixels before feeding them to \cl{frozen} ViViT transformers \cl{trained on raw pixels}.
+
+\cref{tab:understanding} shows that \modelname{} outperforms the previous best MAGVIT in these evaluations. Specifically, when using the decoded tokens as input, the performance approaches that of the model trained with ground-truth pixels using the same ViViT backbone. While these numbers are still worse than the state-of-the-art in action recognition, they represent solid improvements credited to the new tokenizer.
+
+\vspace{-2mm}
+\subsection{Ablation Study}
+\vspace{-2mm}
+In \cref{fig:motivation}, we have ablated \quantizername{} \vs VQ and the vocabulary size.
+In \cref{tab:ablation}, we validate the key designs proposed in \cref{sec:tokenizer_improvement}. Specifically, \cref{tab:ablation_arch} compares the architecture illustrated in \cref{fig:arch}; \cref{tab:ablation_imagenet} and \cref{tab:ablation_ucf101} verify the \quantizername{} and other improvements on ImageNet and UCF-101, respectively.
+
+\begin{table}[tp]
+\vspace{-4mm}
+\centering
+\scriptsize
+\caption{\textbf{Ablation study verifying key design choices}.}
+\label{tab:ablation}
+\vspace{-2mm}
+\begin{subtable}{0.36\linewidth}
+\centering
+\caption{\label{tab:ablation_arch}Causal architectures on UCF-101. FID is calculated on the first frame.}
+
+\begin{tabular}{@{}l@{\hspace{2pt}}c@{\hspace{2pt}}c@{\hspace{2pt}}c@{}}
+\toprule
+ & \#Params & FID$\downarrow$ & FVD$\downarrow$ \\ \midrule
+\textcolor{gray}{MAGVIT} & \textcolor{gray}{39M} & \textcolor{gray}{n/a} & \textcolor{gray}{107.15}  \\
+C-ViViT & 90M & 28.02 & 437.54 \\
+C-ViViT + MAGVIT & 67M & 13.52  & 316.70 \\
+\makecell[l]{\emph{\modelname{}}:\\\ \ Causal 3D CNN} & 58M & \textbf{7.06} & \textbf{96.33} \\ \bottomrule
+\end{tabular}
+\end{subtable}
+\hfill
+\begin{subtable}{0.3\linewidth}
+\centering
+\caption{\label{tab:ablation_imagenet}Image tokenization on\\ImageNet 128$\times$128.}
+\begin{tabular}{@{}l@{\hspace{2pt}}c@{\hspace{2pt}}c@{}}
+\toprule
+ & FID$\downarrow$ & LPIPS$\downarrow$ \\ \midrule
+MAGVIT & 2.65 & 0.1292 \\
++ LFQ & 2.48 & 0.1182 \\
++ large vocabulary & 1.34 & 0.0821 \\
++ up/downsampler & 1.21 & 0.0790 \\
++ deeper model & 1.20 & 0.0686 \\
++ adaptive normalization & \textbf{1.15} & \textbf{0.0685} \\ \bottomrule
+\end{tabular}
+\end{subtable}
+\hfill
+\begin{subtable}{0.33\linewidth}
+\centering
+\caption{\label{tab:ablation_ucf101}Video tokenization on UCF-101.}
+\begin{tabular}{@{}l@{\hspace{2pt}}c@{\hspace{2pt}}c@{}}
+\toprule
+ & FVD$\downarrow$ & LPIPS$\downarrow$ \\ \midrule
+MAGVIT & 24.55 & 0.0988 \\
++ LFQ \& large vocabulary & 16.12 & 0.0694 \\
++ up/downsampler & 15.37 & 0.0678 \\
++ late temporal downsample & 11.11 & 0.0653 \\
++ deeper model & 8.90 & 0.0542 \\
++ 3D blur pooling & \textbf{8.62} & \textbf{0.0537} \\ 
+\bottomrule 
+\end{tabular}
+\end{subtable}
+\vspace{-4mm}
+\end{table}
+
+\vspace{-4mm}
+\section{Related Work}
+\vspace{-4mm}
+\paragraph{Visual tokenization.}
+Beyond the VQ-VAE models discussed in \cref{sec:background}, additional models have been proposed. ViT-VQGAN \citep{yu2021vector} introduces transformer blocks as a substitute for CNNs for image tokenization. C-ViViT \citep{villegas2022phenaki} further extends this idea for video tokenization. %Tokenizing video is more complex since it requires modeling the visual dynamics within the compressed spatial-temporal latent space. 
+Early studies on video tokenization treat frames as independent images with no temporal compression~\citep{wu2021n,gupta2022maskvit}. Later research \citep{yan2021videogpt,ge2022long,yu2022magvit} integrates 3D CNNs to tokenize spatial-temporal volumes. Despite these advances in vector quantization (VQ), the codebook learned by previous VQ models is relatively small (\eg, $8$k) due to the difficulty in improving the generation quality with larger vocabularies. In contrast, our tokenizer can induce a large vocabulary (\eg, $262$k) that can be effectively modeled by an LM, leading to enhanced image and video generation quality. 
+
+\vspace{-4mm}
+\paragraph{Text-to-\{image, video\}.}
+Text-to-image and text-to-video generation has garnered significant rapid advancements using both language models~\citep{yu2023scaling,chang2023muse} and diffusion models~\citep{ho2022imagen,blattmann2023align,singer2022make,ge2023preserve,ramesh2022hierarchical}. Although diffusion models, such as Midjourney, are considered the top performers in these tasks, it is unclear whether their advantage stems from the model, data, or some other unidentified factors. Indeed, it is challenging to scientifically compare these text-to-image models as they are trained on varied datasets, with some even being proprietary data, under inconsistent training conditions. To facilitate a fairer comparison, this paper prioritizes using the ImageNet and Kinetics benchmarks.
+
+\vspace{-4mm}
+\paragraph{Diffusion models.}
+Exhibiting high quality sampling, pixel-space diffusion models \citep{sohl2015deep,song2019generative,ho2020denoising} raised to the top of the generative modeling space for both image \citep{ho2020denoising,dhariwal2021diffusion,saharia2022photorealistic} and video \citep{ho2022video,ho2022imagen,singer2022make} synthesis. The pixel-space denoising diffusion models (DDMs) are later refined by the latent-space DDM \citep{rombach2022high}, which conducts diffusion over the \emph{continuous} latent embeddings derived from a pre-trained variational autoencoder (VAE).
+Binary latents for image modeling were used in \cite{wang2023binary}, where the diffusion process is parameterized with Bernoulli distributions.
+Recent studies have identified advantages in substituting the U-Net~\citep{ronneberger2015u} denoising backbone with a Transformer \citep{peebles2022scalable,jabri2023scalable} or a hybrid of both \citep{hoogeboom2023simple}, making the distinctions between diffusion and language models in visual generation more blurred, with a key distinction being their latent format — continuous for diffusion and discrete for language models.
+
+\vspace{-4mm}
+\section{Conclusion and Future Work}
+\vspace{-3mm}
+
+We introduce \modelname{}, a novel video tokenizer that exploits lookup-free quantization along with architectural advancements to tokenize images and video with a shared vocabulary. The experiments show that our tokenizer outperforms the previously leading video tokenizer across three areas: visual generation, video compression, and action recognition in videos. Our results suggest that a good visual tokenizer is key for enabling language models to excel in image and video generation. These results demonstrate the great capabilities of LMs in visual generation, and advocate for further exploration of advanced visual tokenization methods designed for LLMs.
+
+\subsubsection*{Acknowledgments}
+We would like to express our gratitude to Yu-Chuan Su and Sergey Ioffe for their valuable comments on our work, to Josh Dillon for discussions, 
+and to Eirikur Agustsson for help in compression evaluation.
+
+\clearpage
+
+\end{document}

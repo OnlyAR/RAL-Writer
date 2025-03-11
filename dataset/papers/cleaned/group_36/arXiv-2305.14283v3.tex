@@ -1,0 +1,509 @@
+\title{Query Rewriting for Retrieval-Augmented Large Language Models}
+
+\begin{document}
+
+\maketitle
+\begin{abstract}
+Large Language Models (LLMs) play powerful, black-box readers in the \textit{retrieve-then-read} pipeline, making remarkable progress in knowledge-intensive tasks.
+This work introduces a new framework, \textit{Rewrite-Retrieve-Read} instead of the previous \textit{retrieve-then-read} for the retrieval-augmented LLMs from the perspective of the query rewriting.
+Unlike prior studies focusing on adapting either the retriever or the reader, our approach pays attention to the adaptation of the search query itself, for there is inevitably a gap between the input text and the needed knowledge in retrieval.
+We first prompt an LLM to generate the query, then use a web search engine to retrieve contexts.
+Furthermore, to better align the query to the frozen modules, we propose a trainable scheme for our pipeline.
+A small language model is adopted as a trainable rewriter to cater to the black-box LLM reader.
+The rewriter is trained using the feedback of the LLM reader by reinforcement learning.
+Evaluation is conducted on downstream tasks, open-domain QA and multiple-choice QA. 
+Experiments results show consistent performance improvement, indicating that our framework is proven effective and scalable, and brings a new framework for retrieval-augmented LLM \footnote{https://github.com/xbmxb/RAG-query-rewriting}.
+\end{abstract}
+
+\section{Introduction}
+Large Language Models (LLMs) have shown remarkable abilities for human language processing and extraordinary scalability and adaptability in few- or zero-shot settings.\cite{ouyang2022training, brown2020language, chowdhery2022palm}.
+However, the training process depends on large-scale high-quality corpora but without the perception of the real world. Thus, LLMs still have to face the issue of hallucination \cite{yao2023react, bang2023multitask} and temporal misalignment \cite{rottger-pierrehumbert-2021-temporal-adaptation, luu-etal-2022-time, jang2022temporalwiki}.
+This affects the reliability of LLMs and hinders wider practical application, because the consistency between the LLM responses with the real world needs further validation.
+Existing work has proved that incorporating external knowledge (i.e., non-parametric knowledge) with internal knowledge (i.e., parametric knowledge) can effectively alleviate hallucination, especially for knowledge-intensive tasks. 
+In fact, retrieval-augmented LLMs have been shown so effective that they have been regarded as a standard solution to alleviate the factuality drawbacks in naive LLM generations. 
+Retrieval augmentation is applied to select relative passages as external contexts for the language model, which is \textit{retrieve-then-read} framework  \cite{lewis2020rag, karpukhin-etal-2020-dense, atlas_few-shot_2022}.
+Take the open-domain Question-Answering task (open-domain QA) as an example, a retriever first searches for related documents for a question. Then the LLM receives the question and the documents, then predicts an answer.
+
+As most LLMs are only accessible through inference APIs, they play the part of black-box frozen readers in the pipeline.
+This makes previous retrieval augmentation methods that require complete access \cite{lewis2020rag, guu2020realm, atlas_few-shot_2022} no longer feasible.
+Recent studies on retrieval-augmented language models lean more on the LLM-oriented adaptation.
+An idea is to train a dense retrieval model to cater to the frozen language model \cite{shi2023replug}.
+By using feedback from the LLM as a training objective, the retrieval model is tuned for better LLM input contexts. 
+Another research line focuses on the design of interactions between the retriever and the reader \cite{yao2023react, khattab2022dsp}, where both the retriever and the reader are usually frozen.
+The idea is to trigger the emergent ability through carefully crafted prompts or a sophisticated prompt pipeline. 
+Multiple interactions with external knowledge allow the LLM to approach the correct answer step by step.
+
+However, there are still problems remaining to be solved.
+Existing approaches overlook the adaptation of the query, i.e., the input of the \textit{retrieve-then-read} pipeline. 
+The retrieval query is either original from datasets or directly determined by the black-box generation, thus is always fixed. 
+However, there is inevitably a gap between the input text and the knowledge that is really needed to query.
+This limits performance and places a burden on retrieval capability enhancement and prompt engineering.
+
+In consideration of this issue, this paper proposes \textit{Rewrite-Retrieve-Read}, a new framework for retrieval augmentation, which can be further tuned for adapting to LLMs.
+In front of the retriever, a step of \textit{rewriting the input} is added, filling the gap between the given input and retrieval need, as is shown in Figure \ref{overview}.
+We adopt the off-the-shelf tool, an internet search engine, as the retriever, which avoids the maintenance of the search index and can access up-to-date knowledge \cite{lazaridou2022internet}.
+Different from previous studies \cite{khattab2022dsp, yao2023react} that require the memory of multiple interaction rounds between the retriever and the LLM for each sample,   
+the motivation of our rewriting step is to clarify the retrieval need from the input text. 
+
+We also propose a trainable scheme for our \textit{rewrite-retrieve-read} framework (Figure \ref{overview} (c)).
+The black-box retriever and the reader form a frozen system.
+To further smooth the steps of our pipeline,
+we apply a small, trainable language model to perform the rewriting step, denoted as the \textit{rewriter}.
+The rewriter is trained by reinforcement learning using the LLM performance as a reward, learning to adapt the retrieval query to improve the reader on downstream tasks. 
+
+Our proposed methods are evaluated on knowledge-intensive downstream tasks including open-domain QA (HotpoQA \cite{yang-etal-2018-hotpotqa}, AmbigNQ \cite{min2020ambigqa}, PopQA \cite{mallen2023llm_memorization}) and multiple choice QA (MMLU \cite{hendryckstest2021mmlu}). 
+The experiments are implemented on T5-large \cite{2020t5} as the rewriter, ChatGPT \cite{ouyang2022training} and Vicuna-13B \cite{vicuna2023} as the LLM reader. 
+The results show that query rewriting consistently improves the retrieve-augmented LLM performance. 
+The results also indicate that the smaller language model can be competent for query rewriting.
+
+To sum up, our proposed novel retrieval-augmentation method, \textit{rewrite-retrieve-read} is the first framework where the input text is adapted for the frozen retriever and LLM reader. 
+We introduce a tuneable scheme with a small, trainable model, achieving performance gains with less resource consumption. 
+
+\section{Related Work}
+\subsection{Retrieval Augmentation}
+Language models require external knowledge to alleviate the factuality drawbacks.
+Retrieval augmentation has been regarded as the standard effective solution. 
+With a retrieval module, related passages are provided to the language model as the context of the original input. 
+Thus factual information like common sense or real-time news helps with output prediction through contextualized reading comprehension. 
+
+Earlier studies use sparse retriever \cite{chen2017reading} or dense retriever \cite{karpukhin-etal-2020-dense} in front of a pre-trained language model (PrLM).
+The neural retriever and reader are both PrLMs of trainable size like BERT \cite{bert2019Devlin} or BART \cite{bart2020Lewis}.
+Hence, the whole \textit{retrieve-then-reader} framework is a tuneable end-to-end system, where the retrieved contexts can be regarded as the intermediate results \cite{karpukhin-etal-2020-dense, lewis2020rag}.
+Approaches to smooth the two-step framework are proposed to optimize the retrieval and the reading comprehension \cite{emdr22021SachanRHDY21, lee-etal-2022-need, jiang-etal-2022-reatt}.
+More recently, retrieval remains a powerful enhancement as the size of models and data scales rapidly \cite{mallen2023llm_memorization, shi2023replug, brown2020language}.
+On the other hand, retrieval enhancement can compensate for the shortfall in parameter size, compared to large-scale language models.
+For example,
+by jointly training the retriever and the reader, Atlas \cite{atlas_few-shot_2022} shows few-shot performance on par with 540B PalM \cite{chowdhery2022palm} but be of 50$\times$ smaller size.
+
+\begin{figure*}[t]
+		\centering
+		\includegraphics[width=0.9\textwidth]{figs/f1-crop.pdf}
+		\caption{\label{overview} Overview of our proposed pipeline. From left to right, we show (a) standard \textit{retrieve-then-read} method, (b) LLM as a query rewriter for our \textit{rewrite-retrieve-read} pipeline, and (c) our pipeline with a trainable rewriter. }
+\end{figure*}
+
+\noindent \textbf{The Internet as a knowledge base} \quad
+More related to our work, the search engine can assume the role of the retriever and use the Internet as the source of external knowledge.
+\citet{komeili-etal-2022-internet} use an internet search for relevant information based on the dialogue history to perform dialogue response generation.
+SeeKeR \cite{DBLP:conf/emnlp/0001KARSW22} use a single Transformer to iteratively perform search query generation, then knowledge extraction for dialogue generation and sentence completion.
+For large-scale models, web search still shows effective for knowledge augmentation \cite{lazaridou2022internet}, fact-checking \cite{menick2022teaching}, and LLM agent enhancement \cite{yao2023react}.
+
+\subsection{Cooperation with Black-box LLMs}
+Large Language Models, such as ChatGPT \cite{ouyang2022training}, Codex \cite{codex2021chen}, PaLM \cite{chowdhery2022palm}, emerge impressive natural language processing ability as well as remarkable scalability.
+This leads to a tendency to embrace LLMs on a wide range of NLP tasks.
+However, LLMs are only accessible as a black box in most cases, which is because
+(i) Some like ChatGPT are not open-source and kept private;
+(ii) The large parameter scale requires computational resources that are not always affordable to users.
+This constraint means nothing is available except input and output texts.
+
+Existing studies have proved that LLMs' abilities can be better leveraged by carefully designed interaction methods.
+GenRead \cite{yu2023generate} prompts an LLM to generate context instead of deploying a retriever, showing that LLMs can retrieve internal knowledge by prompting.
+ReAct \cite{yao2023react} and Self-Ask \cite{press2022measuring} combines the Chain-of-Thought (CoT) \cite{cot/nips/Wei0SBIXCLZ22, selfconsistency2022wang} and inter-actions with web APIs. Only relying on prompt construction, ReAct provides novel baselines for interactive tasks.
+Demonstrate–Search–Predict (DSP) \cite{khattab2022dsp} defines a sophisticated pipeline between an LLM and a retriever. Unlike ReAct, DSP integrates prompts for demonstration bootstrap besides multi-hop breakdown and retrieval.
+
+Despite the promising performance in the zero or few-shot setting, the behavior of LLMs sometimes needs adjustments.
+A feasible approach is to append trainable small models in front of or after the LLM. 
+The small models, as a part of the parameters of the system, can be fine-tuned for optimization. 
+RePlug \cite{shi2023replug} is proposed to fine-tune a dense retriever for the frozen LLM in the \textit{retrieve-then-read} pipeline. The retriever is trained under the LLM's supervision to retrieve documents that are suitable for the LLM. 
+With the same purpose, Directional Stimulus Prompting \cite{li2023guiding} deploys a small model to provide the LLM with stimulus (e.g., keywords for summarization, or dialogue actions for response generation), which is updated according to the LLM reward.
+
+Different from the inspiring work mentioned above, our proposed pipeline contains a query rewriting step in front of the \textit{retrieve-then-read} module. We further propose a trainable scheme with a small rewriting model, which is a novel enhancement for retrieval-augmented LLM by reconstructing the search query.
+
+\section{Methodology}
+We present \textit{Rewrite-Retrieve-Read}, a pipeline that improves the retrieval-augmented LLM from the perspective of query rewriting. Figure \ref{overview} shows an overview.
+This section first introduces the pipeline framework in section \ref{fw}, then the trainable scheme in section \ref{ts}.
+
+\subsection{\textit{Rewrite-Retrieve-Read}} \label{fw}
+A task with retrieval augmentation can be denoted as follows. 
+Given a dataset of a knowledge-intensive task (e.g., open-domain QA), $D = \{(x, y)_i\}, i = 0,1,2, \dots, N$, $x$ (e.g., a question) is the input to the pipeline, $y$ is the expected output (e.g., the correct answer). 
+Our pipeline consists of three steps. 
+(\romannumeral1) Query rewrite: generate a query $\tilde{x}$ for required knowledge based on the original input $x$. 
+(\romannumeral2) Retrieve: search for related context, $doc$.
+(\romannumeral3) Read: comprehend the input along with contexts $[doc, x]$ and predict the output $\hat{y}$.
+
+A straightforward but effective method is to ask an LLM to rewrite queries to search for information that is potentially needed.
+We use a few-shot prompt to encourage the LLM to think, and the output can be none, one or more queries to search.
+
+\subsection{Trainable Scheme} \label{ts}
+Besides, total reliance on a frozen LLM has shown some drawbacks. 
+Reasoning errors or invalid search hinders the performance \cite{yao2023react, behnamghader2022can}.
+On the other hand, retrieved knowledge may sometimes mislead and compromise the language model \cite{mallen2023llm_memorization}.
+To better align to the frozen modules, it is feasible to add a trainable model and adapt it by taking the LLM reader feedback as a reward.
+
+Based on our framework, we further propose to utilize a trainable small language model to take over the rewriting step, as is shown in the right part of Figure \ref{overview}. 
+The trainable model is initialized with the pre-trained T5-large (770M) \cite{2020t5}, denoted as \textit{trainable rewriter}, $G_{\theta}$.
+The rewriter is first trained on pseudo data to warm up (\S \ref{warmup}), then continually trained by reinforcement learning (\S \ref{rein}).
+
+\subsubsection{Rewriter Warm-up}\label{warmup}
+The task, query rewriting, is quite different from the pre-training objective of sequence-to-sequence generative models like T5.
+First, we construct a pseudo dataset for the query rewriting task.
+Inspired by recent distillation methods \cite{Hsieh2023DistillingSO,ho2022large}, we prompt the LLM to rewrite the original questions $x$ in the training set and collect the generated queries $\tilde{x}$ as pseudo labels. 
+The collected samples are then filtered: Those that get correct predictions from the LLM reader are selected into the warm-up dataset, denoted as $D_{Train} = \{(x, \tilde{x}) | \hat{y} = y\}$. 
+The rewriter $G_{\theta}$ is fine-tuned on $D_{Train}$ with the standard log-likelihood as the training objective, denoted as
+\begin{equation}
+\setlength{\abovedisplayskip}{5pt}
+\setlength{\belowdisplayskip}{5pt}
+\begin{split}
+& \mathcal{L}_{warm} = - \sum_{t} logp_{\theta} \textup{(} \textit{ $\hat{\tilde{x}}$}_{t} \mid \textit{ $\tilde{x}$}_{<t} \textup{, } \textit{x} \textup{ )}.
+\end{split}
+\label{loss}
+\end{equation}
+
+The rewriter model after warm-up shows modest performance, which depends on the pseudo data quality and rewriter capability. 
+Highly relying on the human-written prompt line, $\tilde{x}$ can be sub-optimal. 
+The relatively small scale of the rewriter size is also a limitation of the performance after the warm-up.
+Then we turn to reinforcement learning to align the rewriter to the following retriever and LLM reader.
+
+\subsubsection{Reinforcement Learning}\label{rein}
+To further fine-tune the rewriter to cater to the LLM reader, we adopt a policy gradient reinforcement learning framework. 
+
+\noindent \textbf{Task Formulation} \quad
+In the context of reinforcement learning, the rewriter optimization is formulated as a Markov Decision Process 5-tuple $\langle\mathcal{S}, \mathcal{A}, P, R, \gamma \rangle$. 
+(\romannumeral1) The state space $\mathcal{S}$ is a finite set limited by the vocabulary and the sequence length. 
+(\romannumeral2) The action space $\mathcal{A}$ is equals to the vocabulary.
+(\romannumeral3) The transition probability $P$ is determined by the policy network, which is the rewriter model $G_{\theta}$.
+(\romannumeral4) The reward function $R$ gives a reward value that depends on the current state. The policy gradient is derived from rewards, used as the training objective.
+(\romannumeral5) $\gamma$ denotes the discount factor.
+More specifically, the rewriter $G_{\theta}$ after the warm-up is the initial policy model $\pi_{0}$. 
+At each step $t$, the action $a_t$ is to generate the next token $\hat{\tilde{x}}_{t}$ based on the observation of the present state, $s_t = [x, \hat{\tilde{x}}_{<t}]$. 
+When the generation is stopped by the End-Of-Sentence token, one episode is ended. 
+After finishing the retrieval and reading, a reward is computed by evaluating the final output, i.e., a score for the LLM reader prediction.
+
+\noindent \textbf{Policy Optimization} \quad
+We adopt Proximal Policy Optimization (PPO) \cite{schulman2017ppo}, following \cite{Ramamurthy2022IsRL}. 
+Maximization of the expectation of the reward $R$ is formulated as
+\begin{equation}
+\setlength{\abovedisplayskip}{5pt}
+\setlength{\belowdisplayskip}{5pt}
+\begin{split}
+&\max _{\theta} \mathbb{E}_{\hat{\tilde{x}} \sim p_{\theta}(\cdot \mid x)}[R(x,\hat{\tilde{x}})],\\
+&\max _{\theta} \mathbb{E}_{\left(s_t, a_t\right) \sim \pi_{\theta^{\prime}}}[min\{k_{t, \theta} A^{\theta^{\prime}}\left(s_t, a_t\right);\\
+&\quad \quad \operatorname{clip}\left(k_{t, \theta}, 1-\varepsilon, 1+\varepsilon\right) A^{\theta^{\prime}}\left(s_t, a_t\right)\}], \\
+& k_{t, \theta} = \frac{p_\theta\left(a_t \mid s_t\right)}{p_{\theta^{\prime}}\left(a_t \mid s_t\right)},\\
+\end{split}
+\end{equation}
+where $\theta^{\prime}$ is the temporarily fixed policy for sampling and $\theta$ is updated.
+$A$ denotes the advantage function, which is formulated based on the estimation of value network $V_{\phi}$.
+The value network $V_{\phi}$ is initialized from the policy network $\pi_{0}$. 
+The formulation follows Generalized Advantage Estimation (GAE) \cite{schulman2015gae}.
+\begin{equation}
+\begin{split}
+\setlength{\abovedisplayskip}{5pt}
+\setlength{\belowdisplayskip}{5pt}
+&\delta_t=R\left(s_t, a_t\right)+V_\phi\left(s_{t+1}\right)-V_\phi\left(s_t\right), \\
+&\hat{A}^{\theta}_{t}\left(s_t, a_t\right)=\sum_{t^{\prime}=0}^{\infty} \lambda^{t^{\prime}} \delta_{t+t^{\prime}},
+\end{split}
+\end{equation}
+where $\lambda$ is the bias-variance trade-off parameter.
+
+The reward function $R$ reflects the quality of the generated queries, which needs to be consistent with the final evaluation of the task. %, denoted as $R_{lm}$. 
+$\hat{\tilde{x}}$ is fed to the retriever and the reader for a final prediction $\hat{y}$. 
+A part of the reward function is the measures of $\hat{y}$ compared to the golden label $y$ (e.g., exact match and F$_{1}$ of the predicted answers), denoted as $R_{lm}$. 
+Besides, a KL-divergence regularization is added to prevent the model from deviating too far from the initialization \cite{Ramamurthy2022IsRL, ziegler2019fine}.
+\begin{equation}
+\begin{split}
+\setlength{\abovedisplayskip}{5pt}
+\setlength{\belowdisplayskip}{5pt}
+&R\left(s_t, a_t\right)=R_{lm}(\hat{\tilde{x}}, y)-\beta \mathrm{KL}\left(\pi_\theta \| \pi_0\right).
+\end{split}
+\label{beta}
+\end{equation}
+The final loss function is composed of policy loss and value loss.
+\begin{equation}
+\begin{split}
+\setlength{\abovedisplayskip}{5pt}
+\setlength{\belowdisplayskip}{5pt}
+&\mathcal{L}_{\theta}= - \frac{1}{\left|\mathcal{S}\right| T} \sum_{\tau \in \mathcal{S}} \sum_{t=0}^T \min (k_{t,\theta} A^{{\theta}^{\prime}}, \operatorname{clip}A^{{\theta}^{\prime}}),\\
+&\mathcal{L}_{\phi}= \frac{1}{\left|\mathcal{S}\right| T} \sum_{\tau \in \mathcal{S}} \sum_{t=0}^T\left(V_\phi\left(s_t\right)-R_t\right)^2, \\
+&\mathcal{L}_{ppo} = \mathcal{L}_{\theta} + \lambda_{v} \mathcal{L}_{\phi}.
+\end{split}
+\end{equation}
+Here, $\mathcal{S}$ denotes the sampled set, and $T$ is for step numbers.
+
+\section{Implementation}
+\noindent \textbf{Rewriter} \quad
+For the frozen pipeline in \S \ref{fw}, we prompt an LLM to rewrite the query with few-shot in-context learning \cite{brown2020language,min-etal-2022-rethinking}.
+Our prompt follows the formulation of \textit{[instruction, demonstrations, input]}, where the input is $x$.
+The instruction is straightforward and demonstrations are 1-3 random examples from training sets and are kept constant across all runs, mainly for the task-specific output format illustration, i.e., a short phrase as an answer for HotpotQA, and an option as an answer for MMLU.
+For the training scheme in \S \ref{ts}, we fine-tuning a T5 as the rewriter.
+
+\noindent \textbf{Retriever} \quad 
+We use the Bing search engine as the retriever. 
+It requires no candidate index construction like a dense retriever, nor candidates like a textbook. 
+But it allows for a wide knowledge scope and up-to-time factuality.
+With Bing API, the retrieval is performed in two approaches.
+(\romannumeral1) For all retrieved web pages, we concatenate the snippets that are related sentences selected by Bing. 
+This method is similar to using a search engine in a browser, input a query and press Enter, then collect the texts shown on the search result page.
+(\romannumeral2) For retrieved web pages, we request the URLs and parser to get all the texts. This is similar to clicking on items on the search result page. 
+Then we use BM25 to keep those with higher relevance scores with the query, reducing the document length.
+
+\noindent \textbf{Reader} \quad 
+The reader is a frozen LLM, where we adopt ChatGPT (gpt-3.5-turbo) and Vicuna-13B.
+It performs reading comprehension and prediction with few-shot in-context learning.
+In our prompt, following the brief instruction and the demonstrations, the input is $x$ or $[doc, \hat{\tilde{x}}]$ with retrieval augmentation.
+
+It has been proved that both the phrasing of prompt lines \cite{zhang2023tempera} and the selection of demonstrations show effects on the in-context learning performance \cite{su2022selective, zhang2023autocot}.
+As it is not the focus of this work, we pay no more attention to prompt editing.
+
+\section{Experiments}
+\subsection{Task Settings}
+\begin{table*}[tbh]
+	\centering\small
+        \resizebox{\linewidth}{!}{
+	\begin{tabularx}{0.9\linewidth}{X}
+		\toprule
+		\textbf{Direct prompt}   \\
+             \midrule
+		 Answer the question in the following format, end the answer with '**'. \{demonstration\} Question: \{$x$\} Answer:
+		\\
+		\midrule
+		\textbf{Reader prompt in retrieval-augment pipelines} \\
+            \midrule
+            Answer the question in the following format, end the answer with '**'. \{demonstration\} Question: \{$doc$\} \{$x$\} Answer: \\
+            \midrule
+            \textbf{Prompts for LLM as a frozen rewriter}\\
+            \midrule
+            \textit{Open-domain QA: }Think step by step to answer this question, and provide search engine queries for knowledge that you need. Split the queries with ';' and end the queries with '**'. \{demonstration\} Question: \{$x$\} Answer: \\
+            \textit{Multiple choice QA: }Provide a better search query for web search engine to answer the given question, end the queries with '**'. \{demonstration\} Question: \{$x$\} Answer: \\
+		\bottomrule
+	\end{tabularx}}
+	\caption{Prompt lines used for the LLMs.}
+        \label{prompt}
+        \vspace{-1.2em}
+\end{table*}%
+\subsubsection{Open-domain QA}
+Three open-domain QA datasets are used for evaluation.
+(\romannumeral1) HotPotQA \cite{yang-etal-2018-hotpotqa} consists of complex questions that require multi-hop reasoning. We evaluate the full test set.
+(\romannumeral2) AmbigNQ \cite{min2020ambigqa} provides a disambiguated version of Natural Questions (NQ) \cite{kwiatkowski2019natural}. For ambiguous questions in NQ, minimal constraints are added to break it into several similar but specific questions. The first 1000 samples are evaluated in the test set.
+(\romannumeral3) PopQA \cite{mallen2023llm_memorization} includes long-tail distributions as it contains more low-popularity knowledge than other popular QA tasks. 
+We split the dataset into 13k for training and 714 for testing.
+
+Open-domain QA benchmarks are sets of question-answer pairs denoted as $\{(q, a)_i\}$.
+We use ChatGPT for both the reader and the frozen rewriter.
+The evaluation metrics are Exact Match ($EM$) and $F_{1}$ scores.
+For the reward function in RL, we use an indicator to reward if the retrieved content hits the answer and penalize if misses the answer, denoted as $Hit$.
+The total reward is a weighted sum of EM, F$_{1}$, and $Hit$.
+\begin{equation}
+\setlength{\abovedisplayskip}{6pt}
+\setlength{\belowdisplayskip}{6pt}
+\begin{split}
+&Hit= \begin{cases}1 & a \enspace \text{in} \enspace doc, \\ -1 & else\end{cases} \\
+&R_{lm} = EM + \lambda_{f} {F}_{1} + \lambda_{h} Hit.
+\end{split}
+\label{hit}
+\end{equation}
+
+\subsubsection{Multiple-choice QA}
+
+For multiple-choice QA, our evaluation is conducted on
+Massive Multi-task Language Understanding (MMLU) \cite{hendryckstest2021mmlu}, an exam question dataset including 4 categories: Humanities, STEM, Social Sciences, and Other. 
+Each category is split into 80\% for the training set and 20\% for the test set.
+
+Multiple-choice QA can be formulated as $\{(q^{\prime}, a)_i\}$, where $q^{\prime} = [q, c_0, c_1, c_2, c_3]$. $c$ denotes the options, generally there are four for each question. 
+The retrieved documents that are included in the officially provided contaminated lists are ignored.
+The questions with options are rewritten into search queries. The answer is one option. $EM$ is reported as metrics and used for the reward.
+\begin{equation}
+\setlength{\abovedisplayskip}{5pt}
+\setlength{\belowdisplayskip}{5pt}
+\begin{split}
+&R_{lm} = EM.
+\end{split}
+\end{equation}
+We use ChatGPT as a frozen rewriter and the reader. We also use Vicuna-13B as the reader for evaluation due to the rate limit issue of ChatGPT. 
+More information on datasets and training setup are presented in the appendix.
+
+\subsection{Baselines}
+The following settings are implemented to evaluate and support our methods.
+(\romannumeral1) \textbf{Direct}:
+The standard in-context learning without any augmentations. 
+(\romannumeral2) \textbf{Retrieve-then-read}:
+The standard retrieval-augmented method. Retrieved documents are concatenated with the question.
+(\romannumeral3) \textbf{LLM as a frozen rewriter}:
+As is introduced in \S \ref{fw}, we prompt a frozen LLM to reason and generate queries by few-shot in-context learning. 
+(\romannumeral4) \textbf{Trainable rewriter}:
+Applying the fine-tuned rewriter, the output queries are used by the retriever and the reader. 
+Table \ref{prompt} presents prompt line forms. Please note that the prompts for prediction are kept the same for each task.
+
+\subsection{Results}
+Experimental results on open-domain QA are reported in Table \ref{mainqa}.
+For the three datasets, query rewriting consistently brings performance gain with both a frozen rewriter and a trainable rewriter.
+On AmbigNQ and PopQA, the standard retrieval augments the reader, indicating useful external knowledge is retrieved.
+On HotpotQA, the standard retrieval hurts the reader. This shows that using complex questions as queries cannot compensate for the parametric knowledge, but bring noises instead \cite{mallen2023llm_memorization}.
+This suggests that multi-hop questions are not suitable queries for the web search engine.
+The scores increase by adding the rewriting step.
+On PopQA, our trainable rewriter surpasses standard retrieval while being inferior to the LLM rewriter.
+This indicates that the distillation of query rewriting is sub-optimal.
+
+The scores on multiple-choice QA are presented in Table \ref{mainmc}.
+With ChatGPT as a reader, it can be observed that query rewriting improves the scores in most of the settings, except for the social sciences category.
+With Vicuna as a reader, our method achieves more gains on the four categories compared to ChatGPT.
+This agrees with the intuition that a more powerful reader has more parametric memories, thus more difficult to compensate with external knowledge.
+
+\begin{table}[tbh]
+	\centering\small
+	{\begin{tabular}{p{4cm}p{0.9cm}p{0.9cm}}
+		\toprule
+		\textbf{Model} & \textbf{EM} &\textbf{F$_{1}$} \\
+            \midrule
+            \multicolumn{3}{c}{\emph{HotpotQA}} \\
+            Direct &32.36& 43.05 \\
+            Retrieve-then-read &30.47& 41.34 \\
+            LLM rewriter &32.80& 43.85 \\
+            Trainable rewriter &34.38& 45.97 \\
+            \midrule
+            \multicolumn{3}{c}{\emph{AmbigNQ}} \\
+            Direct &42.10& 53.05 \\
+            Retrieve-then-read &45.80 & 58.50  \\
+            LLM rewriter &46.40 &58.74  \\
+            Trainable rewriter &47.80 & 60.71 \\
+            \midrule
+            \multicolumn{3}{c}{\emph{PopQA}} \\
+            Direct &41.94 & 44.61  \\
+            Retrieve-then-read & 43.20 &47.53 \\
+            LLM rewriter &46.00 & 49.74  \\
+            Trainable rewriter &45.72& 49.51 \\
+		\bottomrule
+	\end{tabular}
+	}
+        \caption{Metrics of open-domain QA.}
+	\label{mainqa}
+ \vspace{-1.2em}
+\end{table}
+
+            
+
+\begin{table}[tbh]
+	\centering\small
+	{\begin{tabular}{p{2.8cm}p{0.7cm}p{0.6cm}p{0.6cm}p{0.6cm}}
+		\toprule
+            \textbf{MMLU} & \multicolumn{4}{c}{\textbf{EM}}\\
+             \midrule
+             &Human. &STEM & Other & Social \\
+             \midrule
+             \multicolumn{5}{c}{\emph{ChatGPT}} \\
+            Direct &75.6 &58.8 & 69.0 &71.6 \\
+            Retrieve-then-read & 76.7 &63.3 &70.0 &78.2 \\
+            LLM rewriter &77.0 &63.5 &72.6 & 76.4\\
+            \midrule
+            \multicolumn{5}{c}{\emph{Vicuna-13B}} \\
+            Direct &39.8 &34.9 & 50.2 &46.6 \\
+            Retrieve-then-read & 40.2 &39.8 &55.2 &50.6 \\
+            LLM rewriter &42.0 &41.5 &57.1  & 52.2\\
+            Trainable rewriter &43.2 & 40.9& 59.3 & 51.2\\
+            
+		\bottomrule
+	\end{tabular}
+	}
+        \caption{Metrics of multiple choice QA.}
+	\label{mainmc}
+ \vspace{-1.2em}
+\end{table}
+
+\section{Analysis}
+
+\begin{figure}[tbh]     
+ \vspace{-1em}
+    \centering      
+        \begin{minipage}{0.49\textwidth}    
+            \centering      
+            \includegraphics[width=\textwidth]{figs/curve-hot.pdf}
+        \end{minipage}            
+        \begin{minipage}{0.49\textwidth}
+            \centering      
+            \includegraphics[width=\textwidth]{figs/curve-amb.pdf}      
+        \end{minipage}     
+        \begin{minipage}{0.49\textwidth}
+            \centering      
+            \includegraphics[width=\textwidth]{figs/curve-pop.pdf}      
+        \end{minipage}    
+    \caption{Reinforcement learning validation scores of (a)HotpotQA, (b)AmbigNQ, and (c)PopQA.  The solid lines show EM (red) and F1 (blue) numbers through training iterations. The dashed lines are EM scores of the standard retrieve-then-read method (orange) and retrieval with an LLM as the rewriter (green).}
+    \label{curves}
+ \vspace{-1.5em}
+\end{figure} 
+\subsection{Training Process}
+The training process includes two stages, warm-up and reinforcement learning.
+This section shows the validation scores of the three open-domain QA datasets for further analysis.
+Figure \ref{curves} presents the metric scores through training iterations in the process of reinforcement learning. 
+As the rewriting models have been warmed up on the pseudo data before RL, scores at ``0 iteration'' denote the ability acquired from the warm-up training.
+
+It can be observed that the curves show upward trends with some fluctuations on all the datasets.
+(\romannumeral1) For multi-hop questions in HotpotQA, the standard retrieval is relatively weaker. 
+Complex questions can be not specific search queries and show a larger gap from rewritten queries, i.e., the green and red lines.
+(\romannumeral2) On AmbigNQ and PopQA, our method surpasses the baselines after several iterations (3 or 4). % which indicates that our pseudo data is insufficient for this distillation.
+This indicates that the RL training stage can compensate for the insufficiency of the distillation on the pseudo data during warm-up training.
+(\romannumeral3) In particular, on PopQA, the trainable rewriter remains inferior to the LLM rewriter. This can be explained as the dataset is constructed for adaptive retrieval \cite{mallen2023llm_memorization}, which only uses retrieval
+where it helps to avoid harmful redundant retrieval. Thus, \textit{``None''} is a possible query that means no retrieval. This causes more complexity and uncertainty. LLM rewriter knows better when the retrieval is needed for itself as a reader, although the rewriting step is not concatenated as the input context of the reader.
+
+We calculate the performance of query \textit{``None''}.
+The questions that can be correctly answered without retrieval (i.e., the ``Direct'' method) are those samples that need no more context. 
+Comparing this retrieval-free set with those that are rewritten to be\textit{``None''} query,
+the F$_{1}$ score of the LLM rewriter is 71.9\% and the T5 rewriter score is 67.1\%.
+If we consider the questions that can be correctly answered without retrieval but go wrong with retrieval as the retrieval-free set, the F$_{1}$ scores are 78.7\% for LLM rewriter and 77.4\% for T5.
+
+\begin{table}[htb]
+	\centering\small
+        \setlength{\belowcaptionskip}{-0.5cm}
+	{\begin{tabular}{p{2.5cm}p{1.0cm}p{1.0cm}p{1.2cm}}
+		\toprule
+		\textbf{Model} & \textbf{EM} &\textbf{F$_{1}$} & \textbf{Hit ratio} \\
+            \midrule
+            No retrieval &42.10& 53.05& --\\
+            Upper bound &58.40 &69.45 & 100 \\
+            \multicolumn{3}{c}{\emph{Retrieve-then-read}} \\
+            w/ snippet &38.70 & 50.50 &61.1 \\
+            w/ BM25 &45.80 & 58.50 & 76.4\\
+            \multicolumn{3}{c}{\emph{LLM rewriter}} \\
+             w/ snippet &39.80 &52.64 & 63.5\\
+            w/ BM25 &46.40 &58.74 &77.5\\
+            \multicolumn{3}{c}{\emph{Trainable rewriter}} \\
+            w/ BM25\tablefootnote{Our trainable rewriter is adapted to the retriever using BM25 during RL training. Using the output queries of the test set after training, the snippet hit rate is 73.4\%.} &47.80 & 60.71 & 82.2 \\
+		\bottomrule
+	\end{tabular}
+	}
+        \caption{Retrieval analysis on AmbigNQ.}
+	\label{ana}
+\end{table}
+
+\subsection{Retrieval Result}
+Our proposed method is a pipeline framework, instead of an end-to-end system.
+The query rewriting first affects the retrieved context, then the context makes a difference to the output of the reader.
+Hence, QA metrics are indirect measurements.
+We take a closer look at the retrieved context and the reader capability through the retrieval metric, hit ratio.
+After text normalization, the hit rate is computed to measure whether the retrieved context contains the correct answers.
+
+Table \ref{ana} shows the scores on AmbigNQ.
+The scores in the second line are computed on a selection of the samples whose retrieved contexts hit correct answers (under the standard retrieve-then-read setting).
+The scores show the approximate upper bound ability of the reader with retrieval augmentation, abbreviated as the ``upper bound'' score.
+The effectiveness of retrieval is proved compared to the no retrieval setting (the first line). 
+For each retrieval method, two settings are presented:
+(\romannumeral1) collecting Bing snippets, (\romannumeral2) selecting from URLs by BM25.
+The metrics show that content selection with BM25 recalls better documents than snippets, while query rewriting makes progress on both settings.
+We also observed that the improvement in the hit rate of the retriever is more significant than the improvement in the reader. This is consistent with the findings in related search \cite{mallen2023llm_memorization, liu2023lost}.
+
+\begin{figure}[t]
+    \centering
+    \setlength{\belowcaptionskip}{-0.3cm}
+    \includegraphics[width=0.5\textwidth]{figs/case-crop.pdf}
+    \caption{\label{case}Examples for intuitive illustration. Q0 denotes original input, Q1 is from the LLM rewriter, and Q2 is from the trained T5 rewriter. \textbf{Hit} means retriever recall the answer, while \textbf{Correct} is for the reader output.}
+\end{figure}
+
+\subsection{Case Study}
+To intuitively show how the query rewriting makes a difference in the retrieved contexts and prediction performance, we present examples in Figure \ref{case} to compare the original questions and the queries.
+In example 1, the original question asks for a film that \textit{the youngest daughter of Lady Mary-Gaye Curzon} co-stars with two certain actors.
+Both query 1 and query 2 put the keyword \textit{film} forward, closely following \textit{the youngest daughter of Lady Mary-Gaye Curzon}. With both, the actress \textit{Charlotte Calthorpe} and her movie information can be retrieved and the answer is included.
+The second is an example where the query from the LLM rewriter failed but the query from T5 gets the correct answer. The number \textit{2000} is misunderstood in query 1, while query 2 keeps \textit{200 movie} together, avoiding meaningless retrieval.
+Example 3 is for multiple choice. The query simplifies the background and enhances the keyword \textit{community planner}. The retrieve contexts are mainly about \textit{Introduction to Community Planning} where the answer \textit{environment} appears several times.
+
+\section{Conclusion}
+This paper introduces the \textit{Rewrite-Retrieve-Read} pipeline, where a query rewriting step is added for the retrieval-augmented LLM. This approach is applicable for adopting a frozen large language model as the reader and a real-time web search engine as the retriever. Further, we propose to apply a tuneable small language model the rewriter, which can be trained to cater to the frozen retriever and reader. 
+The training implementation consists of two stages, warm-up and reinforcement learning.
+Evaluation and analyses on open-domain QA and multiple-choice QA show the effectiveness of query rewriting.
+Our work proposes a novel retrieval-augmented black-box LLM framework, proves that the retrieval augmentation can be enhanced from the aspect of query rewriting, and
+provides a new method for integrating trainable modules into black-box LLMs.
+
+\section*{Limitations}
+We acknowledge the limitations of this work. (i) There is still a trade-off between generalization and specialization among downstream tasks. 
+Adding a training process, the scalability to direct transfer is compromised, compared to few-shot in-context learning.
+(ii) The research line of \textit{LLM agent} has shown impressive performance but relies on multiple calls to the LLM for each sample \cite{khattab2022dsp, yao2023react}, where the LLM plays as an agent to flexibly call the retriever multiple times, reads the context in earlier hops, and generates follow-up questions. Different from these studies, our motivation is to enhance the one-turn retriever-then-read framework with a trainable query rewriter.
+(iii) Using a web search engine as the retriever also leads to some limitations. Neural dense retrievers that are based on professional, filtered knowledge bases may potentially achieve better and controllable retrieval. More discussion is included in the appendix.
+
+\end{document}

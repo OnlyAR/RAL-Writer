@@ -1,0 +1,422 @@
+\title{VideoComposer: Compositional Video Synthesis \\ with Motion Controllability}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+
+The pursuit of controllability as a higher standard of visual content creation has yielded remarkable progress in customizable image synthesis.
+However, achieving controllable video synthesis remains challenging due to the large variation of temporal dynamics and the requirement of cross-frame temporal consistency.
+Based on the paradigm of compositional generation, this work presents \method that allows users to flexibly compose a video with textual conditions, spatial conditions, and more importantly temporal conditions.
+Specifically, considering the characteristic of video data, we introduce the motion vector from compressed videos as an explicit control signal to provide guidance regarding temporal dynamics.
+In addition, we develop a Spatio-Temporal Condition encoder (STC-encoder) that serves as a unified interface to effectively incorporate the spatial and temporal relations of sequential inputs, with which the model could make better use of temporal conditions and hence achieve higher inter-frame consistency.
+Extensive experimental results suggest that \method is able to control the spatial and temporal patterns simultaneously within a synthesized video in various forms, such as text description, sketch sequence, reference video, or even simply hand-crafted motions.
+The code and models will be publicly available at \url{https://videocomposer.github.io}.
+
+\end{abstract}
+\section{Introduction}
+
+\begin{figure}
+    \centering
+    \includegraphics[width=1.0\linewidth]{Figures/01_motivation.pdf}
+    \vspace{-1em}
+    \caption{
+        \textbf{Compositional video synthesis.}
+        \textbf{(a-c)} \method is capable of generating videos that adhere to textual, spatial and temporal conditions or their subsets; 
+        \textbf{(d)} \method can synthesize videos conforming to expected motion patterns (red stroke) and shape patterns (white stroke) derived from two simple strokes. 
+        }
+    \label{fig:teaser}
+    \vspace{-2em}
+\end{figure}
+
+Driven by the advances in computation, data scaling and architectural design, current visual generative models, especially diffusion-based models, have made remarkable strides in automating content creation, empowering designers to generate realistic images or videos from a textual prompt as input~\cite{rombach2022LDM, singer2022make-a-video,ho2022imagenvideo}.
+These approaches typically train a powerful diffusion model~\cite{rombach2022LDM} conditioned by text~\cite{ho2020denoising_ddpm} on large-scale video-text and image-text datasets~\cite{2021Frozen,schuhmann2021laion}, reaching unprecedented levels of fidelity and diversity.
+However, despite this impressive progress, a significant challenge remains in the limited controllability of the synthesis system, which impedes its practical applications.
+
+Most existing methods typically achieve controllable generation mainly by introducing new conditions, such as segmentation maps~\cite{rombach2022LDM, wang2022pretraining}, inpainting masks~\cite{xie2022smartbrush} or sketches~\cite{zhang2023controlnet, mou2023T2I_Adapter}, in addition to texts.
+Expanding upon this idea, Composer~\cite{huang2023composer} proposes a new generative paradigm centered on the concept of \emph{compositionality}, which is capable of composing an image with various input conditions, leading to remarkable flexibility.
+However, Composer primarily focuses on considering multi-level conditions within the spatial dimension, hence it may encounter difficulties when comes to video generation due to the inherent properties of video data.
+This challenge arises from the complex temporal structure of videos, which exhibits a large variation of temporal dynamics while simultaneously maintaining temporal continuity among different frames.
+Therefore, incorporating suitable temporal conditions with spatial clues to facilitate controllable video synthesis becomes significantly essential.
+
+Above observations motivate the proposed \method, which equips video synthesis with improved controllability in both spatial and temporal perception.
+For this purpose, we decompose a video into three kinds of representative factors, \emph{i.e.}, textual condition, spatial conditions and the crucial temporal conditions, and then train a latent diffusion model to recompose the input video conditioned by them.
+In particular, we introduce the video-specific \emph{motion vector} as a kind of temporal guidance during video synthesis to explicitly capture the inter-frame dynamics, thereby providing direct control over the internal motions.
+To ensure temporal consistency, we additionally present a unified STC-encoder that captures the spatio-temporal relations within sequential input utilizing cross-frame attention mechanisms, leading to an enhanced cross-frame consistency of the output videos.
+Moreover, STC-encoder serves as an interface that allows for efficient and unified utilization of the control signals from various condition sequences.
+As a result, \method is capable of flexibly composing a video with diverse conditions while simultaneously maintaining the synthesis quality, as shown in~\cref{fig:teaser}.
+Notably, we can even control the motion patterns with simple hand-crafted motions, such as an arrow indicating the moon's trajectory in~\cref{fig:teaser}d, a feat that is nearly impossible with current methods.
+Finally, we demonstrate the efficacy of \method through extensive qualitative and quantitative results, and achieve exceptional creativity in the various downstream generative tasks.
+
+\section{Related work}
+
+\textbf{Image synthesis with diffusion models.}
+Recently, research efforts on image synthesis have shifted from utilizing GANs~\cite{goodfellow2020GAN}, VAEs~\cite{kingma2013VAE}, and flow models~\cite{dinh2014NICE} to diffusion models~\cite{sohl2015Diffusion_model,ho2020denoising_ddpm,zhang2022gddim,vahdat2021score_generative_latent} due to more stable training, enhanced sample quality, and increased flexibility in a conditional generation.
+Regarding image generation, notable works such as DALL-E 2~\cite{ramesh2022Dalle-2} and GLIDE~\cite{nichol2021glide} employ diffusion models for text-to-image generation by conducting the diffusion process in pixel space, guided by CLIP~\cite{radford2021CLIP} or classifier-free approaches.
+Imagen~\cite{saharia2022Imagen} introduces generic large language models, \textit{i.e.}, T5~\cite{raffel2020T5}, improving sample fidelity.
+The pioneering work LDMs~\cite{rombach2022LDM} uses an autoencoder~\cite{PatrickEsser2021TamingTF} to reduce pixel-level redundancy, making LDMs computationally efficient.
+Regarding image editing, pix2pix-zero~\cite{parmar2023pix2pix-zero} and prompt-to-prompt editing~\cite{hertz2022prompt-to-prompt} follow instructional texts by manipulating cross-attention maps.
+Imagic~\cite{kawar2022Imagic} interpolates between an optimized embedding and the target embedding derived from text instructions to manipulate images.
+DiffEdit~\cite{couairon2022diffedit} introduces automatically generated masks to assist text-driven image editing.
+To enable conditional synthesis with flexible input, ControlNet~\cite{zhang2023controlnet} and T2I-Adapter~\cite{mou2023T2I_Adapter} incorporate a specific spatial condition into the model, providing more fine-grained control.
+One milestone, Composer~\cite{huang2023composer}, trains a multi-condition diffusion model that broadly expands the control space and displays remarkable results.
+Nonetheless, this compositionality has not yet been proven effective in video synthesis, and \method aims to fill this gap.
+
+\textbf{Video synthesis with diffusion models.}
+Recent research has demonstrated the potential of employing diffusion models for video synthesis~\cite{ho2022video_diffusion_models,yang2022DPM_video,harvey2022flexible_diffusion_video,luo2023videofusion,khachatryan2023text2video-zero,blattmann2023align_latents}.
+Notably, ImagenVideo~\cite{ho2022imagenvideo} and Make-A-Video~\cite{singer2022make-a-video} both model the video distribution in pixel space, which limits their applicability due to high computational demands.
+In contrast, MagicVideo~\cite{zhou2022magicvideo} models the video distribution in the latent space, following the paradigm of LDMs~\cite{rombach2022LDM}, significantly reducing computational overhead.
+With the goal of editing videos guided by texts, VideoP2P~\cite{liu2023video-P2P} and vid2vid-zero~\cite{wang2023vid2vid-zero} manipulate the cross-attention map, while Dreamix~\cite{molad2023dreamix} proposes an image-video mixed fine-tuning strategy.
+However, their generation or editing processes solely rely on text-based instructions~\cite{radford2021CLIP,raffel2020T5}.
+A subsequent work, Gen-1~\cite{esser2023gen-1}, integrates depth maps alongside texts using cross-attention mechanisms to provide structural guidance.
+Both MCDiff~\cite{chen2023MCDiff} and LaMD~\cite{hu2023LaMD} target motion-guided video generation; the former focuses on generating human action videos and encodes the dynamics by tracking the keypoints and reference points, while the latter employs a learnable motion latent to improve quality.
+Nevertheless, incorporating the guidance from efficient motion vectors or incorporating multiple guiding conditions within a single model is seldom explored in the general video synthesis field. 
+
+\textbf{Motion modeling.}
+Motion cues play a crucial role in video understanding fields, such as action recognition~\cite{wang2016temporal,varol2017long,qiu2017learning,carreira2017quo,wang2021tdn,arnab2021vivit,bertasius2021space}, action detection~\cite{zhao2017temporal,weinzaepfel2015learning,cheng2022tallformer,zeng2019graph}, human video generation~\cite{ohnishi2018hierarchical,wang2020g3an,ni2023conditional}, \emph{etc}.
+Pioneering works~\cite{wang2016temporal,qiu2017learning,arnab2021vivit,wang2020g3an,ni2023conditional,carreira2017quo} usually leverage hand-crafted dense optical flow~\cite{zach2007duality} to embed motion information or design various temporal structures to encode long-range temporal representations.
+Due to the high computational demands of optical flow extraction, several attempts in compressed video recognition~\cite{zhang2016real,wu2018compressed,shou2019dmc,chen2022mm} have begun to utilize more efficient motion vectors as an alternative to represent motions and have shown promising performance.
+In contrast to these works, we delve into the role of motions in video synthesis and demonstrate that motion vectors can enhance temporal controllability through a well-designed architecture.
+
+\section{VideoComposer}
+
+\begin{figure}
+    \centering
+    \includegraphics[width=1.0\linewidth]
+    {Figures/VideoComposer_framework.pdf}
+     \vspace{-1.5em}
+    \caption{
+        \textbf{Overall architecture} of \method.
+        First, a video is decomposed into three types of conditions, including textual condition, spatial conditions and temporal conditions.
+        Then, we feed these conditions into the unified STC-encoder or the CLIP model to embed control signals.
+        Finally, the resulting conditions are leveraged to jointly guide VLDMs for denoising.
+        }
+    \label{fig:overall_framework}
+    \vspace{-1em}
+\end{figure}
+
+In this section, we will comprehensively present \method to showcase how it can enhance the controllability of video synthesis and enable the creation of highly customized videos.
+Firstly, we in brief introduce Video Latent Diffusion Models (VLDMs) upon which VideoComposer is designed, given their impressive success in various generative tasks.
+Subsequently, we delve into the details of \method's architecture, including the composable conditions and unified Spatio-Temporal Condition encoder (STC-encoder) as illustrated in Fig.~\ref{fig:overall_framework}.
+Finally, the concrete implementations, including the training and inference processes, will be analyzed.
+
+\subsection{Preliminaries}\label{sec:VLDMs}
+
+Compared to images, processing video requires substantial computational resources.
+Intuitively, adapting image diffusion models that process in the pixel space~\cite{ramesh2022Dalle-2,nichol2021glide} to the video domain impedes the scaling of \method to web-scale data.
+Consequently, we adopt a variant of LDMs that operate in the latent space, where local fidelity could be maintained to preserve the visual manifold. 
+
+\textbf{Perceptual video compression.}
+To efficiently process video data, we follow LDMs by introducing a pre-trained encoder~\cite{PatrickEsser2021TamingTF} to project a given video $\bm{x} \in \mathbb{R}^{F \times H \times W \times 3}$ into a latent representation $\bm{z} = \mathcal{E}(\bm{x})$, where $\bm{z} \in \mathbb{R}^{F \times h \times w \times c}$.
+Subsequently, a decoder $\mathcal{D}$ is adopted to map the latent representations back to the pixel space $\bar{\bm{x}} = \mathcal{D}(\bm{z})$.
+We set $H/h = W/w = 8$ for rapid processing.
+
+\textbf{Diffusion models in the latent space.}
+To learn the actual video distribution $\mathbb{P}(x)$, diffusion models~\cite{sohl2015Diffusion_model,ho2020denoising_ddpm} learn to denoise a normally-distributed noise, aiming to recover realistic visual content.
+This process simulates the reverse process of a Markov Chain of length $T$.
+$T$ is set to 1000 by default.
+To perform the reverse process on the latent, it injects noise to $\bm{z}$ to obtain a noise-corrupted latent $\bm{z}_{t}$ following~\cite{rombach2022LDM}.
+Subsequently, we apply a denoising function $\epsilon_{\theta}(\cdot, \cdot, t)$ on $\bm{z}_{t}$ and selected conditions $\bm{c}$, where $t \in \{1,...,T\}$.
+The optimized objective can be formulated as:
+\begin{equation}
+    \mathcal{L}_{VLDM} = \mathbb{E}_{\mathcal{E}\bm(x), \epsilon \in \mathcal{N}(0,1), \bm{c}, t} \left[\| \epsilon - \epsilon_{\theta}(\bm{z}_{t}, \bm{c}, t) \|_{2}^{2}\right]
+\end{equation}
+To exploit the inductive bias of locality and temporal inductive bias of sequentiality during denoising, we instantiate $\epsilon_{\theta}(\cdot, \cdot, t)$ as a 3D UNet augmented with temporal convolution and cross-attention mechanism following~\cite{modelscope2023, ronneberger2015UNet, ho2022video_diffusion_models}.
+
+\subsection{VideoComposer}
+
+\textbf{Videos as composable conditions.} 
+We decompose videos into three distinct types of conditions, \emph{i.e.}, textual conditions, spatial conditions and crucially temporal conditions, which can jointly determine the spatial and temporal patterns in videos.
+Notably, \method is a generic compositional framework.
+Therefore, more customized conditions can be incorporated into \method depending on the downstream application and are not limited to the decompositions listed above. 
+
+\emph{Textual condition.}
+Textual descriptions provide an intuitive indication of videos in terms of coarse-grained visual content and motions.
+In our implementation, we employ the widely used pre-trained text encoder from OpenCLIP\footnote{https://github.com/mlfoundations/open\_clip} ViT-H/14  to obtain semantic embeddings of text descriptions.
+
+\emph{Spatial conditions.}
+To achieve fine-grained spatial control and diverse stylization, we apply three spatial conditions to provide
+structural and stylistic guidance:
+\emph{i)} Single image.
+Video is made up of consecutive images, and a single image usually reveals the content and structure of this video.
+We select the first frame of a given video as a spatial condition to perform image-to-video generation.
+\emph{ii)} Single sketch.
+We extract sketch of the first video frame using PiDiNet~\cite{su2021pixel_diff} as the second spatial condition and encourage \method to synthesize temporal-consistent video according to the structure and texture within the single sketch.
+\emph{iii)} Style.
+To further transfer the style from one image to the synthesized video, 
+we choose the image embedding as the stylistic guidance,  following~\cite{balaji2022ediffi,huang2023composer}.
+We apply a pre-trained image encoder from OpenCLIP ViT-H/14 to extract the stylistic representation.
+\begin{wrapfigure}{r}{0.4\linewidth}
+    \vspace{-0.2em}
+    \includegraphics[width=0.24\textheight]{Figures/06_motion_vectors.pdf}
+    \caption{\textbf{Examples of motion vectors}.}
+    \label{fig:motion_vector}
+\end{wrapfigure}
+\vspace{-1em}
+
+\emph{Temporal conditions.}
+To accomplish finer control along the temporal dimension,  we introduce four temporal conditions:
+\emph{i)} Motion vector.
+Motion vector as a video-specific element is represented as two-dimension vectors, \emph{i.e.}, horizontal and vertical orientations. 
+It explicitly encodes the pixel-wise movements between two adjacent frames, as visualized by red arrows in~\cref{fig:motion_vector}.
+Due to the natural properties of motion vector,
+we treat this condition as a motion control signal for temporal-smooth synthesis.
+Following~\cite{wu2018compressed,shou2019dmc}, we extract motion vectors in standard MPEG-4 format from compressed videos.
+\emph{ii)} Depth sequence.
+To introduce depth information, we utilize the pre-trained model from~\cite{ranftl2020robust_depth} to extract depth maps of video frames.
+\emph{iii)} Mask sequence.
+To facilitate video regional editing and inpainting, we manually add masks.
+We introduce tube masks~\cite{tong2022videomae,feichtenhofer2022masked_spatiotemporal} to mask out videos and enforce the model to predict the masked regions based on observable information.
+\emph{iv)} Sketch sequence.
+Compared with the single sketch, sketch sequence can provide more control details and thus achieve precisely customized synthesis.
+
+\textbf{STC-encoder.}
+Sequential conditions contain rich and complex space-time dependencies, posing challenges for controllable guidance.
+In order to enhance the temporal awareness of input conditions, we design a Spatio-Temporal Condition encoder (STC-encoder) to incorporate the space-time relations, as shown in~\cref{fig:overall_framework}.  % 
+Specifically, a light-weight spatial architecture consisting of two 2D convolutions and an average pooling layer is first applied to the input sequences, aiming to extract local spatial information.
+Subsequently, the resulting condition sequence is fed into a temporal Transformer layer~\cite{vaswani2017Transformer} for temporal modeling.
+In this way, STC-encoder facilitates the explicit embedding of temporal cues, allowing for a unified condition interface for diverse inputs, thereby enhancing inter-frame consistency.
+It is worth noting that we repeat the spatial conditions of a single image and single sketch along the temporal dimension to ensure their consistency with temporal conditions, hence facilitating the condition fusion process.
+
+After processing the conditions by STC-encoder, the final condition sequences are all in an identical spatial shape to $\bm{z}_t$ and then fused by element-wise addition.
+Finally, we concatenate the merged condition sequence with $\bm{z}_t$ along the channel dimension as control signals.
+For textual and stylistic conditions organized as a sequence of embeddings, we utilize the cross-attention mechanism to inject textual and stylistic guidance.
+
+\subsection{Training and inference}
+\textbf{Two-stage training strategy.} 
+Although \method can initialize with the pre-training of LDMs~\cite{rombach2022LDM}, which mitigates the training difficulty to some extent, the model still struggles in learning to simultaneously handle temporal dynamics and synthesize video content from multiple compositions.
+To address this issue, we leverage a two-stage training strategy to optimize \method.
+Specifically, the first stage targets pre-training the model to specialize in temporal modeling through text-to-video generation. 
+In the second stage, we optimize \method to excel in video synthesis controlled by the diverse conditions through compositional training.
+
+\textbf{Inference.} 
+During inference, DDIM~\cite{zhang2022gddim} is employed to enhance the sample quality and improve inference efficiency.
+We incorporate classifier-free guidance~\cite{ho2022classifier} to ensure that the generative results adhere to specified conditions.
+The generative process can be formalized as:
+\begin{equation}
+    \hat{\epsilon}_{\theta}(\bm{z}_{t}, \bm{c}, t) = \epsilon_{\theta}(\bm{z}_{t}, \bm{c}_{1}, t) + \omega \left(\epsilon_{\theta}(\bm{z}_{t}, \bm{c}_{2}, t) - \epsilon_{\theta}(\bm{z}_{t}, \bm{c}_{1}, t)\right)
+\end{equation}
+where $\omega$ is the guidance scale; $\bm{c}_{1}$ and $\bm{c}_{2}$ are two sets of conditions.
+This guidance mechanism extrapolates between two condition sets, placing emphasis on the elements in $(\bm{c}_{2} \setminus \bm{c}_{1})$ and empowering flexible application.
+For instance, in text-driven video inpainting, $\bm{c}_{2}$ represents the expected caption and a masked video, while $\bm{c}_{1}$ is an empty caption and the same masked video.
+
+\begin{figure}[t]
+    \centering
+    \includegraphics[width=1.0\linewidth]{Figures/02_Driving_Single_Image.pdf}
+     \vspace{-1.5em}
+    \caption{
+    \small
+    \textbf{Compositional image-to-video generation}.
+    We showcase six examples, each displaying two generated videos.
+    The upper video is generated using a given single frame as the spatial condition and a textual condition describing the scene.
+    The lower video is generated by incorporating an additional sequence of temporal conditions to facilitate finer control over the temporally evolving structure.
+    }
+    \label{fig:local_image}
+    \vspace{-4mm}
+\end{figure}
+
+\subsection{Experimental setup}
+\textbf{Datasets.} 
+To optimize \method, we leverage two widely recognized and publicly accessible datasets: WebVid10M~\cite{2021Frozen} and LAION-400M~\cite{schuhmann2021laion}.
+WebVid10M~\cite{2021Frozen} is a large-scale benchmark scrapped from the web that contains 10.3M video-caption pairs.
+LAION-400M~\cite{schuhmann2021laion} is an image-caption paired dataset, filtered using CLIP~\cite{radford2021CLIP}.
+
+\textbf{Evaluation metrics.} 
+We utilize two metrics to evaluate \method:
+\textit{i)} To evaluate video continuity, we follow Gen-1~\cite{esser2023gen-1} to compute the average CLIP cosine similarity of two consecutive frames, serving as a \textbf{frame consistency metric};
+\textit{ii)} To evaluate motion controllability, we adopt end-point-error~\cite{xu2022gmflow,teed2020raft} as a \textbf{motion control metric}, 
+which measures the Euclidean distance between the predicted and the ground truth optical flow for each pixel.
+
+\vspace{-2mm}
+
+\subsection{Composable video generation with versatile conditions}
+
+\vspace{-1mm}
+In this section, we demonstrate the ability of \method to tackle various tasks in a controllable and versatile manner, leveraging its inherent compositionality. 
+It's important to note that the conditions employed in these examples are customizable to specific requirements.
+We also provide additional results in the supplementary material for further reference.
+
+\textbf{Compositional Image-to-video generation.}
+Compositional training with a single image endows \method with the ability of animating static images.
+In~\cref{fig:local_image}, we present six examples to demonstrate this ability.
+\method is capable of synthesizing videos conformed to texts and the initial frame.
+To further obtain enhanced control over the structure, we can incorporate additional temporal conditions.
+We observe resultant videos consistently adhere to the given conditions.
+
+\begin{figure}[t]
+    \centering
+    \includegraphics[width=1.0\linewidth]{Figures/03_inpainting.pdf}
+     \vspace{-1.5em}
+    \caption{
+    \small
+    \textbf{Compositional video inpainting.}
+    By manually adding masks to videos, \method can perform video inpainting, facilitating the restoration of the corrupted parts according to textual instructions.
+    Furthermore, by incorporating temporal conditions specifying the visual structure, \method can perform customized inpainting that conforms to the prescribed structure.
+    }
+    \label{fig:mask}
+    \vspace{-5mm}
+\end{figure}
+
+\begin{figure}[t]
+    \centering
+\includegraphics[width=1.0\linewidth]{Figures/04_sketch.pdf}
+     \vspace{-1.5em}
+    \caption{
+    \small
+    \textbf{Compositional sketch-to-video generation}.
+    In the first example, the upper video is generated using text and a single sketch as the conditions, while the lower is generated by using an additional mask sequence for finer control over the temporal patterns.
+    For the last two examples, the upper video is generated using a single sketch and a textual condition, while the lower is generated with an additional style from a specified image.
+    }
+    \label{fig:single_sketch}
+    \vspace{-3mm}
+\end{figure}
+
+\begin{figure}[t]
+    \centering
+    \includegraphics[width=1.0\linewidth]{Figures/07_mv_difference.pdf}
+     \vspace{-1em}
+    \caption{
+    \small
+    \textbf{Video-to-video translation}.
+    We extract a sequence of depth maps, sketches or motion vectors from the source video, along with textual descriptions, to perform the translation.
+    By utilizing motion vectors, we achieve \textbf{static-background removal}.
+    }
+    \label{fig:motion_prioritization}
+    \vspace{-5mm}
+\end{figure}
+
+\textbf{Compositional video inpainting.}
+Jointly training with masked video endows the model with the ability of filling the masked regions with prescribed content, as shown in~\cref{fig:mask}.
+\method can replenish the mask-corrupted regions based on textual descriptions.
+By further incorporating temporal conditions, \emph{i.e}, depth maps and sketches, we obtain more advanced control over the structure.
+
+\begin{wraptable}{r}{0.46\textwidth}
+    \vspace{-1.1em}
+    \tablestyle{3pt}{1.0}
+    \caption{\small
+        \textbf{Evaluating the motion controllability}.
+        ``Text" and ``MV" represent the utilization of text and motion vectors as conditions for generation.}
+        \vspace{-2pt}
+    \centering
+    \renewcommand{\arraystretch}{1.1}
+    \begin{tabular}{l|c|c|c}
+        Method & Text & MV &  Motion control $\downarrow$ \\
+        \shline
+        \textit{w/o} STC-encoder  &  \checkmark  &  &   4.03     \\
+        \textit{w/o} STC-encoder  &  \checkmark  & \checkmark & 2.67       \\
+        \method                   &  \checkmark  & \checkmark & \textbf{2.18}         \\
+    \end{tabular}
+    \label{tab:motion_control}
+    \vspace{-5pt}
+\end{wraptable}
+\textbf{Compositional sketch-to-video generation.}
+Compositional training with single sketch empowers \method with the ability of animating static sketches, as illustrated in~\cref{fig:single_sketch}.
+We observe that \method synthesizes videos conforming to texts and the initial sketch.
+Furthermore, we observe that the inclusion of mask and style guidance can facilitate structure and style control.
+
+\subsection{Experimental results of motion control}
+
+\textbf{Quantitative evaluation.}
+To validate superior motion controllability, we utilize the motion control metric.
+We randomly select 1000 caption-video pairs and synthesize corresponding videos.
+The results are presented in~\cref{tab:motion_control}.
+We observe that the inclusion of motion vectors as a condition reduce the motion control error, indicating an enhancement of motion controllability.
+The incorporation of STC-encoder further advances the motion controllability.
+
+\begin{figure}[t]
+    \centering
+    \includegraphics[width=1.0\linewidth]{Figures/08_motion_control.pdf}
+     \vspace{-1.5em}
+    \caption{
+    \small
+    \textbf{Versatile motion control using hand-crafted motions.}
+     \textbf{(a)} Limited motion control using CogVideo~\cite{hong2022cogvideo}.
+    \textbf{(b)} Fine-grained and flexible motion control,  empowered by \method.
+    }
+    \label{fig:motion_control}
+    \vspace{-1mm}
+\end{figure}
+
+\textbf{Motion vectors prioritizing moving visual cues.}
+Thanks to the nature of motion vectors, which encode inter-frame variation, static regions within an image are inherently omitted.
+This prioritization of moving regions facilitates motion control during synthesis.
+In~\cref{fig:motion_prioritization}, we present results of video-to-video translation to substantiate such superiority.
+We observe that motion vectors exclude the static background, \textit{i.e.}, human legs, a feat that other temporal conditions such as depth maps and sketches cannot accomplish.
+This advantage lays the foundation for a broader range of applications.
+
+\textbf{Versatile motion control with motion vectors.}
+Motion vectors, easily derived from hand-crafted strokes, enable more versatile motion control.
+In~\cref{fig:motion_control}, we present visualization comparing CogVideo~\cite{hong2022cogvideo} and \method.
+While CogVideo is limited to insufficient text-guided motion control, \method expands this functionality by additionally leveraging motion vectors derived from hand-crafted strokes to facilitate more flexible and precise motion control.
+
+\subsection{Ablation study}
+In this subsection, we conduct qualitative and quantitative analysis on \method, 
+aiming to demonstrate the effectiveness of incorporating STC-encoder.
+
+\textbf{Quantitative analysis.}
+In~\cref{tab:temporal_consistency}, we present the frame consistency metric computed on 1000 test videos. %
+We observe that incorporating STC-encoder augments the frame consistency, which we attribute to its temporal modeling capacity.
+This observation holds for various temporal conditions such as sketches, depth maps and motion vectors.
+
+\begin{wraptable}{r}{0.52\textwidth}
+    \vspace{-1.1em}
+    \tablestyle{3pt}{1.0}
+    \caption{\small
+        \textbf{Quantitative ablation study of STC-encoder}.
+        ``Conditions" denotes the conditions utilized for generation.
+    }
+    \vspace{-5pt}
+    \centering
+    \renewcommand{\arraystretch}{1.2}
+    \setlength{\tabcolsep}{1.5pt}
+    \begin{tabular}{l|c|c}
+        Method   &   Conditions   &  Frame consistency $\uparrow$ \\
+        \shline
+        \textit{w/o} STC-encoder  & \multirow{2}{*}{\shortstack{Text and \\ sketch sequence}}  &  0.910 \\
+        \method   &  & \textbf{0.923} \\
+        \shline
+        \textit{w/o} STC-encoder  & \multirow{2}{*}{\shortstack{Text and \\ depth sequence}}  &  0.922 \\
+        \method   &  & \textbf{0.928} \\
+        \shline
+        \textit{w/o} STC-encoder  & \multirow{2}{*}{\shortstack{Text and \\ motion vectors}}  &  0.915 \\
+        \method   &  & \textbf{0.927}
+    \end{tabular}
+    \label{tab:temporal_consistency}
+    \vspace{-10pt}
+\end{wraptable}
+\textbf{Qualitative analysis.}
+In~\cref{fig:ablation_study}, we exemplify the usefulness of STC-encoder.
+We observe that in the first example, videos generated by \method without STC-encoder generally adhere to the sketches but omit certain detailed information, such as several round-shaped ingredients.
+For the left two examples, \method without STC-encoder generates videos that are structurally inconsistent with conditions.
+We can also spot the noticeable defects in terms of human faces and poses.
+Thus, all the above examples can validate the effectiveness of STC-encoder.
+
+\begin{figure}[t]
+    \centering
+    \includegraphics[width=1.0\linewidth]{Figures/05_ablations.pdf}
+     \vspace{-1.5em}
+    \caption{
+    \small
+    \textbf{Qualitative ablation study}.
+    We present three representative examples.
+    The last two rows of videos display generated videos conditioned on a textual condition and one additional temporal condition (\textit{i.e.}, sketches, depth maps or motion vectors).
+    Regions exhibiting deficiencies or fidelity are emphasized within red boxes.
+    }
+    \label{fig:ablation_study}
+    \vspace{-5mm}
+\end{figure}
+
+\section{Conclusion}
+In this paper, we present \method, which aims to explore the compositionality within the realm of video synthesis, striving to obtain a flexible and controllable synthesis system.
+In particular, we explore the use of temporal conditions for videos, specifically motion vectors, as powerful control signals to provide guidance in terms of temporal dynamics.
+An STC-encoder is further designed as a unified interface to aggregate the spatial and temporal dependencies of the sequential inputs for inter-frame consistency.
+Our experiments, which involve the combination of various conditions to augment controllability, underscore the pivotal role of our design choices and reveal the impressive creativity of the proposed \method.
+
+{\small
+}
+
+\newpage
+\onecolumn
+
+\end{document}

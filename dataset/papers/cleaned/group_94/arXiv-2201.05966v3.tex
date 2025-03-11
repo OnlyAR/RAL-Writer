@@ -1,0 +1,864 @@
+\title{\uskg: Unifying and Multi-Tasking Structured Knowledge Grounding with Text-to-Text Language Models}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+
+Structured knowledge grounding (SKG) leverages structured knowledge to complete user requests, such as semantic parsing over databases and question answering over knowledge bases. 
+Since the inputs and outputs of SKG tasks are heterogeneous, they have been studied separately by different communities, which limits systematic and compatible research on \skg. 
+In this paper, we overcome this limitation by proposing the \uskg framework, which unifies \ntasks SKG tasks into a text-to-text format, aiming to promote systematic SKG research, instead of being exclusive to a single task, \mbox{domain}, or dataset.
+We use \uskg to benchmark T5 with different sizes and show that T5, with simple modifications when necessary, achieves state-of-the-art performance on almost all of the \ntasks tasks. 
+We further demonstrate that multi-task prefix-tuning improves the performance on most tasks, largely improving the overall performance. 
+\uskg also facilitates the investigation of zero-shot and few-shot learning, and we show that T0, GPT-3, and Codex struggle in zero-shot and few-shot learning for SKG. 
+We also use \uskg to conduct a series of controlled experiments on structured knowledge encoding variants across \skg tasks. 
+\uskg is easily extensible to more tasks, and it is open-sourced at \url{https://github.com/hkunlp/unifiedskg}.\footnote{Latest collections at \url{https://unifiedskg.com}.}
+
+\end{abstract}
+
+\section{Introduction}
+
+Structured knowledge (e.g., web tables, knowledge graphs, and databases) stores large amounts of data in organized structures, forming a basis for a wide range of applications, e.g., medical diagnosis, personal assistants, and customer relations management.
+Accessing and searching data in structured knowledge typically requires mastering query languages through professional training.
+To promote the efficiency of data access, structured knowledge grounding (\skg) systems ground user requests in structured knowledge and produce various outputs, including computer programs (e.g., SQL and SPARQL), table cell values, and natural language responses (Figure \ref{fig:skg}). 
+For example, semantic parsing~\cite{ZelleM96,Zettlemoyer05} converts natural language questions into formal programs;
+knowledge-base question answering \cite{BerantCFL13} derives answers from tables or knowledge graphs.
+
+\skg has attracted significant interest and has been studied through different tasks defined by different communities.
+Recent developments in tasks, models, and datasets for \skg have led to task-specific modeling advances, making each task's progress seemingly unique and incompatible.
+A main reason is that \skg tasks are \textit{heterogeneous}.
+Different types of structured knowledge, such as databases or knowledge graphs, lead to highly specialized encoders~\citep{kagnet-emnlp19,Herzig2020tapas,Wang2020RATSQLRS,yasunaga-etal-2021-qa}.
+Some SKG tasks, e.g., semantic parsing, use customized decoders to generate programs~\cite{YinN18,ren2021lego}.
+Therefore, instead of solving common challenges in \skg research, improvements in \skg have been prone to be exclusive to a single task, domain, or dataset.
+
+\begin{figure*}[!t]
+    \centering
+    \includegraphics[width=0.75\linewidth]{./figures/unifiedskg.pdf}
+    \caption{Structured knowledge grounding (SKG) leverages structured knowledge to complete user requests.
+    By casting inputs and outputs into the text-to-text format, \uskg standardizes datasets, models, code, experiments, and metrics for \ntasks \skg tasks.
+    }
+\label{fig:skg}
+\end{figure*}
+
+In this paper, we propose the \uskg framework to advocate for a unifying view of \ntasks \skg tasks across six task families and multiple data domains (Table \ref{tab:tasks-included}).
+\uskg standardizes datasets, models, code, experiments, and evaluation metrics into a single framework.
+By casting user requests, structured knowledge, and outputs into the text-to-text format \cite{2020t5}, it promotes model advances where new tasks can be framed with our standardized abstraction, and new models can be easily applied to diverse \skg tasks.
+While previous works also cast \skg tasks into the text-to-text format \cite{hosseini2020simple,Shaw2021CompositionalGA,liu2021tapex}, their independent choices of pretrained language models (PLMs), input-output formats, and frameworks make our unification non-trivial. 
+\uskg is easily extensible to more \skg tasks, and it is open-sourced to promote community-wide progress.
+
+Using \uskg as a benchmark, we show that finetuning T5 (with constrained decoding or reranking when necessary) on individual tasks achieves state-of-the-art (sota) results on almost all of the \ntasks tasks, establishing a powerful and reproducible starting point for \skg research. T5 performance also increases with size on most tasks. 
+
+\uskg facilitates multi-task learning on \skg, enabling knowledge sharing and cross-task generalization. 
+Although simple multi-task learning has mixed results, we show that multi-task learning with prefix-tuning \citep{li2021prefixtuning} benefits most tasks and largely improves the overall performance, on both T5-base and T5-large.
+
+\uskg is a challenging testbed for few-shot \cite{brown2020language,Ye2021CrossFitAF} and zero-shot learning \cite{Zhong2021AdaptingLM,Jason2021,sanh2021multitask} with PLMs.
+Our experiments show that models like T0 \cite{sanh2021multitask} struggle in zero-shot learning on \skg tasks, and GPT-3 \cite{brown2020language} and Codex \cite{chen2021evaluating} struggle in few-shot learning on \skg tasks.
+
+\uskg enables a series of controlled experiments on structured knowledge encoding.
+We find that T5 is sensitive to encoding variations, and the sensitivity varies across tasks.
+\uskg aims to facilitate more general and robust structured knowledge encoding methods. 
+Finally, we conduct a comprehensive error analysis across \skg tasks.
+Although the errors made by PLMs decrease with the model size, T5-3B may still generate invalid outputs. 
+
+In summary, we 1) unify and benchmark 21 \skg tasks under the \uskg framework to evaluate diverse grounding goals and structured knowledge sources, 2) demonstrate (near) sota performance of T5 on all the unified \skg tasks, using a single, general-purpose approach, 3) show the benefit of knowledge sharing across \skg tasks via multi-task prefix-tuning, and 4) analyze recent modeling contributions (zero-shot, few-shot, and structured knowledge encoding) on these tasks. 
+We hope \uskg enables the design of new models and learning algorithms that generalize to diverse \skg tasks and to identify their challenges.
+
+\section{Related Work}
+\label{sec:related-work}
+
+\begin{table*}[ht]
+    \small
+	\centering
+	\begin{adjustbox}{width=0.96\linewidth}
+		\begin{tabular}{@{}ccccc@{}}
+			\toprule
+			Task Family & Task & Knowledge Input & User Input & Output \\
+			\midrule
+	        \multirow{4}*{\textit{Semantic Parsing}} & Spider \cite{Yu18c} & Database & Question & SQL \\
+            & GrailQA \cite{gu2021beyond} & Knowledge Graph & Question & s-Expression \\
+            & WebQSP \cite{yih-etal-2016-value} & Knowledge Graph & Question & s-Expression \\
+            & MTOP \cite{li-etal-2021-mtop} & API Calls & Question &  TOP Representation\\
+			\midrule
+			\multirow{6}*{\textit{Question Answering}} & WikiSQL \cite{zhongSeq2SQL2017} & Table & Question & Answer \\
+            & WikiTQ \cite{pasupat-liang-2015-compositional} & Table & Question & Answer \\
+            & CompWebQ \cite{talmor18compwebq} & Knowledge Graph & Question & Answer \\
+            & HybridQA \cite{chen2020hybridqa} & Table + Text Passage & Question & Answer \\
+            & MultiModalQA \cite{talmor2021multimodalqa} & Table + Text + Image & Question & Answer \\
+            & FeTaQA \cite{nan2021feta} & Table & Question & Free-Form Answer  \\
+			\midrule
+			\multirow{2}*{\textit{Data-to-Text}} & DART \cite{nan2021dart} & Triple & None & Text \\
+			& ToTTo \cite{parikh2020totto} & Highlighted Table & None & Text \\
+			\midrule 
+			& MultiWoZ \cite{budzianowski2018large} & Ontology & Dialog & Dialog State \\
+			& KVRET \cite{Eric2017KeyValueRN} & Table & Dialog & Response \\
+			\textit{Conversational} & SParC \cite{Yu19} & Database & Multi turn & SQL \\
+			& CoSQL \cite{yu-etal-2019-cosql} & Database & Dialog & SQL \\
+			& SQA \cite{iyyer-etal-2017-search} & Table & Multi turn & Answer \\
+			\midrule
+			\multirow{2}*{\textit{Fact Verification}} 
+			& TabFact \cite{2019TabFactA} & Table & Statement & Boolean \\
+			& FEVEROUS \cite{aly2021fact} & Table + Text & Statement & Boolean \\
+			\midrule
+			\multirow{2}*{\textit{Formal-Language-to-Text}} & SQL2Text \cite{shu-etal-2021-logic} & Optional Database & SQL & Text \\
+			& Logic2Text \cite{chen-etal-2020-logic2text} & Table Schema & Python-like program & Text \\
+			\bottomrule
+		\end{tabular}
+	\end{adjustbox}
+	\caption{We unify \ntasks SKG tasks with different knowledge input, user input, and output, covering six task families. 
+	}
+	\label{tab:tasks-included}
+	\vspace{-3mm}
+\end{table*}
+\noindent\textbf{SKG with PLMs \ \ }
+PLMs have been applied to several SKG tasks. 
+To encode structured knowledge, prior work linearized the structured knowledge and concatenated it with the text \cite{Hwang2019ACE,weijie2019kbert,hosseini2020simple,liu2021tapex}, which has been augmented by positional encoding (e.g., row/column embedding) \cite{Herzig2020tapas,yin20tabert} and template-based linearization \cite{chen2020logical,2019TabFactA,oguz2021unik}, and planning \cite{Su2021PlanthenGenerateCD}.
+Recently, cell-column alignment is modeled by manipulating the attention matrix of transformers \cite{zhang2020table,eisenschlos2021mate}.
+Hierarchical encoding is another way to represent the structure, e.g., 
+\citet{wang2021tuta} used tree-based transformers to represent the structure of the tables;
+\citet{iida2021tabbie} used transformers to encode row and column representations; \citet{chen2020hitter} used hierarchical transformers to encode KG triples. 
+\skg's outputs include, but are not limited to, structured meaning representations (e.g., logic forms, SQL), dialogue states, natural language, answer sets, and Boolean values. Among them, structured meaning representation is challenging for PLMs because they are originally trained on natural language. 
+To bridge this gap, \citet{shin2021constrained} adopted the insights from \citet{berant2014semantic} and \citet{marzoev2020unnatural} and proposed to convert formal language into an English-like representation, decode with GPT-3, and map back to formal language automatically.
+We do not focus on these techniques in this work; instead, we unify all tasks and systematically compare them.
+
+\noindent\textbf{Task format unification \ \ }
+Recent years witnessed the trend of unifying related but different tasks into a shared format.
+\citet{abs-1806-08730} unified various tasks as question answering. \citet{YinRRSX20} and \citet{abs-2104-14690} unified few-shot learning as textual entailment. PLUR \cite{chen2021plur} unified program learning, understanding, and repair tasks into a graph-to-sequence format. In this paper, we focus on the text-to-text format \cite{2020t5} due to its flexibility. 
+Different from unifying tasks that only take text as input, a core challenge in unifying \skg tasks into the text-to-text format is to linearize structured knowledge.
+Notably, UnifiedQA \cite{2020unifiedqa} unified QA tasks, while \uskg covers a broader scope of six task families for systematic exploration. 
+
+\noindent\textbf{Cross-task generalization with PLMs \ \ } 
+Multi-task learning and transfer learning go beyond task boundaries, view different tasks as related, and have been shown to outperform single-task learning \cite{muppet,vu2021spot}.
+Large PLMs show potential for zero-shot and few-shot learning, e.g., GPT-2 \cite{radford2019language} and GPT-3 \cite{brown2020language}, which can be improved by multi-task learning \cite{Zhong2021AdaptingLM}, e.g., FLAN \cite{Jason2021}, T0 \cite{sanh2021multitask}, and CrossFit \cite{Ye2021CrossFitAF}. ExT5 \cite{aribandi2021ext5} shows that scaling up multi-task learning helps improve pretraining efficiency and downstream performances.
+\uskg facilitates the investigation of multi-task, zero-shot, and few-shot learning on \skg tasks. 
+
+\begin{figure*}[t]
+    \centering
+    \includegraphics[width=0.9\linewidth]{figures/modeling.pdf}
+    \caption{We unify SKG tasks with heterogeneous inputs and outputs into the text-to-text format. }
+\label{fig:input-output-format}
+\end{figure*}
+
+\section{The \uskg Framework}
+\label{sec:method}
+
+\subsection{Task Unification}
+\label{subsec:task_unification}
+The guiding principle of \uskg{}'s task selection is diversity. We unify \ntasks SKG tasks across six task families and multiple domains (Table \ref{tab:tasks-included}). Our task families include:
+\begin{itemize}[leftmargin=*]
+    \item \textbf{Semantic parsing} converts questions to logical forms \cite{ZelleM96,Zettlemoyer05}.
+    \item \textbf{Question answering} derives answers to natural language questions based on structured data \cite{BerantCFL13}.
+    \item \textbf{Data-to-text generation} describes structured data in natural language \cite{NovikovaDR17}.
+    \item \textbf{Fact verification} checks if a statement is true based on the structured data \cite{2019TabFactA}.
+    \item \textbf{Conversational tasks} require understanding of not only the user's last request but also the full interaction history between users and machines \cite{budzianowski2018large, eric2019multiwoz, yu-etal-2019-cosql}.
+    \item \textbf{Formal language to text translation} describes formal language in natural language \cite{chen-etal-2020-logic2text}. 
+\end{itemize}
+
+All these tasks take as input $x$ a user request, a structured knowledge input, and an optional (dialogue) context to predict an output $y$.
+Figure \ref{fig:input-output-format} illustrates how we convert the input $x$ to an input sequence $\tilde{x}$ and the output $y$ to an output sequence $\tilde{y}$ by means of ``linearization'' \cite{liu2021tapex}, enabling the unification of diverse forms of structured knowledge. We provide more details, examples, and input length analysis in the Appendices \ref{app:task-unification} and \ref{app:examples}.
+Our code implementation uses Hugging Face's Transformers \cite{wolf-etal-2020-transformers} and Datasets \cite{lhoest2021datasets} toolkits. 
+
+\subsection{Modeling}
+The simplest usage of \uskg is to train on individual tasks. In this case, we minimize the negative log-likelihood loss averaged over tokens in each batch. 
+For decoding, we use beam search by default.
+\uskg also facilitates exploration of multi-task learning, few-shot, and zero-shot learning with PLMs, and details are presented in the corresponding parts in Section \ref{sec:results}. 
+
+\begin{table*}[ht]
+	\begin{minipage}{\textwidth}
+	    \small
+        \centering
+	    \begin{adjustbox}{width=0.95\linewidth}
+    		\begin{tabular}{@{}l@{}ccccl|l@{}}
+    			\toprule
+    			& Metric & T5-base
+    			& T5-large
+    			& T5-3B & Previous sota (w/o extra) & Previous sota (w/ extra)
+    			\\ 
+    			\midrule
+    	        \multirow{1}*{Spider (dev.)} 
+                & Match & 58.12 & 66.63 & 71.76 & \textbf{75.5}$^{+}$ \cite{Scholak2021:PICARD} & 74.7  \cite{rubin-berant-2021-smbop} \\
+                \multirow{1}*{GrailQA}
+                & Match & 62.39	& 67.30 & 70.11 & 
+                \textbf{83.8}$^{+}$ \cite{ye2021rng} %use gold entities
+                & \na \\
+                \multirow{1}*{WebQSP}
+                & F1 & 78.83 & 79.45 & 80.70 & 
+                \textbf{83.6}$^{+}$ \cite{ye2021rng} %use gold entities
+                & \na \\
+                MTOP & Match & 85.49 & 86.17 & \textbf{86.78} & 86.36 \cite{pasupat-etal-2021-controllable} & \na \\
+    			\midrule
+                \multirow{1}*{WikiTQ}
+                & Acc & 35.76 & 43.22 & \bf 49.29 & 44.5 \cite{wang-etal-2019-learning} & 57.5  \cite{liu2021tapex}\\
+                \multirow{1}*{WikiSQL}
+                & Acc & 82.63 & 84.80 & \textbf{85.96} & 85.8 \cite{liu2021tapex} & 89.5 \cite{liu2021tapex}\\
+                \multirow{1}*{CompWebQ}
+                & Acc & 68.43 & 71.38 & 73.26 & 70.4$^{\ddag}$ \cite{das2021case} & \na \\
+                \multirow{1}*{HybridQA (dev.)}
+                & Acc & 54.07 & 56.95 & 59.41 & 60.8$^\ddag$ \cite{eisenschlos2021mate} & 63.4$^\ddag$  \cite{eisenschlos2021mate} \\
+                \multirow{1}*{MultiModalQA (dev.)}
+                & F1 & 75.51	& 81.84	& \bf 85.28 &    82.7 \cite{yoran2021turning} &  83.8 \cite{yoran2021turning} \\
+                \multirow{1}*{FeTaQA}
+                & BLEU & 29.91 & 32.45 & \bf 33.44 & 30.54 \cite{nan2021feta} & \na \\
+    			\midrule
+    			\multirow{1}*{DART}
+    			& BLEU & 46.22 & \textbf{46.89} & 46.66 & 46.89 \cite{nan2021dart} & 47.2  \cite{aghajanyan2021htlm} \\
+    			\multirow{1}*{ToTTo (dev.)}
+    			& BLEU & 48.29 & \bf 48.95 & \bf 48.95 & % \textbf{49.5} % They also used T5-3b while our result is weaker.
+    			48.95 \cite{KaleR20a} & \na \\
+                \midrule
+    			\multirow{1}*{MultiWoZ2.1}
+    			& Joint Acc & 54.64 & 54.45 & 55.42 & \textbf{60.61}$^*$\cite{dai-etal-2021-preview} & 60.48 \cite{yu2021SCoRE}\\
+    			\multirow{1}*{KVRET}
+    			& Micro F1 & 66.45 & 65.85 & \bf 67.88 & 63.6 \cite{gou2021contextualize} & \na \\
+    			\multirow{1}*{SParC (dev.)}
+    			& Match & 50.54 & 56.69 & \bf 61.51 & 54.1 \cite{hui2021dynamic} & 62.2 \cite{yu2021SCoRE}\\
+    			\multirow{1}*{CoSQL (dev.)}
+    			& Match & 42.30 & 48.26 & 54.08 & \textbf{56.9}$^{+}$  \cite{Scholak2021:PICARD} & 52.1 \cite{yu2021SCoRE}\\
+    			\multirow{1}*{SQA}
+    			& Overall Acc  & 52.91 & 61.28 & \bf 62.37 & 58.6 \cite{liu2021tapex} & 74.5 \cite{liu2021tapex}\\
+    			\midrule
+    			\multirow{1}*{TabFact}
+    			& Acc & 76.13 & 80.85 & \bf 83.68 & 74.4 \cite{yang-etal-2020-program} & 84.2 \cite{liu2021tapex}\\
+    			\multirow{1}*{FEVEROUS (dev.)}
+    			& Acc & 75.05 & 79.81 & \bf 82.40 & 82.38 \cite{aly2021fact} & \na \\
+    			\midrule
+    			\multirow{1}*{SQL2Text}
+    			& BLEC & 93.52 & 93.68 & \textbf{94.78} & 93.7 \cite{shu-etal-2021-logic} & \na \\
+    			\multirow{1}*{Logic2Text}
+    			& BLEC & 90.66	& 90.57	& \bf 91.39 & 88.6 \cite{shu-etal-2021-logic} & \na \\
+    			\bottomrule
+    		\end{tabular}
+    	\end{adjustbox}
+	    \caption{Test or development (dev.) set performance of models trained on individual tasks.
+	    Vanilla T5 or T5 with simple modifications (e.g., $^{+}$constrained decoding or reranking) achieve sota on nearly all tasks.
+	    The best result without extra pretraining is shown in \textbf{bold}.
+	    More detailed results and result variances can be found in Tables \ref{tab:baseline-full-dev} and \ref{tab:baseline-full-test} in Appendix.
+	    Human evaluation for generation tasks is in Section \ref{subsec:human-eval}.
+	    \textit{w/ (w/o) extra} means with (without) extra pretraining on unsupervised structured data (e.g., web tables).\footnotemark
+	    }
+	\label{tab:baseline-simple-version}
+	\end{minipage}
+\end{table*}\begin{table}[t]
+\small
+	\centering
+	\begin{adjustbox}{width=0.98\linewidth}
+		\begin{tabular}{@{}l@{}c@{}c@{}c@{}c@{}c@{}c@{}}
+			\toprule
+			& Spider \ & \ WikiTQ \ & \ \ DART \ \ &  \ MWoZ \ \ &  \ TabFact \ \ & SQL2Text \\ 
+			\midrule 
+		    T5-3B \ \ \ & \bf 71.76 & \bf 50.65 & \bf 50.38 & 58.46 & 83.97 & 92.71 \\
+            T0-3B & 68.09 & 50.62 & 50.16 & \bf 60.20 & \bf 85.51 & \bf 92.93 \\
+			\bottomrule
+		\end{tabular}
+	\end{adjustbox}
+	\caption{Comparison between T5-3B and T0-3B. T0-3B is initialized from LM-adapted T5 and further pretrained on a large number of non-\skg tasks. We finetune both models on individual tasks.
+	T0-3B under-performs T5-3B on semantic parsing (Spider) and outperforms T5-3B on dialogue state tracking (MWoZ) and fact verification (TabFact). We report results on the dev. set. }
+	\vspace{-3mm}
+	\label{tab:t0}
+\end{table}
+
+\section{Experiments and Analysis}
+\label{sec:results}
+
+\subsection{Results on Individual Tasks} 
+\label{subsec:baseline-performance}
+We apply T5 models \cite{2020t5} on each individual task in \uskg.
+For model training, we set the maximum number of epochs as 50--200, depending on the dataset size. We use early stopping and model selection on the development set. 
+More details are shown in Appendix \ref{subapp:implementation-details}. 
+For each task, we report one commonly used metric in Table~\ref{tab:baseline-simple-version}. See Appendix \ref{app:all-results} for all metrics. 
+
+\noindent\textbf{Comparison with previous sota \ \ }
+Table~\ref{tab:baseline-simple-version} shows that vanilla T5-3B outperforms most previous sota models not trained on extra unsupervised in-domain data.  
+Some semantic parsing sota models, denoted as $^{+}$ in Table \ref{tab:baseline-simple-version}, are also T5 with constrained decoding \cite{Scholak2021:PICARD} or reranking \cite{ye2021rng}. 
+This shows that a generalist architecture like T5, when scaled up to a certain size, can be as good as task-specific architectures for \skg, suggesting the potential of larger PLMs. 
+
+\noindent\textbf{Model scalability \ \ } 
+In general, T5 performance increases with the model size, but this trend varies across task families.
+Semantic parsing, QA, and fact verification tasks get large benefits from increased sizes, while text generation does not. 
+See Section \ref{subsec:human-eval} for a human evaluation for text generation tasks.
+Also, the gap between T5-base (220M) and T5-large (770M) is larger than the gap between T5-large (770M) and T5-3B (3B). 
+
+\noindent\textbf{Effect of pretraining on structured knowledge} \ \
+Some smaller models pretrained on structured knowledge \cite{liu2021tapex} show competitive performance as T5-3B, suggesting that pretraining with structured data is beneficial for \skg. This result calls for structured knowledge pretraining that generalizes to different \skg tasks across domains, which can be systematically explored using \uskg. 
+
+\noindent\textbf{Effect of pretraining on non-\skg tasks \ \ }
+T0-3B \cite{sanh2021multitask} is initialized from T5-3B and pretrained on multiple tasks that (in most cases) do not use structured knowledge as input (non-\skg tasks). 
+Exploring the performance of T0-3B on \skg tasks helps us understand the relationship between \skg tasks and non-\skg tasks. 
+Table \ref{tab:t0} shows that T0-3B under-performs T5-3B on semantic parsing and outperforms T5-3B on dialogue state tracking and fact verification. 
+We note that T0-3B is pretrained on dialogue QA, dialogue summarization, and NLI tasks; therefore, pretraining on non-\skg tasks might not be useful for \skg unless we add similar \skg tasks to pretraining. 
+
+\footnotetext{%
+For GrailQA and WebQSP, we run T5 and rerun the previous sota model~\cite{ye2021rng} using the gold entities. 
+For MultiModalQA and FEVEROUS, we report performance of T5 and the previous sota models on the dev. samples with at least one table (samples with image input are further excluded for MultiModalQA);
+The gold table and text candidates are used for both T5 and previous sota~(for MultiModelQA, numbers are from~\cite{yoran2021turning}, and for FEVEROUS, we rerun the available model~\cite{aly2021fact} on gold candidates to obtain the number).
+We use sacreBLEU to report all BLEU results.
+$^\ddag$We use gold entity linking, but the previous sota does not, which makes the results not directly comparable; therefore, we do not bold any numbers for CompWebQ and HybridQA.
+$^*$T5-base with the independent output scheme \cite{lee-etal-2021-dialogue} achieves 56.66 on MWoZ2.1, higher than our sequence output scheme. 
+For WebQSP, as the original dataset does not have a dev.~set, we split the original train set into in-house train/dev.~sets (90\%/10\%), following prior practice (e.g. \citet{ren2021lego}). Similarly, for CompWebQ, as the test set is not publicly available, we split the original dev.~set into in-house dev./test sets (20\%/80\%). For GrailQA, we split the original dev.~set into in-house dev./test sets (5\%/95\%).
+}
+
+\subsection{Multi-Task Learning}
+\uskg facilitates the exploration of multi-task learning. In this part, we systematically study multi-task learning on all \ntasks unified tasks. We find that \skg benefits from multi-task prefix-tuning on both T5-base and T5-large, showing that the benefits from multi-task learning is scalable in terms of the model size. The baselines we use include:
+
+\noindent\textbf{Single-task finetuning (ST-F)}, which is finetuning on individual tasks, same as Section \ref{subsec:baseline-performance}.
+
+\noindent\textbf{Single-task prefix-tuning (ST-P;} \citealp{li2021prefixtuning}\textbf{)}, which learns lightweight task-specific parameters while keeping the PLM fixed. We set the prefix length as 10. \citet{Clive2021ControlPF} also used prefix-tuning on T5 for data-to-text generation. 
+
+\noindent\textbf{Multi-task finetuning (MT-F)}, which combines the training data of all tasks with temperature mixing (\citealp{2020t5}; after hyperparameter tuning with a few steps, we set the temperature as 2). We select model weights based on the average metric on all tasks' development set.
+
+Table~\ref{tab:multitask-dev-simple} shows that ST-P is comparable to ST-F on nearly all tasks. 
+However, we find that it takes about 5--10 times as many training steps (See Appendix \ref{app:step}), which is similarly observed for prompt-tuning \cite{LesterAC21}. 
+We also observe that MT-F leads to mixed results. 
+For many tasks, MT-F is even worse than ST-F.
+
+\noindent\textbf{Multi-task prefix-tuning (MT-P) \ \ } 
+Our explanation for the mixed results of MT-F is that the inputs of SKG tasks contain different structured knowledge from diverse domains, making it difficult to learn shared parameters effectively. 
+To address this challenge, we first pretrain a prefix on all tasks, freezing T5 and using the same temperature mixing as MT-F. In the second step, we initialize each task's prefix with this pretrained prefix and optimize the prefix while freezing T5. 
+This initialization step is similar to the prompt transfer explored in \citet{vu2021spot}.
+Following ST-P, we set the prefix length as 10. 
+
+Table~\ref{tab:multitask-dev-simple} shows that multi-task prefix-tuning outperforms single-task finetuning and single-task prefix-tuning on most tasks, and it largely outperforms the naive multi-task learning baseline.
+It demonstrates that SKG tasks can be studied together to share data and knowledge.
+
+\begin{table}[t!]
+	\centering
+	\begin{adjustbox}{width=0.95\linewidth}
+		\begin{tabular}{@{}lcccc|cc@{}}
+			\toprule
+			\multicolumn{1}{c}{}  & \multicolumn{4}{c|}{T5-base} & \multicolumn{2}{c}{T5-large} \\
+		    & ST-F & ST-P & MT-F & MT-P & ST-F & MT-P
+			\\ 
+			\midrule
+	        \multirow{1}*{Spider} 
+            & 58.12 & 58.61 & 58.90 & \bf 59.86 & 66.63 & \bf 67.60 \\
+            \multirow{1}*{GrailQA}
+            & 60.00 & 61.33 & 56.00 & \bf 62.67 & \bf 67.00 & 65.33 \\
+            \multirow{1}*{WebQSP}
+            & 72.50 & 73.81 & 67.25 & \bf 74.77 & 73.96 & \bf 74.92 \\
+            \multirow{1}*{MTOP}
+            & \bf 83.89 & 82.93 & 78.79 & 82.77 & \bf 84.70 & 84.34 \\
+			\midrule
+            \multirow{1}*{WikiTQ}
+            & 36.94 & 36.42 & \bf 41.15 & 39.74 & 43.30 & \bf 50.90 \\
+            \multirow{1}*{WikiSQL}
+            & \bf 84.50 & 83.09 & 81.85 & 84.44 & 86.27	& \bf 87.45 \\
+            \multirow{1}*{CompWQ}
+            & 66.71 & 67.85 & 68.28 & \bf 69.70 & 68.85	& \bf 71.27 \\
+            \multirow{1}*{HybridQA}
+            & 54.07 & \bf 54.93 & 53.52 & 54.88 & 56.95	& \bf 57.33 \\
+            \multirow{1}*{MMQA}
+            & 75.51 & 75.50 & \bf 76.63 & 76.40 & 81.84	& \bf 84.59 \\
+            \multirow{1}*{FeTaQA}
+            & 29.00 & 28.03 & \bf 31.85 & 29.33 & 30.94	& \bf 32.48 \\
+			\midrule 
+			\multirow{1}*{DART} 
+			& 50.62 & 50.33 & 49.74 & \bf 50.68 & \bf 51.72	& 50.82 \\
+			\multirow{1}*{ToTTo}
+			& \bf 48.29 & 45.70 & 45.29 & 45.21 & \bf 48.95	& 47.90 \\
+            \midrule
+			\multirow{1}*{MWoZ2.1}
+			& \bf 57.52 & 56.67 & 53.19 & 57.06 & 58.23	& \bf 59.24 \\
+			\multirow{1}*{KVRET} 
+			& 20.04 & 19.68 & 18.53 & \bf 21.32 & 18.84	& \bf 20.76 \\
+			\multirow{1}*{SParC}
+			& 50.54 & 51.04 & \bf 51.70 & 51.29 & 56.69	& \bf 59.02 \\
+			\multirow{1}*{CoSQL}
+			& 42.30 & 44.39 & 43.59 & \bf 45.68 & 48.26	& \bf 51.64 \\
+			\multirow{1}*{SQA}
+		    & 49.49 & 44.81 & \bf 51.48 & 48.43 & \bf 59.12	& 58.15 \\
+			\midrule
+			\multirow{1}*{TabFact}
+			& 76.34 & 75.74 & 71.19 & \bf 77.86 & 81.40 & \bf 83.62 \\
+            \multirow{1}*{FEVER.}
+            & 75.05 & 75.33 & 76.85 & \bf 78.02 & 79.81	& \bf 82.05 \\
+			\midrule
+			\multirow{1}*{SQL2Text}
+			& 93.69 & \bf 94.50 & 93.57 & 93.79 & 93.35	& \bf 93.93 \\
+			\multirow{1}*{Logic2Text}
+			& 92.15 & \bf 95.25 & 92.24 & 94.70 & 92.88	& \bf 93.61\\
+			\midrule
+			Total para. & $21T$ & $T + 21P$ & $T$ & $T + 21P$ & $21T$ & $T + 21P$ \\
+			Avg. score & 60.82 & 60.76 & 60.08 & \bf 61.84 & 64.27 & \bf 65.57 \\
+			\bottomrule
+		\end{tabular}
+		\end{adjustbox}
+	\caption{Multi-task learning results. 
+	ST and MT stand for single-task and multi-task. F and P stand for finetuning and prefix-tuning. 
+	For total parameters, $T$ and $P$ are the numbers of T5 and prefix parameters ($P \ll T$). 
+    Multi-task learning with prefix improves the performance on most tasks, largely improving the overall performance. We report results on the dev. set. }
+	\label{tab:multitask-dev-simple}
+	\vspace{-3mm}
+\end{table}
+
+\begin{table}[!t]
+	\centering
+	\begin{adjustbox}{width=0.85\linewidth}
+		\begin{tabular}{@{}ccccc@{}}
+			\toprule
+			Task A & Task B & Type & B only & A to B \\
+			\midrule
+			\multirow{1}*{WikiSQL}
+			& \multirow{1}*{TabFact}
+			& same source & 81.43 & 82.76 \\
+			\multirow{1}*{TabFact}
+			& \multirow{1}*{WikiTQ}
+			& same source & 43.30 & 45.88 \\
+			\multirow{1}*{WikiSQL}
+			& \multirow{1}*{FeTaQA}
+	        & same source & 30.94 & 31.19 \\
+			\multirow{1}*{Spider}
+			& \multirow{1}*{GrailQA}
+	        & parallel tasks & 67.00 & 67.00 \\
+			\multirow{1}*{Spider}
+			& \multirow{1}*{WikiTQ}
+            & subtask & 43.30 & 41.68 \\
+			\multirow{1}*{Spider}
+			& \multirow{1}*{TabFact}
+			& weakly related & 81.43 & 80.39 \\
+	        \bottomrule
+		\end{tabular}
+		\end{adjustbox}
+	\caption{Task knowledge transfer. We use T5-large here. \textit{B only} means training the model on task B; \textit{A to B} means to train the model on task A and then to finetune the model on task B. In both settings, we report task B's development set performance. We find that tasks benefit from other tasks with the same data source. }
+	\label{tab:task-relationship-main}
+\end{table}
+
+\iffalse
+
+\begin{table}[t]
+	\centering
+	\begin{adjustbox}{width=\linewidth}
+		\begin{tabular}{@{}ccccc@{}}
+			\toprule
+			Group & Task & Single-Finetune & Single-Prefix & Shared-Prefix \\
+			\midrule 
+	        \multirow{3}*{Text-to-SQL}
+	        & Spider    & 58.12 & 58.61 & 60.64$\uparrow$ \\
+	        & CoSQL     & 42.30 & 42.30 & 46.87$\uparrow$ \\
+	        & SParC     & 50.54 & 51.04 & 52.04$\uparrow$ \\
+	        \midrule
+			\multirow{8}*{QA}
+			& WikiTQ    & 36.94 & 36.42 & 39.60$\uparrow$ \\
+			& WikiSQL   & 84.50 & 83.09 & 80.38 \\ 
+			& HybridQA  & 54.07 & 54.93 & 52.34 \\ 
+			& MMQA      & 75.51 & 75.50 & 73.76 \\ 
+			& FeTaQA    & 29.12 & 28.03 & 28.77 \\ 
+			& SQA       & 49.49 & 44.81 & 43.13 \\ 
+			& CompWebQ  & 66.71 & 67.85 & 67.14$\uparrow$ \\ 
+			\midrule
+			\multirow{3}*{KG input}
+			& GrailQA   & 62.39 & 63.33 & 58.67 \\
+			& WebQSP    & 72.50 & 73.81 & 72.70 \\ 
+			& CompWebQ  & 68.43 & 67.85 & 68.14 \\ 
+	        \midrule
+			\multirow{2}*{Data-to-text}
+			& DART      & 50.62 & 50.33 & 49.13 \\
+			& ToTTo     & 48.29 & 45.70 & 43.98 \\ 
+			\midrule
+			\multirow{2}*{Fact veri.}
+			& TabFact      &  76.34 & 75.74 & 76.25 \\
+			& FEVEROUS     &  75.05 & 75.33 & 79.04$\uparrow$\\ 
+			\midrule
+			\multirow{2}*{HF NLG}
+			& Logic2Text    & 92.15 & 95.25 & 94.79 \\
+			& SQL2Text      & 93.43 & 94.50 & 94.86 \\ 
+	        \bottomrule
+		\end{tabular}
+		\end{adjustbox}
+	\caption{Task similarity induced by prefix-tuning. $\uparrow$ means this task is benefit from other tasks in the group }
+	\label{tab:task-relationship-main}
+\end{table}
+
+\fi
+
+\iffalse
+\begin{table}[t]
+	\centering
+	\begin{adjustbox}{width=\linewidth}
+		\begin{tabular}{@{}ccccc@{}}
+			\toprule
+			Group & Task & Single-task & PAMT \\
+			\midrule 
+	        \multirow{3}*{Text-to-SQL}
+	        & Spider    & 58.12 & 60.64 \\
+	        & CoSQL     & 42.30 & 46.87 \\
+	        & SParC     & 50.54 & 52.04 \\
+	        \midrule
+			\multirow{8}*{QA}
+			& WikiTQ    & 36.94 & 39.60 \\
+			& WikiSQL   & 84.50 & 80.38 \\ 
+			& HybridQA  & 54.07 & 52.34 \\ 
+			& MMQA      & 67.29 & 65.42 \\ 
+			& FeTaQA    & 29.12 & 28.77 \\ 
+			& SQA       & 49.49 & 43.13 \\ 
+			& CompWebQ  & 66.71 & 67.14 \\ 
+			\midrule
+			\multirow{3}*{KG input}
+			& GrailQA   & 62.39 & 58.67 \\
+			& WebQSP    & 72.50 & 72.70 \\ 
+			& CompWebQ  & 68.43 & 68.14 \\ 
+	        \midrule
+			\multirow{2}*{Data-to-text}
+			& DART      & 50.62 & 49.13 \\
+			& ToTTo     & 48.29 & 43.98 \\ 
+			\midrule
+			\multirow{2}*{Fact veri.}
+			& TabFact      &  76.34 & \running \\
+			& FEVEROUS     &  75.05 & 79.04 \\ 
+			\midrule
+			\multirow{2}*{HF NLG}
+			& Logic2Text    & 92.15 & 94.79 \\
+			& SQL2Text      & 93.43 & 94.86 \\ 
+	        \bottomrule
+		\end{tabular}
+		\end{adjustbox}
+	\caption{Task relationship induced by PAMT. }
+	\label{tab:task-relationship-main}
+\end{table}
+\fi\noindent\textbf{Exploring task knowledge transfer \ \ } 
+\uskg facilitates studying knowledge transfer between \skg tasks. Given two tasks, \textit{task A} and \textit{task B}, we first train the model on task A and then continue training on task B. Table \ref{tab:task-relationship-main} shows that tasks benefit from other tasks with the same data source (e.g., tasks that all use Wikipedia tables as structured knowledge). We do not observe positive transfer between \textit{parallel tasks} (e.g., semantic parsing tasks with different structured knowledge and different output) and \textit{subtask} (e.g., question answering can be viewed as the execution semantic parses) when data sources are different.  
+Compared to the positive results in Table \ref{tab:multitask-dev-simple}, results in this part indicate that manually selecting source and target tasks may not be efficient for multi-task learning. 
+
+\subsection{Zero-Shot and Few-Shot Learning}
+\label{subsec:pretrained-models-analysis}
+The text-to-text unification of \uskg enables us to investigate zero/few-shot learning on SKG with large PLMs. 
+
+\noindent\textbf{Zero-shot learning setting \ \ } 
+Zero-shot learning enables models to solve tasks with natural language descriptions without training samples. We follow T0 \cite{sanh2021multitask} to create similar natural language instructions for the unseen tasks. Our instructions are provided in Appendix \ref{subapp:t0_zero}. 
+
+\iffalse
+\begin{table}[t]
+    \small
+	\centering
+	\begin{adjustbox}{width=\columnwidth}
+		\begin{tabular}{lcccc}
+			\toprule
+			& T5-large & BART-large & GPT-3 & Codex \\ 
+			\midrule
+			\multirow{1}*{Spider} 
+            & 64.73 & 43.13 & \running & 41.49  \\
+            \multirow{1}*{WikiTQ}
+            & 43.59 & 33.73 & \running & 26.21 \\
+            \multirow{1}*{DART} 
+			& 51.72 & 43.23 & \running & 42.13  \\
+			\multirow{1}*{MultiWoZ2.1}
+			& 56.62 & 54.60 & \running & 23.11 \\
+			\multirow{1}*{TabFact}
+			& 81.40 & 77.49 & \running & 50.97 \\
+			\multirow{1}*{SQL2Text}
+			& 93.07 & 88.86 & \running & 90.64 \\
+			\bottomrule
+		\end{tabular}
+	\end{adjustbox}
+	\caption{Comparison of pretrained models. \tao{add T0/FLAN/GPT3/Codex/MetaICL zero-shot results here too to add a few-shot/zero-shot section in the paper. use their prompt style for T0/FLAN. use a figure to show the big performance gap of T0 on their unseen tasks and our skg tasks}}
+	\label{tab:effect-of-models}
+\end{table}
+
+\fi 
+
+\begin{table}[t]
+    \small
+	\centering
+	\begin{adjustbox}{width=\columnwidth}
+		\begin{tabular}{@{}l@{}cccccc@{}}
+			\toprule
+			& T5-3B &
+			\multicolumn{1}{c}{T0 3B} &
+			\multicolumn{2}{c}{GPT-3 175B} & \multicolumn{2}{c}{Codex 175B} \\ 
+			& \textit{finetune} & \textit{zero-shot} & \textit{select} & \textit{random} & \textit{select} & \textit{random} \\
+			\midrule
+			\multirow{1}*{Spider} 
+            & 71.76 & \ \ 0.00 & 20.00 & 18.33$_{3.78}$ & 40.72 & 43.23$_{4.16}$ \\
+            \multirow{1}*{WikiTQ}
+            & 50.65 & 12.68 & 32.00 & 29.33$_{9.04}$ & 26.21 & 20.46$_{4.21}$ \\
+            \multirow{1}*{DART} 
+			& 50.38 & 23.42 & 40.23 & 34.21$_{4.50}$ & 42.13 & 36.54$_{1.67}$ \\
+			\multirow{1}*{MWoZ}
+			& 58.46 & \ \ 0.00 & 18.00 & \ \ 0.02$_{0.02}$ & 23.47 & \ \ 0.06$_{0.03}$ \\
+			\multirow{1}*{TabFact}
+			& 83.97 & 52.45 & 51.00 & 49.67$_{3.79}$ & 50.97 & 51.58$_{1.59}$ \\
+			\multirow{1}*{SQL2Text}
+			& 92.71 & 39.64 & 94.00 & 85.00$_{2.65}$ & 90.64 & 88.31$_{1.61}$ \\
+			\bottomrule
+		\end{tabular}
+	\end{adjustbox}
+	\caption{Zero-shot and few-shot learning for SKG. Subscripts show the standard deviation with three runs. 
+	\textit{select} means to select the most similar training samples as few-shot examples, while \textit{random} means to randomly select training samples as few-shot examples. 
+	T0 performs poorly on all the tasks in the zero-shot setting.
+	Codex outperforms GPT-3 on tasks that generate structured programs (Spider and MultiWoZ).
+	}
+	\label{tab:effect-of-models}
+\end{table}
+\noindent\textbf{Few-shot learning settings \ \ } \citet{brown2020language} showed that large PLMs could be few-shot learners by encoding a few training samples as ``context'' to learn without gradient updates. 
+We use GPT-3 \cite{brown2020language} and Codex \cite{chen2021evaluating} to explore such few-shot learning for SKG. To stay within our budget, for GPT-3, we report the performance on 100 random dev. set samples. We explore two settings for few-shot learning. 
+
+In the first setting, we randomly sample few-shot examples from the training set; these examples are shared by all dev. set samples, denoted as \textit{random} in Table \ref{tab:effect-of-models}. 
+For sequences that are too long for Codex (4096) and GPT-3 (2048), we use as many examples as possible and make sure that there is at least one example (truncated if needed). 
+
+In the second setting, we follow \citet{gao2021making} to select few-shot examples from the training set. 
+We call this setting \textit{few-shot with example selection}, denoted as \textit{select} in Table \ref{tab:effect-of-models}. 
+We use the pretrained SBERT \cite{reimers-2020-multilingual-sentence-bert} for sentence embeddings of the user request input (for tasks that only have structured input, we embed the linearized structured input) and sample five most similar examples measured by cosine similarity. Further details (e.g., prompts and task instructions) are provided in Appendix \ref{subapp:gpt3_codex}.
+
+\noindent\textbf{SKG is challenging for zero/few-shot learning. }
+Table~\ref{tab:effect-of-models} shows that zero-shot performance is very poor on most tasks (Spider and MultiWoZ are even 0). 
+It also shows a large gap between few-shot learning and finetuning for Spider, WikiTQ, MWoZ, and TabFact, while the gap is smaller for generation tasks. 
+For few-shot learning, example selection based on similarity outperforms random selection, but the gap is usually smaller than 10 points out of 100. 
+It is also interesting to compare the results between \textit{synthesis} tasks (Spider), which requires predicting programs, and \textit{induction} tasks (WikiTQ and TabFact), where a model directly outputs answers \citep{Devlin2017RobustFillNP}. 
+We find that PLMs generally struggle more when adapting to induction tasks (e.g., close to random-guess on the binary classification task TabFact), reminiscent of recent attempts in program synthesis and induction using PLMs~\citep{Austin2021ProgramSW}.
+For GPT-3 and Codex, 
+better zero-shot performances can be expected by better prompt design. 
+
+\subsection{Structured Knowledge Encoding}
+\label{subsec:structured-encoding-analysis}
+Structured knowledge encoding has been widely explored (\citealp{Bogin2019GlobalRO,kagnet-emnlp19,agarwal2020knowledge,saxena2020improving,yasunaga2020graph,yasunaga2022dragon}; and others detailed in Section \ref{sec:related-work}). We hope that \uskg can promote systematic study of \textit{general} structured knowledge encoding. 
+To this end, this part focuses on the linearization of structured knowledge. 
+
+\begin{table}[t]
+	\centering
+	\small
+	\begin{adjustbox}{width=0.95\linewidth}
+		\begin{tabular}{@{}lcccc@{}}
+		    \toprule
+		    & Spider & WikiTQ & MultiWoZ2.1 & TabFact\\
+			\midrule
+			 \textit{rs(c)} & \quad \ \ 66.63$_{2.31}$ & \quad \ \ 43.30$_{0.25}$ & \quad \ \ 58.23$_{0.39}$ & \quad \ \ 81.43$_{0.16}$ \\
+			 \textit{sr} & 64.12 & 38.78 & \na & 80.98 \\ \textit{rcs} & \na & \na & 58.89 & \na \\
+			\bottomrule
+		\end{tabular}
+	\end{adjustbox}
+	\caption{Ordering of inputs. Subscripts show the standard deviation with three runs. \textit{s}, \textit{r}, and \textit{c} stand for the structured knowledge, request input, and context. Placing \textit{r} before \textit{s} is always better, and placing \textit{c} between \textit{r} and \textit{s} is better for dialogue state tracking (MultiWoZ2.1).
+	}
+	\label{tab:sk_txt_ordering}
+\end{table}
+
+\begin{table}[t]
+    \small
+	\centering
+	\begin{adjustbox}{width=1\linewidth}
+		\begin{tabular}{@{}l@{}cccc@{}}
+		    \toprule
+			& Spider & WikiTQ & DART & MultiWoZ2.1 \\
+			\midrule
+			Same Order & \quad \ \ 66.63$_{2.31}$ & \quad \ \ 43.30$_{0.25}$ & \quad \ \ 51.72$_{0.15}$ & \quad \ \ 58.23$_{0.39}$ \\
+			Reversed Order & 64.80 & 37.80 & 48.47 & 13.59 \\
+			\bottomrule
+		\end{tabular}
+	\end{adjustbox}
+	\caption{Order-sensitivity of structured knowledge. Subscripts show the standard deviation with three runs. \textit{Same Order} is the default benchmark setting. \textit{Reversed Order} means to reverse the structured knowledge ordering on the development set (but not the training set). 
+	Tasks with cross-domain tables (in WikiTQ), databases (in Spider), and triples (in DART) are less order-sensitive, while pre-defined ontology (in MultiWoZ2.1) is highly order-sensitive. }
+	\label{tab:sk_ordering}
+\end{table}
+
+\iffalse
+\begin{table}[t]
+    \small
+	\centering
+	\begin{adjustbox}{width=0.95\linewidth}
+		\begin{tabular}{@{}lccc@{}}
+		    \toprule
+			& WikiTQ & WikiSQL & TabFact \\
+			\midrule
+			T5-3B & 49.29  & 85.96 & 83.68 \\
+			TAPAS~\cite{Herzig2020tapas} & 48.8 & 83.6 & 81.0$^{\dagger}$ \\
+			TaBERT~\cite{yin20tabert} & 52.3 & -- & -- \\
+			\bottomrule
+		\end{tabular}
+	\end{adjustbox}
+	\caption{Test set performance of T5-3B and specific structured knowledge encoding models. $^\dagger$Further intermediate pretraining based on TAPAS. T5 with simple linearization is comparable to specific encoding models. }
+	\label{tab:specific_encoding_models}
+\end{table}
+\fi\noindent\textbf{Does the order of user input, structured knowledge, and context matter?} 
+To explore the effect of the order of user input, structured knowledge, and context, we rerun the single-task experiments while switching the order of these components in both the training and development set. 
+Table \ref{tab:sk_txt_ordering} shows that placing the text before structured knowledge (\textit{rs}) is better than the opposite (\textit{sr}), which is consistent across \skg tasks.
+Our explanation is that the position of the text is relatively fixed in \textit{rs}, helping the decoder to learn stable attention over the text. 
+Also, placing the context in between the text and structured knowledge yields better results.
+
+\noindent\textbf{Is T5 sensitive to structured knowledge ordering?}
+Order-insensitivity is common for most structured knowledge, e.g., permutation of columns in a table preserves the meaning. 
+To study this insensitivity, we evaluate T5-large on a manipulated development set where the order of schema (for database), column (for table), or slots and values (for ontology) is reversed. 
+Table \ref{tab:sk_ordering} shows that tasks with cross-domain tables and databases are less order-sensitive, while models are very sensitive to the order of ontology. 
+Other types of robustness (e.g., robustness to cell values irrelevant to the answer) remain an open question in \uskg. 
+
+\begin{table}[t]
+	\centering
+	\small
+	\begin{adjustbox}{width=0.85\linewidth}
+		\begin{tabular}{@{}lccc@{}}
+		    \toprule
+			& Spider & WikiSQL & TabFact \\
+			\midrule
+			Linearization  & 40.23 & 59.21 & 58.77  \\
+			Natural Language & 38.59 & 63.16 & 58.56  \\
+			\bottomrule
+		\end{tabular}
+	\end{adjustbox}
+	\caption{Converting structured knowledge into natural language for low-resource learning. 
+	A large improvement is observed on question answering (WikiSQL), but not on text2SQL semantic parsing (Spider) and fact verification (TabFact). }
+	\label{tab:convert-to-nl}
+\end{table}\noindent\textbf{Is it beneficial to represent structured knowledge as natural language?}
+SKG data is not typically used to pretrain PLMs. Given ample training data, PLMs adapt well to SKG tasks, as shown in Table \ref{tab:baseline-simple-version}. However, under the low-resource setting, converting structured data to natural language might be helpful. 
+For Spider, we use a shared template to convert structured data to natural language. 
+For TabFact and WikiSQL, we randomly selected 236 tables shared by both datasets and manually labeled templates to convert each row into a sentence. Examples of the templates are shown in Appendix \ref{app:examples_template}. These templates produce about 1000 samples for each task, divided into training and test sets. We find that, in WikiSQL, the conversion to natural language stabilizes and accelerates the training process. % while in TabFact and Spider, it doesn't help much by a large margin.
+Table \ref{tab:convert-to-nl} shows that conversion to natural language improves the performance on WikiSQL, has no significant influence on TabFact, and slightly degrades the performance on Spider.
+
+\begin{table}[t]
+	\centering
+	\small
+	\begin{adjustbox}{width=0.85\linewidth}
+	\begin{tabular}{@{}lllll@{}}
+			\toprule
+			& Metric & T5-base
+			& T5-large
+			& T5-3B
+			\\ 
+			\midrule
+            \multirow{2}*{FeTaQA}
+            & BLEU & 29.00 & 30.94 & 31.73 \\
+            & Human$^{*\dag}$ & 36.0\% & 51.3\% & 57.3\% \\
+			\midrule 
+			\multirow{2}*{DART} 
+			& BLEU & 50.62 & 51.72 & 50.38 \\
+			& Human & 90.7\% & 91.7\% & 87.7\% \\
+            \midrule
+			\multirow{2}*{ToTTo}
+			& BLEU & 48.29 & 48.95 & 48.95 \\
+			& Human & 78.7\% & 80.0\% & 81.3\% \\
+            \midrule
+			\multirow{2}*{KVRET}
+			& BLEU & 20.04 & 18.84 & 17.75 \\
+			& Human$^{\dag}$ & 72.3\% & 66.3\% & 75.0\% \\
+            \midrule
+			\multirow{2}*{SQL2Text}
+			& BLEC & 93.69 & 93.35 & 92.71 \\
+			& Human$^{*}$ & 83.7\% & 90.3\% & 84.7\% \\
+            \midrule
+			\multirow{2}*{Logic2Text}
+			& BLEC & 92.15 & 92.88 & 91.69 \\
+			& Human$^{\dag}$ & 77.2\% & 81.5\% & 84.2\% \\
+			\bottomrule
+	\end{tabular}
+	\end{adjustbox}
+	\caption{Automatic metrics and human evaluation on the development set of generation tasks. $^{*}p<0.05$ for ``the rank-1 model is better than the rank-2 model''. $^{\dag}p<0.05$ for ``the rank-2 model is better than the rank-3 model''. Automatic metrics do not always reflect human evaluation. Larger models are not always better. }
+	\label{tab:human-eval}
+\end{table}
+
+\iffalse
+\begin{figure}[t]
+\centering
+    \subfigure[FeTaQA]{
+        \includegraphics[width=0.46\linewidth]{figures/human_and_error/FeTaQA-human.pdf}
+    }
+    \subfigure[DART]{
+        \includegraphics[width=0.46\linewidth]{figures/human_and_error/DART-human.pdf}
+    }
+    \subfigure[ToTTo]{
+        \includegraphics[width=0.46\linewidth]{figures/human_and_error/ToTTo-human.pdf}
+    }
+    \subfigure[KVRET]{
+        \includegraphics[width=0.46\linewidth]{figures/human_and_error/KVRET-human.pdf}
+    }
+    \subfigure[SQL2Text]{
+        \includegraphics[width=0.46\linewidth]{figures/human_and_error/SQL2Text-human.pdf}
+    }
+    \subfigure[Logic2Text]{
+        \includegraphics[width=0.46\linewidth]{figures/human_and_error/Logic2Text-human.pdf}
+    }
+\caption{\label{fig:human-eval} Development set performance measured by automatic metrics and human for generation tasks. Generation metrics do not always reflect human evaluation. Larger models are not always better. Human evaluation statistical test: 1) on FeTaQA and SQL2Text, we have $p<0.05$ for ``the rank-1 model is better than the rank-2 model''; 2) on FeTaQA, KVRET, and Logic2Text, we have $p<0.05$ for ``the rank-2 model is better than the rank-3 model''.
+\ziyu{larger font size in figures?}
+\tao{take too much space to show a non-key discussion}
+}
+\end{figure}
+\fi\iffalse
+\begin{table*}[t]
+	\centering
+	\small
+	\begin{adjustbox}{width=\linewidth}
+	\begin{tabular}{@{}l@{}c@{}c@{}c@{}c@{}c@{}ccccccc@{}}
+			\toprule
+			& \multicolumn{6}{c}{Invalid / valid-but-wrong} & \multicolumn{6}{c}{Missing-information / contradiction / hallucination / ungrammatical (\%)} \\ 
+		    \cmidrule(lr){2-7} \cmidrule(l){8-13}
+			& \ \ \  Spider \ \ \ & \ \ SParC \ \ & \ \ \ CoSQL \ \ & GrailQA \ & \ WebQSP \ & \ MTOP & FeTaQA & DART & ToTTo & KVRET & SQL2Text & Logic2Text \\ 
+			\midrule 
+			T5-base       & 268/140 & 298/257 & 268/248 & 14/29 & 28/62 & 2/358 & 35/34/6/5 & 4/2/2/3 & 16/4/10/2 & 14/16/0/4 & 5/9/2/3 & 7/13/2/7 \\
+			T5-large      & 167/144 & 181/293 & 228/219 & 13/20 & 33/53 & 1/341 & 33/23/4/4 & 4/2/1/4 & 12/3/10/3 & 22/17/1/3 & 4/5/2/2 & 5/13/1/4 \\
+			T5-3B         & 121/144 & 150/243 & 131/175 & 14/17 & 29/51 & 2/336 & 33/17/4/2 & 6/3/2/4 & 10/3/13/2 & 13/18/2/2 & 7/6/1/3 & 7/9/2/3 \\ 
+			\bottomrule
+	\end{tabular}
+	\end{adjustbox}
+	\caption{Error analysis. For semantic parsing, we show the number of invalid/valid-but-wrong outputs. For generation tasks, we show the proportion of missing-information/contradiction/hallucination/ungrammatical outputs among all outputs. \todo{Noah: better way to present} \tao{plot instead!} }
+	\label{tab:error_distribution}
+\end{table*}
+\fi 
+
+\begin{figure}[t]
+\centering
+    \subfigure[Spider]{
+        \includegraphics[width=0.45\linewidth]{figures/human_and_error/Spider-error.pdf}
+    }
+    \subfigure[GrailQA]{
+        \includegraphics[width=0.45\linewidth]{figures/human_and_error/GrailQA-error.pdf}
+    }
+    \subfigure[FeTaQA]{
+        \includegraphics[width=0.45\linewidth]{figures/human_and_error/FeTaQA-error.pdf}
+    }
+    \subfigure[ToTTo]{
+        \includegraphics[width=0.45\linewidth]{figures/human_and_error/ToTTo-error.pdf}
+    }
+\caption{\label{fig:error-analysis} Error analysis. For semantic parsing, we plot the number of invalid/valid-but-wrong predictions. For generation, we plot the proportion of missing-information/contradiction/hallucination/ungrammatical errors among all predictions (one prediction may have multiple errors). Full visualization is in Appendix \ref{app:all-results}. } 
+\end{figure}
+
+\subsection{Human Evaluation for Generation Tasks}
+\label{subsec:human-eval}
+For each generation task, we randomly sample 100 development set samples and ask human annotators to judge the correctness of each output, using a 0-1 score. Details are provided in Appendix \ref{subapp:human-evaluation}. 
+Table \ref{tab:human-eval} shows that automatic metrics do not always reflect human evaluation, calling for better automatic metrics to truly reflect the model's ability on generation tasks. 
+Larger models are not always better, and detailed error analysis is provided below. 
+
+\subsection{Error Analysis}
+\label{subsec:error}
+
+\noindent\textbf{Error analysis based on output validity \ \ }  
+Unconstrained decoding from PLMs may generate \textit{invalid outputs}. 
+For semantic parsing, we divide wrong outputs into \textit{invalid outputs} (i.e., not executable when the output is SQL, and not parse-able when the output is s-expression or TOP-representation) and \textit{valid but wrong answers}. 
+Figure \ref{fig:error-analysis} shows that, for SQL semantic parsing, a large number of errors are caused by invalid outputs, and the number of invalid outputs gradually decreases with the increase of model size. This phenomenon is also observed by \citet{Scholak2021:PICARD}, who used constrained decoding to improve the validity, largely improving the parsing performance.
+For s-expression semantic parsing, invalid outputs take up 30--50\% of all wrong outputs, and increasing the model size does not reduce invalidity significantly. 
+For fact verification tasks, valid outputs are ``entailed'' and ``refuted''. 
+We observe that T5 always generates valid outputs. 
+For question answering, we do not include the validity analysis since the validity check for an answer is non-trivial and could be imprecise. 
+
+\noindent\textbf{Error analysis for text generation tasks \ \ } 
+For generation tasks, we consider four types of errors: \textit{missing information} (required information is not shown in the output), \textit{contradiction} (the output is contradictory to the input), 3) \textit{hallucination} (the output contains information that cannot be verified by the input), and 4) \textit{ungrammatical}. 
+Figure \ref{fig:error-analysis} shows that the proportion of ungrammatical outputs is generally less than 5\%. 
+Missing information and contradiction are common errors made by T5, and performance gains generally come from reducing contradiction. 
+Hallucination is not a common error made by T5 except for the highlighted-table-to-text task (ToTTo), where T5 tends to output information of non-highlighted cell values.
+
+\noindent\textbf{Case study \ \ }
+We summarize some interesting observations about the model output (more in Appendix~\ref{app:case-study}).
+Compared with T5-base and T5-large, T5-3B's outputs for text generation tasks tend to be more diverse and creative as shown in Appendix \ref{app:fetaqa_case} and \ref{app:totto_case}.
+Also, T5-3B sometimes leverages domain knowledge to summarize facts in some tasks such as DART (e.g., describing \textit{rating 5 out of 5} as \textit{low}), while the other two copy the original expressions in the input, as shown in Appendix \ref{app:dart_case} and \ref{app:logic2text_case}.
+However, this ability puts T5-3B in the risk of manipulating information and meaning of user request as shown in Appendix \ref{app:kvret_case2} and \ref{app:sql2text_case}. 
+
+\section{Conclusions}
+In this paper, we propose the \uskg framework to promote systematic research on structured knowledge grounding by unifying \ntasks \skg tasks. Using \uskg as a benchmark, we demonstrate that finetuning T5 on individual tasks achieves state-of-the-art results on almost all \ntasks tasks. 
+We show that multi-task prefix-tuning benefits most \skg tasks, largely improving the overall performance. 
+For structured knowledge encoding, we find that the effectiveness of encoding variations varies across tasks. 
+Moreover, \uskg is a challenging testbed for zero-shot and few-shot learning, shown by the poor results of large PLMs. 
+
+\section{Limitations}
+
+\uskg establishes a powerful and reproducible starting point for \skg research. New models can be easily applied to diverse \skg tasks, and new tasks can be easily framed based on our standardized abstraction.
+\uskg promotes a systematic study on more general and robust advances in structured knowledge encoding, multi-task learning, zero-shot learning, and few-shot learning for \skg tasks.
+It also would be interesting to explore general pretraining methods within \uskg, which potentially benefit all the unified tasks. 
+When the structured knowledge is too large for GPU memory, we truncate them based on heuristic rules,
+calling for future study on 1) incorporating retrieval component in \skg, 
+2) designing sparse attention in T5 for structured knowledge or other means to improve model efficiency. 
+
+\uskg currently provides the correct type of structured knowledge for each task. 
+However, how a system searches for the correct structured knowledge resources, takes appropriate action, and integrates information and results from multiple structured sources given a user request is still under-explored, which are a prerequisite for building a unified multi-purpose \skg system. 
+
+Since we select popular tasks from each task family, we risk disproportionality in terms of the data language,  domain and population, and we actively welcome diverse, multi-lingual tasks to be added into \uskg. 
+Also, the error analysis of \skg can more fine-grained, and we hope our findings can promote future work on systematically studying and decomposing the behavior of PLMs on \skg tasks. 
+Furthermore, training and evaluation data should reflect the intents and linguistic phenomena in the real world \cite{Vries2020TowardsEV}, suggesting more realistic tasks to be added into \uskg. 
+\clearpage
+
+\clearpage
+
+\end{document}

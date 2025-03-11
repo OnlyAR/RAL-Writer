@@ -1,0 +1,542 @@
+\title{KnowCoder: Coding Structured Knowledge into LLMs for Universal Information Extraction}
+
+\begin{document}
+
+\maketitle
+\begin{abstract}
+
+In this paper, we propose KnowCoder, a Large Language Model (LLM) to conduct Universal Information Extraction (UIE) via code generation. KnowCoder aims to develop a kind of unified schema representation that LLMs can easily understand and an effective learning framework that encourages LLMs to follow schemas and extract structured knowledge accurately. To achieve these, KnowCoder introduces a code-style schema representation method to uniformly transform different schemas into Python classes, with which complex schema information, such as constraints among tasks in UIE, can be captured in an LLM-friendly manner. We further construct a code-style schema library covering over $\textbf{30,000}$ types of knowledge, which is the largest one for UIE, to the best of our knowledge. To ease the learning process of LLMs, KnowCoder contains a two-phase learning framework that enhances its schema understanding ability via code pretraining and its schema following ability via instruction tuning. After code pretraining on around $1.5$B automatically constructed data, KnowCoder already attains remarkable generalization ability and achieves relative improvements by $\textbf{49.8\%}$ F1, compared to LLaMA2, under the few-shot setting. After instruction tuning, KnowCoder further exhibits strong generalization ability on unseen schemas and achieves up to $\textbf{12.5\%}$ and $\textbf{21.9\%}$, compared to sota baselines, under the zero-shot setting and the low resource setting, respectively. Additionally, based on our unified schema representations, various human-annotated datasets can simultaneously be utilized to refine KnowCoder, which achieves significant improvements up to $\textbf{7.5\%}$ under the supervised setting.
+
+\end{abstract}
+
+\section{Introduction}
+
+\begin{figure}[tbp]  
+    \vspace{8mm}
+    \centering
+    \includegraphics[width=1\linewidth]{./pic/intro-schema.pdf}
+    \caption{An illustration of KnowCoder schemas.} 
+    \vspace{-4mm}
+    \label{fig:illustration}
+\end{figure}
+  
+Information Extraction (IE) aims to extract explicit and structured knowledge
+following the manually designed schemas. The IE schemas define high-level types
+of knowledge (i.e., concepts) and structures among them~\cite{kg-book}, which
+include various types of entities, relations, and events. To simultaneously
+extract various knowledge under different schemas via a single model, the
+Universal Information Extraction (UIE) task is proposed~\cite{lin2020joint}.
+Recently, Large Language Models (LLMs) have demonstrated general understanding
+abilities through large-scale pretraining, which drives their increasing
+utilization in UIE. However, their performance on UIE is still limited because
+of two main challenges: (1) the lack of a unified schema representation method
+that LLMs can easily understand; (2) the lack of an effective learning framework
+that encourages LLMs to accurately follow specific schemas for extracting
+structured knowledge.
+
+For the first challenge, the existing UIE models first represent different
+schemas in a universal way, such as classification labels~\cite{lin2020joint},
+keywords~\cite{gui2023instructie}, or a specifically-designed formal
+language~\cite{lu-etal-2022-unified}. These schema representation methods have
+three main restrictions: (1) ignoring information like taxonomies (e.g.,
+``fairytale'' is a subclass of ``written work'') and constraints among concepts
+(e.g., ``spouse'' relation exists between two ``human'' entities); (2)
+classification labels or a specifically designed formal language is hard for
+LLMs to understand and follow; (3) designed for specific IE datasets and lacking
+a general schema library.
+
+To solve these restrictions, in this paper, we propose a kind of code-style
+schema representation method, with which various types of knowledge are
+generally defined as Python classes. As shown in Figure~\ref{fig:illustration},
+the class inheritance mechanism is adopted to describe the concept taxonomies. A
+mechanism of type hint is employed to model constraints among different
+concepts. The class comments are used to provide clear definitions of concepts.
+And, the class methods are used to post-process the results according to
+specific IE guidelines. Upon this method, we construct a comprehensive
+code-style schema library covering over $29,000$ entity types, $900$ relation types,
+and $500$ event types based on Wikidata, the largest one for UIE, to the best of
+our knowledge, currently reported in the open literature.
+
+For the second challenge, the existing learning framework for UIE directly
+conducts instruction tuning on LLMs to extract knowledge following specific and
+limited schemas~\cite{sainz2023gollie,wang2023instructuie}. The enormous
+concepts in the constructed schema library challenge the existing training
+framework. To help LLMs better understand and follow these schemas, we propose
+an effective two-phase framework containing a schema understanding phase and a
+schema following phase. The former improves the ability of LLMs to understand
+different concepts in schemas via large-scale code pretraining on the schema
+definition code and corresponding instance code. The latter advances their
+abilities to follow specific schemas in an IE task via instruction tuning. After code pretraining on around 1.5B automatically constructed data, KnowCoder already attains remarkable generalization ability and achieves NER improvements compared to the base model, LLaMA2, by $\textbf{49.8\%}$ relative F1 point under the few-shot setting on NER. After instruction tuning on 1.5B automatically annotated data,  KnowCoder experimentally demonstrates strong generalization ability on unseen schemas. Under the zero-shot setting,  KnowCoder achieves average relative improvements up to $\textbf{12.5\%}$ on  the NER task. Under the low-resource setting, KnowCoder gets average relative improvements up to $\textbf{21.9\%}$ on all the IE tasks. Additionally, based on our unified schema representation, various IE datasets can be simultaneously utilized to refine KnowCoder. After refinement, KnowCoder achieves consistent improvements across all IE tasks under the supervised setting, getting up to $\textbf{7.5\%}$ improvement on the relation extraction task, respectively. 
+
+In general, the main contributions of this paper include: 
+\begin{itemize}
+  \item We propose a code-style schema representation method to uniformly
+  represent different schemas for UIE. Using this method, we construct a large
+  code-style schema library covering more than $30,000$ types of knowledge.
+  \item We propose an effective learning framework for LLMs in a two-phase
+  manner, which first enhances the schema understanding through code pretraining
+  and then boosts schema following via instruction tuning. 
+  \item After training on billions of automatically annotated data and refining
+  with human-annotated IE datasets, KnowCoder demonstrates superior performance
+  on different IE tasks under the zero-shot, low-resource, and supervised
+  settings.
+  \item The constructed schema library, training data, code, and models are released for future research.
+\end{itemize}
+
+\section{KnowCoder Schema} 
+The proposed schema representation method uses code, a language that LLMs easy to understand, to define schemas. Specifically, KnowCoder schema adopts a series of programming language features to comprehensively model schema information, including the concept taxonomies, the constraints among different concepts, the definition of concepts, and other extraction requirements. Besides, considering that previous schema representation methods are only designed for specific datasets and contain limited types of knowledge, we further construct a
+large-scale schema corpus containing a wide range of knowledge.
+
+\subsection{Code-style Schema Representation Method}
+
+ The code-style schema representation method comprises three basic classes,
+ namely, \texttt{``\textcolor{darkgreen}{Entity}''}, \texttt{``\textcolor{darkgreen}{Relation}''}, and \texttt{``\textcolor{darkgreen}{Event}''}. Based on the three basic
+ classes, we represent all the concepts in the schemas by the corresponding
+ classes. Then, the instances of each concept can be represented by the objects
+ of the corresponding class. In the following, we will introduce four features
+ of the proposed representation method.
+
+  \paragraph{Class Inheritance.} We adopt the class inheritance mechanism to
+  account for the taxonomies in the schemas. Specifically, we let class A
+  inherit all the class members from class B if the corresponding concept A is
+  the hyponym of concept B in the taxonomies. For a concept with multiple
+  hypernyms, the hypernym concept with the most instances is selected. The class
+  of an unseen concept can inherit from an existing class or directly from the
+  basic class.
+  
+  \paragraph{Class comment.} Similar to ~\citet{sainz2023gollie}, we adopt
+  class comments to provide clear definitions of concepts. As shown in
+  Figure~\ref{fig:illustration}, a class comment includes a natural language
+  description that explains the corresponding concept and the examples of instances
+  corresponding to that type. When there is an unseen concept, we use the
+  description in its annotation guidelines~\footnote{If the annotation
+  guidelines are missing, we use the description generated by GPT-4.} and
+  manually give out a few examples. 
+
+  \paragraph{Type Hint.} Type hint is a formal solution to indicate the type of
+  a value in the code. We adopt type hints in the initialization function of a
+  class to define its constraints with other classes strictly. Thus, the
+  constraints among the concepts in the schemas are modeled. As shown in
+  Figure~\ref{fig:illustration}, taking the relation ``PlaceOfBirth'' for
+  example, \texttt{``def \_\_init\_\_(self, head\_entity: \textcolor{darkgreen}{Human}, tail\_entity:
+  \textcolor{darkgreen}{SpatialEntity})''} denotes that the head entity must be a \texttt{``\textcolor{darkgreen}{Human}''} and the tail
+  entity must be a \texttt{``\textcolor{darkgreen}{SpatialEntity}''}.
+
+  \paragraph{Class Method.} A class method is bound to the class and not the
+ object of the class. They are utilized to post-process the extracted instance
+ results of a class. For example, some IE tasks may not consider the pronouns
+ ``he'' and ``she'' as instances of the \texttt{``\textcolor{darkgreen}{Human}''} concept. To address this, a
+ class method can be added to the \texttt{``\textcolor{darkgreen}{Human}''} class to filter out such pronouns
+ from the extraction results, ensuring that the output aligns with the task's
+ unique criteria. Note that, class methods are manually designed for specific IE
+ tasks based on their task constraints. We take a few IE datasets to demonstrate
+ the effectiveness of class methods in our experiments, as shown in the
+ Appendix~\ref{sec:class_method}.
+
+\subsection{Schema Library Construction}
+We construct the code-style schema library based on Wikidata~\footnote{We use the Wikidata dump up to 20220704.}. We
+select the concepts included in the existing IE datasets created from Wikidata, i.e., KELM~\cite{agarwal-etal-2021-knowledge}, UniversalNER~\cite{zhou2023universalner}, InstructIE~\cite{knowlm}, and LSEE~\cite{chen-etal-2017-automatically}. We derive the constraints among concepts according to their co-occurrences. To construct the taxonomies, we
+extract the \texttt{``\textcolor{darkgreen}{SubclassOf}''} relations among these concepts from Wikidata. To obtain the description of a concept, we use its definition from Wikidata directly or generate its descriptions using GPT-4 if its definition in Wikidata
+is missing. Finally, the constructed schema library encompasses over $29,177$ entity types, $876$ relation types, and $519$ event types. The detailed statistics of the schema are in Appendix \ref{appendix:stat}.
+
+\begin{figure*}[tbp]  
+  \centering
+  \includegraphics[width=1.0\textwidth]{./pic/knowcoder-framework.pdf}
+  \caption{An diagram of training and inference processes of KnowCoder.}
+ \vspace{-4mm}
+  \label{fig:training_framework}
+  \end{figure*}
+
+\section{Learning Framework of KnowCoder}
+
+To discriminate enormous concepts defined in schemas, we first let KnowCoder understand each concept through its definition and instances. Subsequently, we enhance KnowCoder to discriminate among a few concepts and extract corresponding knowledge. Thus, as shown in Figure~\ref{fig:training_framework}, the proposed learning framework contains two phases, i.e., the schema understanding phase and the schema following phase. In the schema understanding phase, KnowCoder undergoes code pretraining to understand each concept in two manners: 1) Go through the class definition code of each concept. 2) Go through the instance codes of each concept. In the schema following phase, KnowCoder is finetuned using instruction tuning code, where multiple task-demanded concepts are given in the schemas, enhancing KnowCoder's ability to follow schemas and generate instantiating code accordingly.
+
+\subsection{Schema Understanding Phase}
+
+\subsubsection{Training Data Generation}
+To enhance KnowCoder's schema understanding abilities, we construct a large-scale training dataset based on the schema library. As shown in the left part of Figure~\ref{fig:training_framework}, the training data consists of two kinds of codes, i.e., schema definition codes and instance codes. The schema definition codes are generated based on the schema library, where we randomly sample a certain number of concepts (decided by the maximum sequence length) from the schema library to consist of a training sample. As the aim of the schema understanding phase is to understand each concept but not to discriminate various concepts, the instance code corresponding to a single concept contains three parts, i.e., a sentence containing instances of the given concept, an import clause to introduce the corresponding class of the given concept, and an instantiating clause to give out all the instances of the given concept in the sentence. The schema-instance codes are constructed based on KELM corpus~\cite{agarwal-etal-2021-knowledge}, which contains $15, 628, 486$ synthetic sentences to describe the structured knowledge from Wikidata. We do data cleaning for the corpus. The cleaning details are in Appendix \ref{sec: data_clean}.
+
+\subsubsection{Code Pretraining}
+
+After obtaining the data, we apply regular code pretraining to make LLM understand the diverse concepts in the schemas. Given a training sample with length of $L$, $X = {x_0, x_1, ..., x_{i}, ..., X_{L-1}}$, the model attempts to predict every token $x_{l}$ based on the ${x_0, ..., x_{l-1}}$, where $l={0,...,L-1}$. Some training details are as follows:
+
+\paragraph{Schema Importing.}
+The straightforward way to construct a pretraining sample is to directly give the whole schema definition for the corresponding instance code. However, this manner may cause the model to overfit the schema definition code because they are frequently repeated in every instance code. To address this problem, we separate the schema definition code from the instance code and use the ``import'' clause to introduce the corresponding schema definition to the instance code.
+
+The position of the ``import'' clause is also critical for the LLMs to learn. We study two positions for the ``import'' clause, i.e., ``Import-First'' and ``Sentence-First''. We adopt ``Sentence-First'' in the learning framework because it performs better than the others. The comparison results are in Appendix~\ref{sec:import_position}.
+
+\subsection{Schema Following Phase}
+
+\subsubsection{Training Data Generation}
+
+  To enhance the schema following abilities of KnowCoder, we construct instruction tuning training data for UIE tasks. As shown in the middle part of Figure~\ref{fig:training_framework}, a typical instruction tuning sample contains three parts of codes, i.e., instruction code $T$, input code $I$, and output code $O$. 
+  
+  The instruction code $T$ comprises two snippets, i.e., schema definition and task description. The schema definition snippet includes definitions of some concepts selected from the former phase, which defines specific concepts to be extracted. The task description snippet includes a comment that contains a natural language description of an IE task. For example, the task description of Relation Extraction (RE) is ``This is an object-oriented programming task: some Classes are defined above. Please instantiate all the corresponding Objects in the following sentence.''. The input $I$ contains the sentence to be extracted, which is denoted as a variable ``sentence'', i.e., ``sentence = ...''. The output $O$ contains all the golden knowledge in the sentence, denoted as a list variable ``results'', i.e., ``results = [...]''. We have conducted a performance comparison of different versions of the instructions, and the corresponding results are in Appendix~\ref{sec:prompt}.
+  
+  We construct the training corpus from three data sources. For Named Entity Extraction (NER), ChatGPT-annotated Pile corpus~\cite{zhou2023universalner} is selected. For Relation Extraction (RE) and Event Extraction (EE), we adopt the data sources constructed in \citet{gui2023instructie}\footnote{We use the English version of the constructed data source.} and LSEE~\cite{chen-etal-2017-automatically}, respectively. 
+
+\subsubsection{Instruction Tuning}
+
+The objective of instruction tuning is to learn an LLM $\mathbf{f}:(I \times T) \rightarrow O$. The LLM takes input code $I$, and instruction code $T$ as input. Subsequently, the LLM is tuned to generate every token in the output $O$. Some training details are as follows:
+
+\paragraph{Negative Class Sampling.} In the constructed schema library, there are more than $30000$ concepts. It is challenging for the model to accommodate all the corresponding class definitions in a single prompt. Consequently, KnowCoder employs a negative class sampling strategy. For each training sample, in addition to the classes annotated in the sentence, we randomly sample several classes ($20\%$ number of the golden classes) from the remaining classes.
+
+\paragraph{Fully negative Sample Construction.} In real-world scenarios, many sentences do not contain any knowledge of a specific IE task, called fully negative samples in this paper. However, the selected data sources neglect such samples. To address this problem, we randomly sample $5\%$ sentences from the data sources. For each sentence, we replace the golden classes with five random negative classes.
+
+\subsection{Refinement}
+
+After schema understanding and following, we obtain KnowCoder, an LLM that demonstrates strong generalization ability on unseen schemas. Additionally, based on our unified schema representation, KnowCoder can be further refined by various human-annotated datasets simultaneously. In this phase, we conduct instruction tuning based on the datasets used in previous work~\cite{wang2023instructuie, sainz2023gollie}.
+
+In different IE datasets, concepts with the same name may follow different annotation guidelines. Take \texttt{``\textcolor{darkgreen}{PERSON}''} for example, in MultiNERD~\cite{multiNERD_DATASET}, entities do not include the pronouns, e.g., ``he'' and ``she'', while ACE05~\cite{ACE2005_DATASET} consider personal pronouns as \texttt{``\textcolor{darkgreen}{PERSON}''}. To alleviate the problem, we add specific dataset information in the instructions to distinguish annotation guidelines for different datasets. For example, the instruction for the ACE05 dataset is ``... Please instantiate all the corresponding Event Objects in the following sentence \texttt{\textcolor{darkgreen}{from DATASET ACE05}}.''
+
+\section{Experiment Setup}
+
+\paragraph{Datasets.}
+We conducted experiments using $33$ specific domain Information Extraction (IE) datasets, including $23$ datasets for Named Entity Extraction (NER), $8$ datasets for Relation Extraction (RE), $2$ datasets for Event Detection (ED) and Event Argument Extraction (EAE). The detailed statistics of these datasets are in Appendix \ref{appendix:stat}. Among these NER datasets, following ~\citet{wang2023instructuie, zhou2023universalner}, we take $7$ datasets as the zero-shot benchmark, including $5$ datasets of different domains from CrossNER~\cite{CrossNERDATASET}, MIT-Movie~\cite{MITReviewDataset} and MIT-Restaurant~\cite{MITReviewDataset}. For RE, we adopt GIDS~\cite{Jat2018ImprovingDS} as the zero-shot dataset. Following~\cite{sainz2023gollie}, we adopt CASIE~\cite{Lu2021Text2EventCS} as the zero-shot ED dataset.
+
+To balance the evaluation coverage and costs, we introduce the KnowCoder benchmark, a composite derived from existing NER, RE, and EE datasets. Under the supervised setting, a sampling strategy was developed for NER and RE tasks to maintain the distributions of original datasets and ensure the broad coverage of knowledge types. Details on the proposed strategy and comprehensive benchmark information are available in Appendix~\ref{appendix:benchmark}. 
+
+\begin{table*}
+  \small
+  \centering
+  \setlength\tabcolsep{2pt}  % control column spacing
+  \resizebox{0.8\linewidth}{!}
+  {\begin{tabular}{@{}l|ccccccc|c@{}}
+  \toprule
+  \textbf{Model} &
+  \textbf{Movie.} &
+  \textbf{Rest.} &
+  \textbf{AI} &
+  \textbf{Litera.} &
+  \textbf{Music} &
+  \textbf{Politics} &
+  \textbf{Science} &
+  \textbf{Average} \\ \midrule
+
+  LLaMA2-7B & 31.0 & 19.6 & 30.8 & 24.1 & 28.0 & 38.7 & 44.1 & 30.9 \\
+  LLaMA2-13B  & 32.6 & 25.2 & 37.5 & 36.5 & 37.0 & 60.3 & \textbf{51.7} & 40.1 \\
+
+  \midrule
+  LLaMA2-7B & 31.0 & 19.6 & 30.8 & 24.1 & 28.0 & 38.7 & 44.1 & 30.9 \\
+  KnowCoder-7B~(SU. only)   & \textbf{37.2}& \textbf{36.4} & \textbf{41.8} & \textbf{42.6} & \textbf{53.8} & \textbf{60.6} & 51.6 & \textbf{46.3}$^{\uparrow\textbf{49.8\%}}$ \\
+
+  \bottomrule
+  \end{tabular}}
+  \caption{Results on NER under the few-shot setting.}
+  \label{tab:fewshot-ner-results-table}
+\end{table*}
+
+\begin{table*}
+  \centering
+  \resizebox{1\linewidth}{!}
+  {\begin{tabular}{@{}lcccccccc}
+  \toprule
+  \textbf{Model} &
+  \textbf{Movie.} &
+  \textbf{Rest.} &
+  \textbf{AI} &
+  \textbf{Litera.} &
+  \textbf{Music} &
+  \textbf{Politics} &
+  \textbf{Science} &
+  \textbf{Average} \\ 
+  \midrule
+  \textit{\textbf{w. refinement}} \\
+  \rowcolor{softblue} InstructUIE-11B~\cite{wang2023instructuie} & - & - & 48.4 & 48.8 & 54.4 & 49.9 & 49.4 & -  \\
+  \rowcolor{softblue} GoLLIE-7B~\cite{sainz2023gollie} & 63.0  & 43.4 & 59.1 & 62.7 & 67.8 & 57.2  & 55.5 & 58.4 \\
+  \rowcolor{softblue} GoLLIE-13B~\cite{sainz2023gollie} & 62.5  & 49.8 & 56.7 & 59.7 & 65.5 & 54.4  & 56.2 & 57.8 \\
+  \rowcolor{softblue} UniNER-7B~(refined)~\cite{zhou2023universalner} &  59.4 & 31.2 & 62.6 & 64.0 & 66.6 & 66.3 & 69.8 & 60.0 \\
+  \midrule
+  \textit{\textbf{w.o. refinement}} \\
+  Vicuna-7B~\cite{chiang2023vicuna}  & 6.0 & 5.3 & 12.8 & 16.1 & 17.0 & 20.5 & 13.0 & 13.0  \\
+  Vicuna-13B~\cite{chiang2023vicuna}  & 0.9 & 0.4 & 22.7 & 22.7 & 26.6 & 27.2 & 22.0 & 17.5  \\
+  ChatGPT~\cite{ouyang2022training}  & 5.3 & 32.8 & 52.4 & 39.8 & 66.6 & 68.5 & \textbf{67.0} & 47.5  \\
+  UniNER-7B~\cite{zhou2023universalner}  & 42.4 & 31.7 & 53.5 & 59.4 & 65.0 & 60.8 & 61.1 &53.4\\
+  \rowcolor{softyellow} KnowCoder-7B   & \textbf{50.0} & \textbf{48.2} & \textbf{60.3} & \textbf{61.1} & \textbf{70.0} & \textbf{72.2} & 59.1 & \textbf{60.1}$^{\uparrow\textbf{12.5\%}}$\\
+  \bottomrule
+  \end{tabular}}
+  \caption{Results on NER under the zero-shot setting. \hl{\textit{\textbf{w. refinement}}} denotes methods that are refined on human-annotated data, which is unfair for KnowCoder to compare with.}
+  \label{tab:zeroshot-ner-results-table}
+  \vspace{-4mm}
+  \end{table*}
+
+\paragraph{Metrics.}
+We report the span-based offset Micro-F1 following previous methods~\cite{lu-etal-2022-unified, lin-etal-2020-joint}. For NER, an entity is considered correct if the entity boundary and type are correctly predicted. For RE, a relation is considered correct if its triplet matches a golden annotation, including relation type, subject entity, and object entity. For ED, an event trigger is correct if its event type and trigger match a golden annotation. For the EAE task, given an event type, an argument is correct if the argument and its role type match a golden annotation. 
+
+\subsection{Implementation Details}
+
+KnowCoder is finetuned based on LLaMA2-base-7B~\cite{touvron2023llama2}. We
+utilize the Megatron-LM framework~\cite{shoeybi2019megatron} for schema
+understanding. We set the context length to $2048$, the learning rate to $5
+\times 10^{-6}$, the global batch size to $1$M tokens, and the maximum training
+step to $4500$. For the schema following and refinement phases, we use
+LoRA~\cite{hu2021lora} for parameter-efficient fine-tuning. We set the lora rank
+and lora alpha parameters to $32$ and $64$, respectively. The warmup ratio is
+set to $0.03$ and the dropout ratio is set to $0.1$. The learning rates for
+these two phases are set to $3 \times 10^{-4}$. We limit the sequence length to
+$4096$ and set the batch size to $256$. Detailed information about the training
+process is available in Appendix \ref{implementation_details}. During the
+inference phase, we use greedy search and set the temperature to $0$. The
+maximum output length is set to $640$.
+
+\section{Results and Analyses}
+
+\subsection{Few-shot Evaluation After Schema Understanding}
+
+Considering that a pre-trained LLM cannot give proper results without given examples, we study the generalization ability of KnowCoder after the schema understanding phase, denoted as KnowCoder (SU. only), under the few-shot setting. Specifically, We utilize the first five samples from the training data as examples and report the NER F1 score in Table~\ref{tab:fewshot-ner-results-table} across seven zero-shot NER datasets. The results demonstrate that KnowCoder (SU. only) outperforms LLaMA2-7B with an average relative improvement of $\textbf{49.8\%}$. Remarkably, KnowCoder (SU. only) gets an average F1 score of $46.3\%$ with only a few examples, which are comparable to InstructUIE refined using human-annotated datasets. These results strongly support the effectiveness of the schema understanding phase in enhancing model generalization and performance in NER tasks.
+
+\begin{table}
+\centering
+\small
+
+\begin{tabular}{@{}r|r|l@{}}
+\toprule
+
+\textbf{Dataset}   & \multicolumn{1}{r|}{\textbf{SoTA}} & \multicolumn{1}{c}{\KnowCoder~\textbf{7B}} \\ \midrule
+GIDS$_{RE}$      &     \cite{ouyang2022training} 9.9  &       \textbf{25.5}                        \\
+CASIE$_{ED}$   &         \cite{sainz2023gollie} \textbf{59.3$^{\dag}$}          &       58.2                        \\
+\midrule
+Average    &             34.6                    &         \textbf{41.9$^{\uparrow\textbf{21.1\%}}$}                      \\ \bottomrule
+\end{tabular}
+
+\caption{Results on RE and ED tasks under the zero-shot setting. $^{\dag}$ indicates that it is unfair for KnowCoder to compare with the score.}
+\label{tab:re-ed-zero-shot-results}
+\vspace{-5mm}
+\end{table}
+
+\subsection{Zero-Shot Evaluation After Schema Following}
+
+To verify the generalization ability of KnowCoder, we conduct zero-shot experiments on 9 datasets across NER, RE, and ED tasks. In this setting, we employ KnowCoder after schema understanding and following to conduct extraction. KnowCoder is compared with two kinds of baselines. One is the LLM-based IE method that refined on human-annotated data, including InstructUIE~\cite{wang2023instructuie}, GoLLIE~\cite{sainz2023gollie}, and UniNER~\cite{zhou2023universalner}. The other is models without refinement, including Vicuna~\cite{chiang2023vicuna}, ChatGPT, UniNER~\cite{zhou2023universalner}. The results of these three baselines are from \citet{zhou2023universalner}.  Note that KnowCoder is unfair when compared with methods after refinement.
+
+\paragraph{Main Results.}
+The results of zero-shot NER are in Table~\ref{tab:zeroshot-ner-results-table}.  It can be seen that KnowCoder surpasses baselines without refinement across four NER datasets, registering a relative performance enhancement of $\textbf{12.5\%}$. This improvement is attributed to KnowCoder's training on a large-scale, automatically generated dataset within a two-phase learning framework, which enhances its generalization capabilities for NER, even surpassing methods refined with human-annotated data. The results of zero-shot RE and ED are in Table~\ref{tab:re-ed-zero-shot-results}. For ED, KnowCoder's performance is inferior to GoLLIE, a baseline model trained on high-quality, human-annotated data. This emphasizes that human-annotated datasets can enhance performance for more difficult IE tasks, such as ED. To further substantiate the point, we further refine KnowCoder with the ACE05 dataset, the same EE training data employed by GoLLIE. This refinement significantly improves zero-shot F1 performance to $72.0\%$ on the CASIE dataset. This represents a significant advancement over GoLLIE's performance of $59.3\%$, marking a relative improvement of $\textbf{21.4\%}$.
+
+\begin{table}
+  \centering
+  \setlength\tabcolsep{2.3pt}  % control column spacing
+  \resizebox{1\linewidth}{!}
+  {
+  \begin{tabular}{@{}c|c|cccc|c@{}}
+  \toprule
+  \multirow{2}{*}{\textbf{Ratio}} & \multirow{2}{*}{\textbf{Model}} & \multicolumn{4}{c|}{\textbf{Task}} & \multirow{2}{*}{\textbf{Average}} \\
+  \cmidrule{3-6}
+  
+  &       & ${NER}$   & ${RE}$   & ${ED}$  & ${EAE}$  &            \\ 
+      \midrule
+  \multirow{3}{*}{1\%}   & UIE-base                    &   \textbf{82.8}    &   30.8   &  41.5   &   12.8   &    42.0                  \\
+  
+  & LLaMA2-7B              &    72.3   &    32.1     &   35.3  &   33.3  &    43.3                  \\
+         
+  & KnowCoder-7B           &    79.2   &    \textbf{43.3}     &   \textbf{50.3}  &  \textbf{38.5}  &     \textbf{52.8$^{\uparrow\textbf{21.9\%}}$}                 \\ 
+  
+  \midrule
+                         
+  \multirow{3}{*}{5\%}   & UIE-base                   &   88.3    &    \textbf{51.7}   &  55.7   &   30.4  &            56.5            \\
+  
+  & LLaMA2-7B              &   89.3    &    35.7     &   52.6  &   46.3  &    56.0                \\
+  
+  & KnowCoder-7B           &   \textbf{90.6}    &    51.1     &   \textbf{59.0}  &   \textbf{48.3} &      \textbf{62.3$^{\uparrow\textbf{10.3\%}}$}               \\ 
+     
+  \midrule
+  
+  \multirow{3}{*}{10\%}  & UIE-base                 &   89.6    &   \textbf{59.2}   &   60.3  &    36.3  &          61.4            \\
+  
+  & LLaMA2-7B              &   91.2    &    48.6     &   60.7  &   52.3 &      63.2                \\
+  
+  & KnowCoder-7B           &   \textbf{92.2}    &    53.6     &   \textbf{62.2}  &   \textbf{55.1} &      \textbf{65.8$^{\uparrow\textbf{4.1\%}}$}                \\ 
+  
+  \bottomrule
+  \end{tabular}
+  }
+  \caption{
+      Low-resource results on IE tasks, where \textbf{Average} is the average F1 across four IE tasks.
+  }
+  \label{tab:lowresource}
+  \vspace{-3mm}
+\end{table}
+
+\subsection{Low Resource Evaluation After Schema Following} 
+
+To further investigate the generalization ability of KnowCoder for IE tasks, we conduct low-resource experiments by fine-tuning KnowCoder with three different partitions of the original training sets (1/5/10\% ratio) across four tasks. Following \citet{lu-etal-2022-unified},
+we adopt CoNLL03, CoNLL04, ACE05$_{ED}$ and ACE05$_{EAE}$ as the benchmarks for NER, RE, ED, and EAE tasks. LLaMA2 denotes directly fine-tuning LLaMA2 with these partial training data. The results are in Table~\ref{tab:lowresource}. It
+can be shown that KnowCoder gets the highest average F1 scores across all IE tasks in low-resource settings at varying ratios. In ratio $1\%$, KnowCoder gets the relative average improvement of $\textbf{21.9\%}$ compared to UIE, which shows that KnowCoder has strong adaptability to downstream IE tasks after pretraining on large-scale data under the two-phase learning framework. 
+
+\subsection{Supervised Evaluation After Refinement}
+  
+  
+Under the supervised evaluation, KnowCoder is further refined with the IE datasets. We conduct supervised experiments on four IE tasks, including NER, RE, ED, and EAE. KnowCoder is compared with three kinds of methods. The first is the traditional UIE method~\cite{lou2023universal, lu-etal-2022-unified}, which is based on relatively small language models (i.e., million-level parameters). The latter two are based on LLMs (i.e., ChatGPT, LLaMA2). They adopt the in-context learning~\cite{guo2023retrieval, codeie, ashok2023promptner} and supervised fine-tuning paradigms~\cite{zhou2023universalner,wang2023instructuie,sainz2023gollie}, respectively. As some baselines only report results for specific IE tasks, we report the SOTA results of the above methods in each dataset, denoted as ``SoTA'' in the tables. As highlighted by ~\citet{zhou2023universalner}, the evaluation script of InstructUIE~\cite{wang2023instructuie} contains issues. Furthermore, the benchmark in ~\citet{zhou2023universalner} remains pending release. In the end, we have implemented these two baselines on KnowCoder benchmark using their released models.
+
+\begin{table}[]
+  \centering
+  \setlength\tabcolsep{1.6pt}  % control column spacing
+  \resizebox{0.95\linewidth}{!}{
+  \begin{tabular}{@{}c|r|c@{}}
+  \toprule
+  
+  \textbf{Dataset}   & \multicolumn{1}{r|}{\textbf{SoTA}} & \multicolumn{1}{c}{\KnowCoder~7B} \\ \midrule
+  ACE04      &         \cite{lu-etal-2022-unified} \textbf{87.6}               &      86.2                        \\
+  ACE05      &         \cite{sainz2023gollie} \textbf{89.6}               &       86.1                        \\
+  AnatEM   &         \cite{zhou2023universalner} \textbf{88.9}         &       86.4                       \\
+  Broad Twitter  &         \cite{zhou2023universalner} \textbf{79.8}                  &     78.3                        \\
+  CoNLL03   &         \cite{zhou2023universalner} 94.8          &       \textbf{95.1}                        \\
+  DIANN      &          \cite{sainz2023gollie} 84.1         &       \textbf{94.7}                       \\
+  FabNER &          \cite{zhou2023universalner} 82.3        &       \textbf{82.9}                      \\
+  FindVehicle        &         \cite{zhou2023universalner} 98.4       &       \textbf{99.4}                     \\
+  GENIA        &         \cite{zhou2023universalner} \textbf{80.3}        &       76.7                    \\
+  Movie       &         \cite{zhou2023universalner} 90.2        &       \textbf{90.6}                        \\
+  Rest. &          \cite{wang2023instructuie} \textbf{82.6}        &       81.3                    \\
+  MultiNERD       &         \cite{zhou2023universalner} 93.9        &       \textbf{96.1}                        \\
+  OntoNotes 5  &         \cite{sainz2023gollie} 84.6                  &      \textbf{88.2}                        \\
+  WikiANN     &         \cite{zhou2023universalner} 85.4                  &      \textbf{87.0}                       \\ 
+  WNUT17     &         \cite{sainz2023gollie} 54.3                  &      \textbf{66.4}                       \\ 
+  bc2gm      &          \cite{wang2023instructuie} 80.5         &       \textbf{82.0}                      \\
+  bc5cdr     &         \cite{zhou2023universalner} \textbf{91.5}                  &       89.3                        \\ 
+  ncbi     &         \cite{wang2023instructuie} \textbf{85.0}                  &  83.8                     \\
+  \midrule
+  Average    &             85.2                    &         \textbf{86.1$^{\uparrow\textbf{1.1\%}}$}                      \\ \bottomrule
+  \end{tabular}}
+  \caption{Results on NER under the supervised setting.}
+  \vspace{-4mm}
+  \label{tab:ner-supervised-results}
+\end{table}
+
+\paragraph{Main Results.}
+The results for NER, RE, EE (including ED and EAE) tasks are shown in Tables~\ref{tab:ner-supervised-results}, ~\ref{tab:re-supervised-results} and ~\ref{tab:ed-eae-supervised-results}, respectively. We can observe that: (1) KnowCoder outperforms the SOTA baselines on most datasets for NER, RE, ED, and EAE, respectively. Based on the code-style schemas, KnowCoder universally models IE tasks and effectively transfers IE abilities after conducting schema understanding, following, and refinement on large-scale training data. (2) In more challenging UIE tasks, such as RE, KnowCoder demonstrates impressive advancements up to the relative improvement of 8.6\% compared to the SOTA baselines. KnowCoder achieves the performances of 73.9\% for ED and 66\% for EAE. This is \textbf{the first time} LLM-based UIE methods surpass smaller models like UIE in ED and EAE tasks. The code-style schemas and the learning framework enable a more precise definition and understanding of this complex structured knowledge, leading to a significant improvement. (4) UniNER~\cite{zhou2023universalner} achieves comparable results to KnowCoder on NER. Nonetheless, KnowCoder surpasses UniNER in several respects. Primarily, UniNER is limited to extracting one type of entity per iteration, leading to a cost-time complexity. In contrast, KnowCoder can extract multiple entity types in a single iteration, enhancing efficiency. Additionally, UniNER relies on a text-style schema, making it hard to represent and extract relations and events effectively. Conversely, KnowCoder, as a UIE model, offers broader versatility and efficacy comparing to UniNER.  (3) KnowCoder gets better results than baselines with code-style prompt ~\cite{codeie, guo2023retrieval, sainz2023gollie}. This is because KnowCoder provides a more comprehensive schema representation method and conducts two-phase training to understand and follow these schemas.
+
+\begin{table}[]
+  \centering
+  \setlength\tabcolsep{2pt}  % control column spacing
+  \resizebox{0.85\linewidth}{!}{
+  \begin{tabular}{@{}c|r|c@{}}
+  \toprule
+  
+  \textbf{Dataset} & \textbf{SoTA} & \KnowCoder~7B \\
+  \midrule
+  ACE05      &        \cite{sainz2023gollie}~\textbf{70.1}               &       64.5                        \\
+  semevalRE   &       \cite{wang2023instructuie}~65.8          &       \textbf{66.3}                        \\
+  CoNLL04  &          \cite{lou2023universal}~\textbf{78.8}                  &       73.3                        \\
+  NYT        &        \cite{wang2023instructuie}~91.0        &       \textbf{93.7}                       \\
+  ADE corpus &        \cite{wang2023instructuie}~82.8         &       \textbf{84.3}                        \\
+  kbp37      &        \cite{wang2023instructuie}~30.6         &       \textbf{73.2}                        \\
+  GIDS      &         \cite{wang2023instructuie}~76.9         &       \textbf{78.0}                        \\
+  SciERC     &        \cite{lou2023universal}~37.4                  &       \textbf{40.0}                        \\ \midrule
+  Average    &        66.7                        &         \textbf{71.7$^{\uparrow\textbf{7.5\%}}$}                      \\ \bottomrule
+  \end{tabular}}
+  \caption{Results on RE under the supervised setting.}
+  \label{tab:re-supervised-results}
+\end{table}
+
+\begin{table}
+  \centering
+  \resizebox{0.8\linewidth}{!}
+  {
+  \begin{tabular}{@{}c|cc}
+  \toprule
+  \textbf{Model}  & \textbf{ACE05$_{ED}$}         & \textbf{ACE05$_{EAE}$}    \\ 
+  
+  \midrule
+  UIE                     &   73.4    &   69.3   \\
+  USM                     &   69.3    &   63.3   \\ 
+  \midrule
+  Code4UIE                &   37.4    &   57.0   \\ 
+  
+  \midrule
+  
+  InstructUIE-11B             &   43.2    &   56.8   \\
+  GoLLIE-7B                  &   72.2    &   66.0   \\ 
+  
+  \midrule
+  KnowCoder-7B              &   \textbf{74.2}   &   \textbf{70.3}     \\
+  \bottomrule
+  \end{tabular}}
+  \caption{Results on ED and EAE under the supervised setting.}
+  \label{tab:ed-eae-supervised-results}
+  \vspace{-4mm}
+\end{table}
+
+\subsection{Ablation Study}
+To show how the schema following and understanding phases contribute to KnowCoder under the zero-shot setting, we further conduct ablation studies removing the schema understanding and following phase, denoted as KnowCoder (w.o. SU) and KnowCoder (w.o. SF), respectively. The results on seven zero-shot NER datasets are shown in Table~\ref{tab:ablation_zero_shot}. It can be seen that: (1) KnowCoder gets better results than KnowCoder (w.o. SF) on most NER datasets. It is because the schema understanding phase helps KnowCoder to understand concepts in the schema by training on definition and instance codes and increases its generalization ability. (2) Results of KnowCoder (w.o. SF) decrease extremely, which proves the importance of schema following. Due to the lack of in-context learning ability, a 7B model without instruction tuning is hard to understand instructions under the zero-shot setting, thus making it hard to finish the IE tasks. 
+
+  
+  
+  
+
+\section{Related Work}
+\subsection{Universal Information Extraction}
+Universal information extraction aims to conduct different IE tasks via a single
+model. The existing UIE models first represent different schemas for IE tasks in
+a universal way. OneIE~\cite{lin2020joint} represents schemas as classification
+labels, InstructUIE~\cite{wang2023instructuie} uses
+keywords~\cite{gui2023instructie, lou2023universal} of concepts to represent
+schemas, and UIE~\cite{lu-etal-2022-unified} uses a specifically-designed formal
+language to represent schemas. Based on such schema representations, these
+models adopt language models to understand the schemas and extract the
+corresponding structured knowledge. 
+
+\begin{table}[]
+\centering
+\resizebox{0.85\linewidth}{!}
+{
+\begin{tabular}{@{}c|c|cc@{}}
+\toprule
+\textbf{Dataset}  & \KnowCoder~\textbf{7B} & \textbf{w.o. SU} & \textbf{w.o. SF} \\ 
+
+\midrule
+
+Movie.   & 50.0      & +1.6    & \textbf{-50.0}      \\
+Rest.    & 48.2      & \textbf{-0.8}    & \textbf{-46.1}      \\
+AI       & 60.3      & \textbf{-4.5}    & \textbf{-57.7}      \\
+Litera.  & 61.1      & +0.6    & \textbf{-59.0}      \\
+Music    & 70.0      & \textbf{-3.1}    & \textbf{-69.0}      \\
+Politics & 72.2      & \textbf{-1.8}    & \textbf{-70.8}      \\
+Science  & 59.1      & \textbf{-2.7}    & \textbf{-55.6}      \\
+
+\bottomrule
+\end{tabular}}
+\caption{Ablation study under the zero-shot setting.}
+\label{tab:ablation_zero_shot}
+\vspace{-4mm}
+\end{table}
+
+\subsection{Large Language Models for IE}
+Due to the strong generation abilities of LLMs, they have been used in
+IE recently~\cite{xu2023large}. LLM-based IE methods can be divided into
+two categories: In-Context Learning (ICL) based methods and Supervised Finetuning (SFT) based methods. The
+ICL-based IE methods~\cite{codeie, guo2023retrieval, ashok2023promptner,
+wang2023gpt} make predictions only based on contexts augmented with a few
+examples. The SFT-based methods~\cite{wangdeepstruct, gui2023instructie,
+wang2023instructuie, zhou2023universalner, xu2023large, sainz2023gollie} use the
+annotated data to finetune LLMs.
+
+Some existing work uses code-style prompts to conduct IE. Most of them are
+ICL-based methods. ~\citet{wang2022code4struct} uses the code-style prompt to
+conduct event argument extraction. ~\citet{codeie} uses the code-style prompt to
+conduct the named entity extraction and relation extraction.
+~\cite{guo2023retrieval} proposes a reterive-argumented method to conduct the
+universal IE. These methods show relatively poor performance compared to
+SFT-based methods because of the lack of training to follow the schemas in the
+prompt. The most similar work with KnowCoder is GoLLIE, an SFT-based UIE method
+that gives out definitions of schemas as code comments. The difference between
+KnowCoder and GoLLIE is that KnowCoder designs a more comprehensive code-style
+schema representation method, including taxonomies, constraints, and class
+methods, and further constructs a large-scale schema library. Besides, GoLLIE
+conducts instruction tuning on human-annotated data, while KnowCoder contains a
+two-phase learning framework that enhances schema understanding and following
+ability via automatically annotated data. 
+
+\section*{Conclusion}
+
+  In this paper, we introduced KnowCoder for UIE leveraging Large Language
+  Models. KnowCoder is based on a code-style schema representation method and
+  an effective two-phase learning framework. The code-style schema representation
+  method uniformly transforms different schemas into Python classes, with which
+  the UIE task can be converted to a code generation process. Based on the schema representation
+  method, we constructed a comprehensive code-style schema library covering over $30,000$
+  types of knowledge. To let LLMs understand and follow these schemas, we
+  further proposed a two-phase learning framework that first enhances the
+  schema comprehension ability and then boosts its schema following ability. After training on billions of automatically annotated data and refining with human-annotated IE datasets, KnowCoder demonstrates remarkable performance improvements on different IE tasks under the various evalution settings.
+
+\section*{Limitations}
+The schemas utilized in our approach are predominantly constructed from Wikidata, which occasionally results in some schemas lacking definitions or other relevant information. This necessitates the generation of additional data to supplement these missing elements. During the pretraining phase, we adopted a combination of automatic generation and distant supervision methods to amass a large corpus. However, this approach inevitably introduces a certain degree of noise. Furthermore, there remains room for improvement in terms of the richness and complexity of the current corpus. Further exploration of pretraining settings could also be beneficial in enhancing the zero-shot capabilities for relation and event-related tasks.
+
+\end{document}

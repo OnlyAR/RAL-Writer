@@ -1,0 +1,456 @@
+\title{LLM-Pruner: On the Structural Pruning \\ of Large Language Models}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+
+Large language models (LLMs) have shown remarkable capabilities in language understanding and generation. However, such impressive capability typically comes with a substantial model size, which presents significant challenges in both the deployment, inference, and training stages. With LLM being a general-purpose task solver, we explore its compression in a task-agnostic manner, which aims to preserve the multi-task solving and language generation ability of the original LLM. One challenge to achieving this is the enormous size of the training corpus of LLM, which makes both data transfer and model post-training over-burdensome. Thus, we tackle the compression of LLMs within the bound of two constraints: being task-agnostic and minimizing the reliance on the original training dataset. Our method, named \methodname, adopts structural pruning that selectively removes non-critical coupled structures based on gradient information, maximally preserving the majority of the LLM's functionality. To this end, the performance of pruned models can be efficiently recovered through tuning techniques, LoRA, in merely \emph{3 hours}, requiring only \emph{50K} data. We validate the LLM-Pruner on three LLMs, including LLaMA, Vicuna, and ChatGLM, and demonstrate that the compressed models still exhibit satisfactory capabilities in zero-shot classification and generation. The code is available at: {\url{https://github.com/horseee/LLM-Pruner}} 
+
+\end{abstract}
+
+\section{Introduction}
+
+Recently, Large Language Models (LLMs)~\cite{openai2023gpt4,touvron2023llama,thoppilan2022lamda,scao2022bloom,xue2020mt5,vicuna2023,zeng2022glm} have demonstrated remarkable proficiency in language understanding and generation. With the increase in model size, they are better equipped to handle complex tasks ~\cite{brown2020language,chowdhery2022palm,wei2022chain,wu2020biased} and even exhibit emergent abilities~\cite{weiemergent}. However, notwithstanding their impressive performance, LLMs pose challenges in deployment and inference. Their extensive scale engenders substantial computational demands, and the multitude of parameters involved can induce long latencies and other related issues. 
+Several techniques are proposed to solve these problems, like model pruning~\cite{wang2019structured,xia2022structured,zafrir2021prune,kurtic2022optimal}, knowledge distillation~\cite{sun2019patient,pan2020meta,sun-etal-2020-contrastive},quantization~\cite{bai2020binarybert,frantar2022gptq} within the context of pre-trained language model (PLM). 
+
+While previous methods have effectively maintained model performance amidst parameter reduction, they primarily target compression within specialized domains or for designated tasks in the context of task-specific compression. For instance, a PLM is fine-tuned on a particular dataset, such as one of the classification tasks in the GLUE benchmark~\cite{wang2018glue}, after which these models are distilled into a smaller classification model~\cite{sun2019patient,hou2020dynabert}. Although this paradigm could potentially be employed for LLM compression, it compromises the LLM's capacity as a versatile task solver, rendering it suited to a single task exclusively.
+
+Thus, we strive to compress the LLM in a new setting: to reduce the LLM's size while preserving its diverse capabilities as general-purpose task solvers, as depicted in Figure \ref{fig:intro}. This introduces the task-agnostic compression of LLMs, which presents two key challenges:
+\begin{itemize}[leftmargin=*,topsep=5pt]
+    \setlength{\itemsep}{1pt}
+    \setlength{\parskip}{0pt}
+    \setlength{\parsep}{0pt}
+    \item \textbf{The size of the training corpus of the LLM is enormous.} Previous compression methods heavily depend on the training corpus. The LLM has escalated the corpus scale to 1 trillion tokens or more ~\cite{hoffmann2022training, touvron2023llama}. The extensive storage needs and protracted transmission times make the dataset difficult to acquire. Furthermore, if the dataset is proprietary, acquisition of the training corpus verges on impossibility, a situation encountered in ~\cite{zeng2022glm,openai2023gpt4}.
+    \item \textbf{The unacceptably long duration for the post-training of the pruned LLM.} Existing methods require a substantial amount of time for post-training the smaller model~\cite{wang2020minilm,liang2023homodistil}. For instance, the general distillation in TinyBERT takes around 14 GPU days ~\cite{jiao2020tinybert}. Even post-training a task-specific compressed model of BERT demands around 33 hours~\cite{xia2022structured,kwon2022fast}. As the size of both the model and corpus for LLMs increases rapidly, this step will invariably consume an even more extensive time.
+\end{itemize}
+
+\begin{figure}[t!]
+    \centering
+    \includegraphics[width=\linewidth]{figures/introduction_v8.pdf}
+    \caption{
+        Illustration of \methodname. 
+        (i) Task-specific compression: the model is fine-tuned then compressed on a specific task. (ii) TinyBERT: First distill the model on unlabeled corpus and then fine-tune it on the specific task. (iii) LLM-Pruner: Task-agnostic compression  within 3 hours. %Models compressed by (i) and (ii) can only deal with one task, while by (iii), the model can be applied to various tasks.
+    }
+    \label{fig:intro}
+    \vspace{-5mm}
+\end{figure}
+
+To tackle the aforementioned challenges associated with the task-agnostic compression of LLMs, we introduce a novel approach called LLM-Pruner. Since our goal is to compress LLMs with reduced data dependency and expedited post-training, how to prune model with the minimal disruption to the origin is crucial. To accomplish this, we propose a dependency detection algorithm that identifies all the dependent structures within the model. Once the coupled structure is identified, we employ an efficient importance estimation strategy to select the optimal group for pruning under the task-agnostic setting, where the first-order information and an approximated hessian information is taken into account. Finally, a rapid recovery stage is executed to post-train the pruned model with limited data. 
+
+  
+\iffalse{
+In sum, our contributions can be summarized as follow:
+
+\begin{itemize} [leftmargin=*]
+    \setlength\itemsep{0.5em}
+    \item We propose a novel framework, LLM-Pruner, for the task-agnostic compression of the large language model. The compressed language model preserves its ability to serve as a multi-task solver.
+    \item With the limited availability of training corpus, we propose 
+    \item We conduct extensive experiments to demonstrate the effectiveness of LLM-Pruner. The evaluation is performed on LLaMA-7B, Vicuna-7B and ChatGLM-6B with nine datasets to evaluate the generation quality and the zero-shot classification performance of the pruned model. Experiments show that with 20\% parameters removed, the model can maintain 93.6\% of the performance of the original model.
+\end{itemize}
+}\fi
+\paragraph{Contribution.} In this paper,  we propose a novel framework, LLM-Pruner, for the task-agnostic compression of the large language model. To the best of our knowledge, LLM-Pruner is the first framework designed for structured pruning of LLMs. We conclude the advantages of the LLM-Pruner as (i) Task-agnostic compression, where the compressed language model retains its ability to serve as a multi-task solver. (ii) Reduced demand for the original training corpus, where only 50k publicly available samples are needed for compression, significantly reducing the budget for acquiring the training data (iii) Quick compression, where the compression process ends up in three hours. (iv) An automatic structural pruning framework, where all the dependent structures are grouped without the need for any manual design.
+To evaluate the effectiveness of LLM-Pruner, we conduct extensive experiments on three large language models: LLaMA-7B, Vicuna-7B, and ChatGLM-6B. The compressed models are evaluated using nine datasets to assess both the generation quality and the zero-shot classification performance of the pruned models. The experimental results demonstrate that even with the removal of 20\% of the parameters, the pruned model maintains 94.97\% of the performance of the original model.
+
+\section{Related Work}
+\paragraph{Compression of Language Model.}
+Language models ~\cite{devlin2018bert,liu2019roberta,lewis2019bart} have gained much attention and increase the need to reduce the size of parameters and reduce the latency ~\cite{lanalbert,sun2020mobilebert}. To compress the language model, previous works can be divided into several categories: network pruning ~\cite{kurtic2022optimal,xu2021rethinking,liu2021ebert,ProximalPruning}, knowledge distillation ~\cite{sun2019patient,sun-etal-2020-contrastive,metakd}, quantization~\cite{yao2022zeroquant,bai2020binarybert,zafrir2019q8bert} and other techniques, like early exit ~\cite{xin-etal-2020-deebert} or dynamic token reduction ~\cite{ye-etal-2021-tr}. We focus on the pruning  of the language models, especially structural pruning ~\cite{li2016pruning}. Structural pruning removes the entire filter from the neural network, which is more hardware friendly. There are several ways to remove the structure, such as l1-dependent pruning ~\cite{NIPS2015_pruning,zafrir2021prune}, first-order importance estimation ~\cite{hou2020dynabert}, hessian-based estimation~\cite{kurtic2022optimal,wang2019eigendamage} or the optimal brain surgeon~\cite{lecun1989optimal,kurtic2022optimal}. As for the pruning unit in structural pruning, some works adopt the entire layer ~\cite{fan2019reducing} as the minimal unit, and others take the multi-head attention ~\cite{voita2019analyzing} or the feed-forward layers ~\cite{hou2020dynabert,mccarley2019structured} as the basic structure to prune. CoFi ~\cite{xia2022structured} studies the pruning unit in different granularity. 
+
+\paragraph{Efficient and Low Resource Compression.} With the growing size of models, there is an increasing demand for efficient LLM compression and compression is independent of the original training data. As for the efficient compression, ~\cite{kwon2022fast} accelerate the post-training by defining the reconstruction error as a linear least squares problem. ~\cite{frantar2022gptq,frantar2023massive} propose the layer-wise optimal brain surgeon. As for the constraint of availability of the training corpus, data-free pruning ~\cite{srinivas2015data,yvinec2022red++} come up with several strategies to prune the model by measuring neurons' similarity. Besides, ~\cite{maprompting,ma2020adversarial,rashid2020zeroshot} proposes methods that distill the model without reliance on the training corpus of the model. However, those methods are too time-consuming, involving synthesizing samples by backpropagating the pre-trained language models.
+
+\section{Methods}
+In this section, we provide a detailed explanation of LLM-Pruner. Following the conventional model compression pipeline\cite{kwon2022fast}, LLM-Pruner consists of  three steps:
+\textbf{(1) Discovery Stage} (Section \ref{sec:dependency}). This step focuses on identifying groups of interdependent structures within LLMs. 
+\textbf{(2) Estimation Stage} (Section \ref{sec:importance}). Once the coupled structures are grouped, the second step entails estimating the contribution of each group to the overall performance of the model and deciding which group to be pruned.
+\textbf{(3) Recover Stage} (Section \ref{sec:recovery}). This step involves fast post-training that alleviates potential performance degradation caused by the removal of structures.  
+
+\subsection{Discover All Coupled Structure in LLMs} \label{sec:dependency}
+
+In light of the limited availability of data for post-training, it becomes imperative to prioritize the removal of structures with minimal damage when compressing the model. This underscores the dependency-based structural pruning, which ensures coupled structures are pruned in unison. We provide an experiment in Section \ref{exp:dependency} to show the importance of dependency-based structural pruning when compressing the large language model.
+
+\paragraph{Structure Dependency in LLMs.} Similar to~\cite{fang2023depgraph}, the pruning begins by building the dependency for LLMs. Assume $N_i$ and $N_j$ are two neurons in the model, $\operatorname{In}(N_i)$ and $\operatorname{Out}(N_i)$ represents all the neurons that point towards or point from $N_i$. The dependency between structures can be defined as:
+\begin{equation}
+     N_j \in \operatorname{Out}(N_i) \wedge \operatorname{Deg}^-(N_j) = 1 \Rightarrow N_j \text{ is dependent on } N_i
+\end{equation}
+where $\operatorname{Deg}^-(N_j)$ represents the in-degree of neuron $N_j$. Noting that this dependency is directional, we can therefore correspondingly obtain another dependency:
+
+\begin{equation}
+     N_i \in \operatorname{In}(N_j) \wedge \operatorname{Deg}^+(N_i) = 1 \Rightarrow N_i \text{ is dependent on } N_j
+\end{equation}
+where $\operatorname{Deg}^+(N_i)$ represents the out-degree of neuron $N_i$. The principle of dependency here is, if a current neuron (e.g., $N_i$) depends solely on another neuron (e.g., $N_j$), and the neuron $N_j$ is subjected to pruning, it follows that the neuron $N_i$ must also undergo pruning.
+
+\paragraph{Trigger the Dependency Graph.} By having the definition of dependency, the coupled structures in the LLM can be analyzed automatically. Considering any neuron within the LLM as the initial trigger, it possesses the capability to activate neurons that depend on it. Subsequently, these newly triggered neurons can serve as the subsequent triggers to identify the dependency and activate their respective dependent neurons. This iterative process continues until no new neurons are detected. Those neurons then form a group for further pruning. Taking LLaMA as an example, by searching over all the neurons as the initial trigger, we can locate all the coupled structures, as shown in Figure\ref{fig:main}.
+
+Given the diversity in the structure of different LLMs, manual analysis and removal of coupled structures in each LLM could be extremely time-consuming. However, by employing LLM-Pruner, all coupled structures can be automatically identified and extracted.
+
+\begin{figure}[t!]
+    \centering
+    \includegraphics[width=\linewidth]{figures/main_v5.pdf}
+    \caption{
+        Illustration of the coupled structures in LLaMA. We simplify the neurons in each layer to make the dependent group clear. The trigger neuron, marked as a circle with a bell, cause weights with dependency pruned (dashed lines), which may propagate (red dashed lines) to coupled neurons (dashed circles). A group can be triggered by a variety of trigger neurons. Taking Group Type B as an example, the trigger for this group involves (i) the attention head, (ii) the output neuron in Query, Key or Value, and (iii) the input neuron in the final output projection.
+    }
+    \label{fig:main}
+\end{figure}
+
+\subsection{Grouped Importance Estimation of Coupled Structure} \label{sec:importance}
+
+Till now, all coupled structures within the model are grouped. Weights within the same group should be pruned simultaneously, as partial pruning not only increases parameter size but also introduces misaligned intermediate representations. Therefore, we estimate the importance of the group as a whole, as opposed to evaluating the importance of modules. Given the limited access to the training dataset, we explore the use of public datasets or manually created samples as alternative resources. Although the domains of these datasets may not perfectly align with the training set, they still provide valuable information for assessing the importance.
+
+\paragraph{Vector-wise Importance.} Suppose that given a dataset $\mathcal{D} = \{x_i, y_i\}_{i=1}^N$, where N is the number of samples. In our experiments, we set N equal to 10 and we use some public datasets as the source of $\mathcal{D}$. A group (as previously defined as a set of coupled structures) can be defined as $\mathcal{G} = \{W_i\}_{i=1}^M$, where M is the number of coupled structures in one group and $W_i$ is the weight for each structure. While pruning, our goal is to remove the group that has the least impact on the model's prediction, which can be indicated by the deviation in the loss. Specially, to estimate the importance of $W_i$, the change in loss can be formulated as \cite{lecun1989optimal}:
+\begin{equation}
+    I_{W_i} = | \Delta \mathcal{L}(\mathcal{D})| = |\mathcal{L}_{W_i}(\mathcal{D}) - \mathcal{L}_{W_i=0}(\mathcal{D})| =| \underbrace{\frac{\partial \mathcal{L}^{\top}(\mathcal{D})}{\partial W_i} W_i}_{\neq 0}-\frac{1}{2} {W_i}^{\top} H W_i + \mathcal{O}\left(\| W_i \|^3\right) | \label{eq:taylor}
+\end{equation} 
+where $H$ is the hessian matrix. Here, $\mathcal{L}$ represents the next-token prediction loss. The first term is typically neglected in prior work~\cite{lecun1989optimal,wang2019eigendamage,frantar2023massive}, as the model has already converged on the training dataset, where ${\partial \mathcal{L}^{\top}}/{\partial W_i} \approx 0$. However, since $\mathcal{D}$ here is not extracted from the original training data, which means that ${\partial \mathcal{L}^{\top}}/{\partial W_i} \not \approx 0$. This presents a desirable property for determining the importance of $W_i$ by the gradient term under LLMs, since computation of the second term, the Hessian matrix, on the LLM is impractical with $\mathcal{O}\left(N^2\right)$ complexity. 
+
+\paragraph{Element-wise Importance.} The above can be considered as an estimate for the weight $W_i$. We can derive another measure of importance at a finer granularity, where each parameter within $W_i$ is assessed for its significance:
+\begin{equation}
+    I_{W_i^k} = | \Delta \mathcal{L}(\mathcal{D})| = |\mathcal{L}_{W_i^k}(\mathcal{D}) - \mathcal{L}_{W_i^k=0}(\mathcal{D})| = | \frac{\partial \mathcal{L}(\mathcal{D})}{\partial W_i^k} W_i^k-\frac{1}{2} {W_i^k} H_{kk} W_i^k + \mathcal{O}\left(\| W_i^k \|^3\right) |
+\label{eq:element_taylor}
+\end{equation} 
+Here, $k$ represents the k-th parameter in $W_i$. The diagonal of the hessian $H_{kk}$ can be approximated by the Fisher information matrix, and the importance can be defined as:
+\begin{equation}
+    I_{W_i^k} = | \mathcal{L}_{W_i^k}(\mathcal{D}) - \mathcal{L}_{W_i^k=0}(\mathcal{D})| \approx | \frac{\partial \mathcal{L}(\mathcal{D})}{\partial W_i^k} W_i^k-\frac{1}{2} \sum_{j=1}^N \left(\frac{\partial \mathcal{L}(\mathcal{D}_j)}{\partial W_i^k} W_i^k\right)^2 + \mathcal{O}\left(\| W_i^k \|^3\right) | \label{eq:element_final_taylor}
+\end{equation} 
+\paragraph{Group Importance.} By utilizing either $I_{W_i^k}$ or $I_{W_i}$, we estimate the importance at the granularity of either a parameter or a weight. Remembering that our goal is to estimate the importance of $\mathcal{G}$, we aggregate the importance scores in four ways:
+(i) Summation: $I_{\mathcal{G}} = \sum_{i=1}^{M}I_{W_i}$ or $I_{\mathcal{G}} = \sum_{i=1}^{M}\sum_k I_{W_i^k}$, (ii) Production: $I_{\mathcal{G}} = \prod_{i=1}^{M}I_{W_i}$ or $I_{\mathcal{G}} = \prod_{i=1}^{M}\sum_k I_{W_i^k}$, (iii) Max: $I_{\mathcal{G}} = \max_{i=1}^{M}I_{W_i}$ or $I_{\mathcal{G}} = \max_{i=1}^{M}\sum_k I_{W_i^k}$; (iv) Last-Only: Since deleting the last executing structure in a dependency group is equivalent to erasing all the computed results within that group, we assign the importance of the last executing structure as the importance of the group: $I_{\mathcal{G}} = I_{W_l}$ or $I_{\mathcal{G}} = \sum_k I_{W_l^k}$, where $l$ is the last structure. After assessing the importance of each group, we rank the importance of each group and prune the groups with lower importance based on a predefined pruning ratio.
+
+\subsection{Fast Recovery with Low-rank Approximation} \label{sec:recovery}
+In order to expedite the model recovery process and improve its efficiency under limited data, it is crucial to minimize the number of parameters that need optimization during the recovery phase. To facilitate this, we employ the low-rank approximation,  LoRA\cite{hulora}, to post-train the pruned model. Each learnable weight matrix in the model, denoted as $W$, encompassing both pruned and unpruned linear projection in the LLM, can be represented as $W$. The update value $\Delta W$ for $W$ can be decomposed as $\Delta W = PQ \in \mathbb{R}^{d^- \times d^+}$, where $P \in \mathbb{R}^{d^- \times d}$ and $Q \in \mathbb{R}^{d \times d^+}$. The forward computation can now be expressed as:
+\begin{equation}
+    f(x) = (W+\Delta W)X + b = (WX + b) + (PQ)X
+\end{equation}
+where $b$ is the bias in the dense layer. Only training $P$ and $Q$ reduces the overall training complexity, reducing the need for large-scale training data. Besides, the extra parameters $P$ and $Q$ can be reparameterized into $\Delta W$, which would not cause extra parameters in the final compressed model. 
+
+\begin{table}[t]
+    \centering
+    \caption{Zero-shot performance of the compressed LLaMA-7B. The average is  calculated among seven classification datasets. `Underline' indicates the best pruning-only performance, while `bold' represents the overall best performance with the same pruning ratio, considering both pruning and post-training. The `\channelname' strategy only prunes the dependent group of Type C, while all other methods employ the `Block' strategy to prune dependent groups in both Type A and Type B. Since \cite{touvron2023llama} did not provide its prompt, the evaluation of the result with ${}^\star$ is performed under different prompts, which is lower than the official results. } \label{tbl:llama_result}
+    \resizebox{\linewidth}{!}{
+    \begin{tabular}{ll|cc|ccccccc|c}
+        \toprule
+        \toprule
+        Pruning Ratio & Method & WikiText2$\color{teal}\downarrow$ & PTB$\color{teal}\downarrow$ & BoolQ & PIQA & HellaSwag & WinoGrande & ARC-e & ARC-c & OBQA & Average \\
+        \midrule
+        
+        \multirow{2}{*}{Ratio = 0\%} & LLaMA-7B\cite{touvron2023llama} & - & - & 76.5 & 79.8 & 76.1 & 70.1 & 72.8 & 47.6 & 57.2 & 68.59 \\
+         & LLaMA-7B$^{\star}$ & 12.62 & 22.14 & 73.18 & 78.35 & 72.99 & 67.01 & 67.45 & 41.38 & 42.40 & 63.25 \\ %& 73.18 & 78.35/77.42 & 56.40/72.99 & 67.01 & 67.45/52.53 & 38.14/41.38 & 28.00/42.40 & 63.25\\
+        \cmidrule{1-12}
+        \cmidrule{1-12}
+        \multirow{7}{*}{\parbox{1.8cm}{Ratio = 20\% \  w/o tune}} & L2 & 582.41 & 1022.17 & 59.66 & 58.00 & 37.04 & 52.41 & 33.12 & 28.58 & 29.80 & 42.65 \\%59.66 & 58.00/57.51 & 31.12/37.04 & 52.41 & 33.12/32.49 & 25.51/28.58 & 16.60/29.80 & 42.65 \\ % 63.46 & 73.07/71.49 & 49.87/66.06 & 63.61 & 46.30/42.89 & 33.02/35.67 & 25.40/38.40 &  55.22\\
+        & Random & 27.51 & 43.19 & 61.83 & 71.33 & 56.26 & 54.46 & 57.07 & 32.85 & 35.00 & 52.69\\%75.72 & 74.92/73.83 & 51.86/67.86 & 64.88 & 60.44/49.71 & 34.04/36.60 & 26.80/38.60 & 59.86 \\
+        \cmidrule{2-12}
+        & \channelname & 74.63 & 153.75 & 62.75 & 62.73 & 41.40 & 51.07 & 41.38 & 27.90 & 30.40 & 45.38 \\% 62.75 & 62.73/64.53 & 32.35/41.40 & 51.07 & 41.38/38.59 & 21.33/27.90 & 15.60/30.40 & 45.38 \\
+        \cmidrule{2-12}
+        & Vector  & 22.28 & 41.78 & \underline{61.44} & 71.71 & 57.27 & 54.22 & 55.77 & 33.96 & 38.40 & 53.25 \\
+        &$\text{Element}^2$ & 19.77 & 36.66 & 59.39 & 75.57 & 65.34 & \underline{61.33} & 59.18 & \underline{37.12} & 39.80 & \underline{56.82} \\
+        &$\text{Element}^1$  & \underline{19.09} & \underline{34.21} & 57.06 & \underline{75.68} & \underline{66.80} & 59.83 & \underline{60.94} & 36.52 & \bf \underline{40.00} & 56.69 \\% 57.06 & 75.68/75.08 & 50.69/66.80 & 59.83 & 60.94/50.04 & 31.91/36.52 & 29.20/40.00 & 56.69\\%63.52 & 72.69/72.58 &46.83/63.06 & 64.09 & 55.60/47.39 & 30.72/33.11 & 24.40/37.20 & 55.61 \\
+        \cmidrule{1-12}
+        \multirow{5}{*}{\parbox{1.8cm}{Ratio = 20\% \\ w/ tune}} & \channelname & 22.02 & 38.67 & 59.08 & 73.39 & 64.02 & 60.54 & 57.95 & 35.58 & 38.40 & 55.57 \\% 59.08 & 73.39/72.09 & 49.06/64.02 & 60.54 & 57.95/48.40 & 32.76/35.58 & 24.20/38.40 & 55.57 \\
+        \cmidrule{2-12}
+        & Vector & 18.84 & 33.05 & 65.75 & 74.70 & 64.52 & 59.35 & 60.65 & 36.26 & 39.40 & 57.23\\
+        & $\text{Element}^2$ & \textbf{17.37} & 30.39 & \textbf{69.54} & 76.44 & 68.11 & \textbf{65.11} & 63.43 & \textbf{37.88} & \textbf{40.00} & \textbf{60.07} \\
+        & $\text{Element}^1$ & 17.58 & \bf 30.11 & 64.62 & \textbf{77.20} & \bf 68.80 & 63.14 & \bf 64.31 & 36.77 & 39.80 & 59.23 \\%64.62 & 77.20/76.88 & 53.32/68.80 & 63.14 & 64.31/52.10 & 37.20/36.77 & 29.40/39.80 & 59.23\\ 
+        \bottomrule
+        \bottomrule
+    \end{tabular}
+    }
+\end{table}
+
+\begin{table}[t]
+    \vspace{-5mm}
+    \centering
+    \caption{Zero-shot performance of the compressed LLaMA-13B. Here we adopt  $\text{Element}^1$ as the importance estimation for `Channel` and `Block'.} \label{tbl:llama13B_result}
+    \resizebox{\linewidth}{!}{
+    \begin{tabular}{ll|cc|ccccccc|c}
+        \toprule
+        \toprule
+        Pruning Ratio & Method & WikiText2$\color{teal}\downarrow$ & PTB$\color{teal}\downarrow$ & BoolQ & PIQA & HellaSwag & WinoGrande & ARC-e & ARC-c & OBQA & Average \\
+        \midrule
+         Ratio = 0\% & LLaMA-13B$^{\star}$ &  11.58 & 20.24 & 68.47 & 78.89 & 76.24 & 70.09 & 74.58 & 44.54 & 42.00 & 64.97 \\
+        \cmidrule{1-12}
+        \multirow{4}{*}{\parbox{1.8cm}{Ratio = 20\% \  w/o tune}} & L2 & 61.15 & 91.43 & 61.50 & 67.57 & 52.90 & 57.54 & 50.13 & 31.14 & 36.80 & 51.08 \\
+        & Random &  19.24 & 31.84 & 63.33 & 73.18 & 63.54 & 60.85 & 64.44 & 36.26 & 38.00 & 57.09 \\
+        & Channel & 49.03 & 106.48 & 62.39 & 66.87 & 49.17 & 58.96 & 49.62 & 31.83 & 33.20 & 50.29 \\
+        & Block & \underline{16.01} & \underline{29.28} & \underline{67.68} & \underline{77.15} & \underline{73.41} & \underline{65.11} & \underline{68.35} & \underline{38.40} & \underline{42.40} & \underline{61.79} \\
+        \cmidrule{1-12}
+        \multirow{4}{*}{\parbox{1.8cm}{Ratio = 20\% \\ w/ tune}} & L2 & 20.97 & 38.05 & \bf 73.24 & 76.77 & 71.86 & 64.64 & 67.59 & 39.93 & 40.80 & 62.12 \\
+        & Random & 16.84 & 31.98 & 64.19 & 76.06 & 68.89 & 63.30 & 66.88 & 38.31 & 40.80 & 59.78 \\
+        & Channel & 17.58 & 29.76 & 69.20 & 76.55 & 68.89 & 66.38 & 62.08 & 38.99 & 39.60 & 60.24 \\
+        & Block & \bf 15.18 & \bf 28.08 & 70.31 & \bf 77.91 & \bf 75.16 & \bf 67.88 & \bf 71.09 & \bf 42.41 & \bf 43.40 & \bf 64.02 \\
+        \bottomrule
+        \bottomrule
+    \end{tabular}
+    }
+    \vspace{-3mm}
+\end{table}
+
+\section{Experiments}
+
+\subsection{Experimental Settings}
+\paragraph{Foundation Large Language Model.}
+To showcase the effectiveness and versatility of LLM-Pruner, we test it over three open-source large language models with two kinds of structure: LLaMA-7B~\cite{touvron2023llama}, Vicuna-7B~\cite{vicuna2023} \footnote{https://huggingface.co/lmsys/vicuna-7b-delta-v0} and ChatGLM-6B~\cite{zeng2022glm}. %ChatGLM is a bilingual language model, which aids us in discerning whether the compressed model retains the original model's capabilities, given that all corpora used in our compression experiments are in English and the test can be taken in Chinese.
+
+\paragraph{Evaluation and Datasets.} To assess the performance of the model in the task-agnostic setting, we follow LLaMa's evaluation to perform zero-shot task classification on common sense reasoning datasets: BoolQ ~\cite{clark-etal-2019-boolq}, PIQA~\cite{Bisk2020piqa}, HellaSwag~\cite{zellers2019hellaswag}, WinoGrande~\cite{ai2:winogrande}, ARC-easy~\cite{allenai:arc}, ARC-challenge~\cite{allenai:arc} and OpenbookQA~\cite{OpenBookQA2018}. Follow~\cite{eval-harness}, the model ranks the choices in the multiple choice tasks or generates the answer in the open-ended generation \footnote{https://github.com/EleutherAI/lm-evaluation-harness}. Additionally, we complement our evaluation with a zero-shot perplexity (PPL) analysis on WikiText2~\cite{merity2016pointer} and PTB~\cite{marcus-etal-1993-building}. %However, for the experiment on ChatGLM, we do not estimate the PPL on these two datasets. This is attributed to the inherent nature of ChatGLM as a dialogue model, which necessitates a query prompt and often recycles partial words from the query within the response. This pattern of interaction diverges significantly from the formats in WikiText2 and PTB.
+
+\paragraph{Implementation Details.} 
+In the model pruning process, we use 10 randomly selected samples from Bookcorpus~\cite{Zhu_2015_ICCV}, each truncated to a sequence length of 128, as the calibration samples for establishing dependency and calculating the gradient for both LLaMA and Vicuna. For ChatGLM, we select 10 random samples from DailyDialog~\cite{li2017dailydialog}. During the recovery phase, we utilize the cleaned version of Alpaca~\cite{alpaca}, which comprises approximately 50k samples. Remarkably, tuning these samples requires merely 3 hours on a single GPU with only 2 epochs. More hyper-parameters of pruning and training can be found in Appendix \ref{sec:apx_implementation_details}.
+
+\begin{wraptable}{r}{8.8cm}
+\vspace{-3mm}
+\caption{Statistics of the base model and the compressed model. }\label{tbl:stat_param}
+ \resizebox{\linewidth}{!}{%
+    \begin{tabular}{c|cc|ccccc}
+        \toprule
+        Model & Strategy & Ratio & \#Params & \#MACs & Memory & Latency \\
+        \midrule
+        \multirow{5}{*}{\parbox{1.8cm}{LLaMA-7B Vicuna-7B}} & - & - & 6.74B & 424.02G & 12884.5MiB & 69.32s \\%12.62 & 22.14\\ %5.67 & 8.80  \\
+        & \channelname & 20\% & 5.39B & 339.36G & 10363.6MiB & 61.50s \\
+        & \blockname & 20\% & 5.42B & 339.60G & 10375.5MiB & 58.55s\\
+        & \channelname & 50\% & 3.37B & 212.58G & 6556.3MiB & 40.11s\\
+        & \blockname & 50\% & 3.35B &  206.59G & 6533.9MiB & 37.54s\\
+        \bottomrule
+    \end{tabular}   
+}%
+\vspace{-3mm}
+\end{wraptable}
+\vspace{-1mm}
+\paragraph{Statistics of the Compressed Model.} 
+Table \ref{tbl:stat_param} presents the statistic of the 7B models that are used in our experiments: the parameter count, MACs, memory requirements and latency for running each model. The statistical evaluation is conducted using the inference mode, where the model is fed a sentence consisting of 64 tokens. The latency is tested under the test set of WikiText2 on a single A5000.
+Here, the `\blockname' strategy implies that the pruned unit in the model consists of Group Type A and Group Type B as illustrated in Figure \ref{fig:main}, whereas `\channelname' indicates that the unit to be pruned is Group Type C. We delve into an analysis of these two choices in Section \ref{sec:block_channel}(Channel Strategy vs. Block Strategy). The pruning ratio stated here denotes the approximate ratio of parameters to be pruned since the number of parameters within each pruned structure does not perfectly match the total number of pruned parameters.
+
+\subsection{Zero-shot Performance}
+
+Table \ref{tbl:llama_result},\ref{tbl:llama13B_result},\ref{tbl:vicuna_result} and \ref{tbl:chatglm_result} shows the zero-shot performance of the pruned model. 
+Based on the evaluation conducted on LLaMA, employing a 20\% parameter reduction without post-training, the pruned model manages to retain 89.8\% of the performance exhibited by the unpruned model. Furthermore, through the efficient post-training, the classification accuracy further improves to 60.07\%, achieving 94.97\% of the accuracy attained by the original model. This demonstration proves the feasibility of using LLM-Pruner to effectively compress the model, even without relying on training data, and within a remarkably short period of time. 
+Surprisingly, we discover that on most datasets, the pruned model with 5.4B LLaMA even outperformed chatGLM-6B. This highlights the superiority of the LLM-Pruner: if a smaller model with a customized size is required, LLM-Pruner is more cost-effective compared to retraining another model with a satisfying performance.
+However, with 50\% parameters pruned, a large accuracy degradation is observed (see Appendix \ref{sec:large_ratios}). Compressing LLMs under high compression rates still remains a large challenge.
+
+\begin{table}[t]
+    \centering
+    \caption{Zero-shot performance of the compressed Vicuna-7B} \label{tbl:vicuna_result}
+    \resizebox{\linewidth}{!}{
+    \begin{tabular}{ll|cc|ccccccc|c}
+        \toprule
+        \toprule
+        Pruned Model & Method & WikiText2 $\color{teal}\downarrow$ & PTB$\color{teal}\downarrow$ & BoolQ & PIQA & HellaSwag & WinoGrande & ARC-e & ARC-c & OBQA & Average \\
+        \midrule
+        Ratio = 0\% & Vicuna-7B & 16.11 & 61.37 & 76.57 & 77.75 & 70.64 & 67.40 & 65.11 & 41.21 & 40.80 & 62.78 \\ %76.57 & 77.75/77.09 & 56.23/70.64 & 67.40 & 65.11/53.49 & 39.76/41.21 & 28.00/40.80 & 62.78 \\
+        \cmidrule{1-12}
+        \multirow{7}{*}{\parbox{1.8cm}{Ratio = 20\% w/o tune}} & l2 & 3539.98 & 5882.21 & 55.90 & 56.15 & 32.37 & 51.85 & 30.01 & 28.41 & 28.20 & 40.41 \\ % 55.90 & 56.15/56.04 & 28.56/32.37 & 51.85 & 30.01/29.76 & 23.21/28.41 & 14.80/28.20 & 40.41 \\
+        & random & 34.63 & 112.44 & 61.47 & 70.89 & 54.67 & 56.27 & 55.60 & 31.74 & 34.60 & 52.18 \\ %61.47 & 70.89/71.06 & 42.30/54.67 & 56.27 & 55.60/46.51 & 28.33/31.74 & 20.40/34.60 & 52.18 \\
+        \cmidrule{2-12}
+        & \channelname &  71.75 & 198.88 & 51.77 & 63.93 & 42.58 & 55.17 & 43.94 & 29.27 & 33.40 & 45.72 \\ % 51.77 & 63.93/63.98 & 35.02/42.58 & 55.17 & 43.94/40.99 & 26.96/29.27 & 18.60/33.40 & 45.72\\
+        \cmidrule{2-12}
+        & Vector & 27.03 & \underline{92.51} & 62.17 & 71.44 & 55.80 & 53.43 & 55.77 & 33.28 & 37.80 & 52.81 \\
+        & $\text{Element}^2$ & \underline{24.70} & 94.34 & \underline{62.87} & \underline{75.41} & \underline{64.00} & \underline{58.41} & 60.98 & \underline{37.12} & \underline{39.00} & \underline{56.83} \\ %61.90 & 72.96 & 56.78 & 53.04 & 52.57 & 33.28 & 36.80 & 52.47 \\
+        & $\text{Element}^1$ &  25.74 & 92.88 & 61.70 & 75.30 & 63.75 & 56.20 & \underline{63.22} & 36.60 & 37.00 & 56.25 \\ %61.70 & 75.30/74.70 & 49.98/63.75 & 56.20 & 63.22/53.07 & 34.39/36.60 & 26.00/37.00 & 56.25 \\
+        \cmidrule{1-12}
+        \multirow{4}{*}{\parbox{1.8cm}{Ratio = 20\% w/ tune}} 
+        & Vector & 19.94 & \bf 74.66 & 63.15 & 74.59 & 61.95 & 60.30 & 60.48 & 36.60 & \bf 39.40 & 56.64 \\
+        & $\text{Element}^2$ & 
+        \bf 18.97 & 76.78 & 60.40 & 75.63 & \bf 65.45 & \bf 63.22 & \bf 63.05 & \bf 37.71 & 39.00 & \bf 57.78 \\
+        & $\text{Element}^1$ & 19.69 & 78.25 & \bf 63.33 & \bf 76.17 &  65.13 & 60.22 & 62.84 & 37.12 & 39.20 & 57.71\\ 
+        \bottomrule
+        \bottomrule
+    \end{tabular}
+    }
+\end{table}
+
+The compression results of Vicuna-7B align with those of LLaMA, as pruning 20\% of parameters on Vicuna-7B maintains performance at 92.03\% of the original model. We test a smaller pruning rate of 10\% on chatGLM-7B, where the pruned model only experiences a marginal performance decrease of 0.89\%, which can be recovered through post-training. Despite the pruned model outperforming the uncompressed model, we don't assert it is better than the original model. This is largely because chatGLM-6B, a bilingual model, has limited English pre-training exposure. Post-training, however, introduces it to more English corpus, albeit limited, improving its English comprehension.
+
+\paragraph{Ablation: Impact of Importance Estimation.} 
+We conduct tests on all proposed importance estimation techniques mentioned in Section \ref{sec:importance}. The results can be found in Table \ref{tbl:llama_result} and \ref{tbl:vicuna_result}. Here, $\textit{Element}^\text{n}$ represents the importance evaluation utilizing the n-th order term in Eq.\ref{eq:element_final_taylor}. $\textit{Vector}$ represents the result corresponding to Eq.\ref{eq:taylor}. Based on the results obtained from LLaMA-7B and Vicuna-7B, pruning algorithms achieved the best average performance mostly by leveraging the second-order derivatives for each parameter. Nonetheless, given that first-order derivatives are considerably more efficient than second-order derivatives, though yielding slightly inferior results, 
+we still vote for the first-order term as a competitive method. Besides, the results on chatGLM-7B differed significantly from these findings. The importance estimation on each parameter fails, performing even worse than l2, while the importance estimation on the weight matrix reaches the best performance. 
+
+\begin{wrapfigure}{r}{6.5cm} 
+    \vspace{-6mm}
+    \includegraphics[width=0.9\linewidth]{figures/sensitivity.pdf} 
+    \vspace{-2mm}
+    \caption{Layer sensitivity for Pruning: Removing Groups in only one layer. 
+    } \label{fig:layer_sensitivity}
+\vspace{-0.8cm}
+\end{wrapfigure}
+
+\paragraph{\channelname\ Strategy vs. \blockname\ Strategy.} \label{sec:block_channel}
+
+From the results presented in Table \ref{tbl:llama13B_result}, it is evident that pruning `\channelname' significantly deteriorates performance compared to pruning `\blockname'. This discrepancy arises because the layers within the stacked transformer do not evenly distribute their importance. As shown in Figure \ref{fig:layer_sensitivity}, the first and last layers have a profound impact on the model's performance, and pruning them results in more substantial performance degradation compared to other layers. However, due to the uniform treatment of the `\channelname' group across all layers, it becomes inevitable to prune the first and last layers, leading to a significant decline in performance.
+
+\begin{table}[t]
+    \centering
+    \caption{Zero-shot Performance of the compressed ChatGLM-6B} \label{tbl:chatglm_result}
+    \resizebox{0.95\linewidth}{!}{
+    \begin{tabular}{ll|cccccc|c}
+        \toprule
+        \toprule
+        Pruned Model & Method & PIQA & HellaSwag & WinoGrande & ARC-e & ARC-c & OBQA & Average\\
+        \midrule
+        Ratio = 0\% & ChatGLM-6B & 67.95 & 46.37 & 52.33 & 48.36 & 29.95 & 37.40 & 47.05 \\
+        \midrule
+        \multirow{4}{*}{\parbox{1.8cm}{Ratio = 10\% w/o tune}}
+        & L2  & 61.97 & 37.22 & 49.72 & 42.05 & 28.24 & 35.40 & 42.43 \\
+        & Random  & 65.29 & 43.18 & 51.30 & 47.52 & 29.52 & 34.60 & 45.24 \\
+        & Vector  & 66.32 & 43.51 & 53.04 & 47.56 & \bf 30.72 & \bf 35.80 & 46.16 \\
+        & $\text{Element}^1$  & 54.35 & 28.07 & 50.59 & 27.82 & 24.66 & 33.20 & 36.45 \\
+        \cmidrule{1-9}
+        w/ tune & Vector & \bf 67.74 & \bf 46.35 & \bf 53.99 & \bf 51.01 & 29.95 & 35.00 & \bf 47.34 \\
+    \bottomrule
+    \bottomrule
+    \end{tabular}
+    }
+\end{table}
+
+\begin{figure}[t]
+  \centering
+  \vspace{-1mm}
+  \begin{minipage}[b]{0.63\linewidth}
+    \centering
+    \includegraphics[width=\linewidth]{figures/Pruning_Ratio_ALL.pdf}
+    \caption{The pruning results on LLaMA-7B (left) and Vicuna-7B (right) with different pruning rates.}
+    \label{fig:pruning_ratio}
+  \end{minipage}
+  \hfill
+  \begin{minipage}[b]{0.35\linewidth}
+    \centering
+    \includegraphics[width=\linewidth]{figures/overfit.pdf}
+    \caption{Perplexity on zero-shot datasets across varyhing steps.}
+    \label{fig:tune_overfit}
+  \end{minipage}
+  \vspace{-3mm}
+\end{figure}
+
+\begin{table}[t]
+  \centering
+  \begin{minipage}[b]{0.48\linewidth}
+    \centering
+    \caption{Effect of the dependency-based structural pruning. Average represents the average performance on 7 classification datasets.} \label{tbl:dependency}
+    \resizebox{\linewidth}{!}{
+    \begin{tabular}{c|c|ccc}
+        \toprule
+        & Method & WikiText2$\color{red}\downarrow$ & PTB$\color{red}\downarrow$ & Average$\color{teal}\uparrow$\\
+        \midrule
+        \multirow{2}{*}{w/o Tuning}
+        & w/o dependency & 68378.42 & 79942.47 & 38.32\\
+        & w/ dependency & 19.09 & 34.21 & 56.69 \\
+        \midrule
+        \multirow{2}{*}{w/ Tuning}
+        & w/o dependency &  13307.46 & 13548.08 & 38.10 \\
+        & w/ dependency & 17.58 & 30.11 & 59.23\\
+        \bottomrule
+    \end{tabular}
+    }
+  \end{minipage}
+  \hfill
+  \begin{minipage}[b]{0.48\linewidth}
+    \centering
+    \caption{Impact of different aggregation strategies on group importance estimation. Experiments are performed on LLaMA-7B.}
+    \resizebox{\linewidth}{!}{
+    \begin{tabular}{c|cc|ccc}
+        \toprule
+        Method & WikiText2$\color{red}\downarrow$ & PTB$\color{red}\downarrow$  & ARC-e$\color{teal}\uparrow$ & PIQA$\color{teal}\uparrow$ & OBQA$\color{teal}\uparrow$\\
+        \midrule
+        Summation & 66.13 & 164.25 & 40.70 &  63.49 & 34.80 \\
+        Max & 62.59 & 144.38 & 39.60 & 63.71 & 34.60 \\
+        Production & 77.63 & 192.88 & 37.84 & 62.08 & 35.00 \\
+        Last-only & 130.00 & 170.88 & 41.92 & 64.75 & 35.20 \\
+        \bottomrule
+    \end{tabular}
+    }
+  \end{minipage}
+\end{table}
+
+\subsection{More Analysis}
+\paragraph{Impact of Different Pruning Rates.} We investigate the impact of pruning the LLM at various pruning ratios in Figure \ref{fig:pruning_ratio}. We compare our pruning results with the L2 strategy because L2 is also a data-free pruning algorithm. It is observed in the experiment of LLaMA that when the pruning ratio reaches approximately 20\%, the magnitude-dependent algorithm experiences a rapid collapse, leading to the loss of information. Conversely, by employing LLM-Pruner, we are able to increase the pruning ratio to around 60\% while achieving an equivalent perplexity level. Furthermore, in the case of Vicuna-7B, removing 10\% parameters results in a performance decline equivalent to that of LLM-Pruner with 60\%. The utilization of LLM-Pruner enables a significant increase in the number of model parameters that can be pruned, thereby substantially reducing computational overhead.
+
+\paragraph{Tuning on the External Dataset.} To tune the pruned model, we utilize the external dataset Alpaca~\cite{alpaca}. The evaluation curves of the pruned model on two zero-shot datasets during the post-training process are depicted in Figure \ref{fig:tune_overfit}. The results demonstrate a rapid decrease in the perplexity of the pruned model within 300 steps, followed by a gradual increase. We provide a more comprehensive evaluation in Appendix \ref{sec:apx_overfit}. It is important to note that if the model is trained for an excessive number of steps, it runs the risk of overfitting the external dataset, potentially compromising its performance in other general-purpose tasks.
+
+\paragraph{Impact of Dependency-based Structured Pruning.} \label{exp:dependency}
+To study the importance of dependency-based structural pruning, we conduct an experiment to disrupt dependencies within groups, where each weight matrix $W_i$ is pruned solely based on the importance score estimated on itself. Table \ref{tbl:dependency} presents the results demonstrating the impact of dependencies in structural pruning. In the absence of dependencies, the model nearly fails in the zero-shot generation and classification tasks. Even with tuning, the model fails to recover, showing a substantial difference compared to the results in dependency-based pruning.
+
+\paragraph{Impact of Different Aggregation Strategies.}
+\iffalse{
+\begin{wraptable}{r}{6.8cm}
+    \vspace{-5mm}
+    \caption{} \label{tbl:Strategy_ablation_on_llama}
+\end{wraptable}
+}\fi
+We conduct tests on the aggregation algorithms proposed in Section \ref{sec:importance}. Our experimental results unveil notable discrepancies in model performance across different aggregation strategies, with particular emphasis on the `Last-only' strategy. Among the evaluated approaches, the `Max' strategy attains the most favorable outcomes in terms of perplexity, signifying enhanced coherence and fluency in sentence generation. However, it is important to note that the `Max' strategy exhibits the poorest zero-shot classification results compared to all four strategies. Conversely, the `Last-only' strategy showcases superior classification performance but suffers from the poorest generation quality.
+In our experiments, we make a trade-off by selecting the `Sum' strategy since it shows both good generalization quality and classification performance.
+
+\begin{wraptable}{r}{5.0cm}
+    \centering
+    \vspace{-4mm}
+    \caption{DistilBert vs. LLM-Pruner. The average here means the average score on the above seven datasets.} \label{tbl:distilBERT}
+    \resizebox{\linewidth}{!}{
+    \begin{tabular}{ll|c}
+        \toprule
+        Pruning Ratio & \#Param & Average \\
+        \midrule
+        DistilBert & 3.50B & 44.64 \\
+        LLM-Pruner & 3.35B & 48.88 \\
+        \bottomrule
+    \end{tabular}
+    }
+\end{wraptable}
+
+\paragraph{Comparison with DistilBERT} We show the comparison results of DistilBERT and LLM-Pruner on LLaMA-7B in Table \ref{tbl:distilBERT}. LLM-Pruner outperforms DistilBERT by 4.24\% on average with even a smaller size. The reason lies in that LLM-Pruner minimizes model disruption during pruning, whereas DistilBERT merely selects one layer out of two. As a result, the model pruned by LLM-Pruner demands less data to recover its performance compared with DistilBERT, consequently achieving superior performance.
+
+\paragraph{Scratch Training vs. Pruning.} We compare LLM-Pruner with StableLM-3B\footnote{https://huggingface.co/stabilityai/stablelm-tuned-alpha-3b} with a similar parameter size. To ensure fairness, both models are fine-tuned on the Alpaca dataset. The experimental results of these two models are shown in the Table \ref{tbl:llama_stableLM}. 
+LLM-Pruner crafts lightweight LLMs with low resources, and even can sometimes achieve better performance than LLMs from scratch training. However, we also acknowledge that the LLaMA-3B obtained by LLM-Pruner will not always outperform other 3B models from scratch training, due to the huge gap in the size of training corpus.  
+
+\begin{table}[h]
+    \centering
+    \caption{Scratch Training (StableLM-3B) vs. LLaMA-3B (by LLM-Pruner)} \label{tbl:llama_stableLM}
+    \resizebox{\linewidth}{!}{
+    \begin{tabular}{l|ll|ccccccc|c}
+        \toprule
+        \toprule
+        Pruning Ratio & \#Param & Latency & BoolQ & PIQA & HellaSwag & WinoGrande & ARC-e & ARC-c & OBQA & Average \\
+        \midrule
+        StableLM-3B & 3.6B & 31.69s & 48.78 & 69.48 & 44.52 & 54.62 & 50.93 & 25.17 & 27.40 & 45.84 \\
+        LLaMA-3B & 3.6B & 37.96s & 61.41 & 70.08 & 51.01 & 55.01 & 46.80 & 30.38 & 37.40 & 50.30 \\ 
+        \bottomrule
+        \bottomrule
+    \end{tabular}
+    }
+    \vspace{-3mm}
+\end{table}
+
+\paragraph{Case Study.} We provide some examples of sentences generated by the model compressed using LLM-Pruner in Table \ref{tbl:visualization}. We made efforts to ensure a minimal overlap between these generated sentences and the information contained in the tuning corpus, which demonstrates that the information originates from the original model rather than the tuning corpus. We provide additional examples in the Appendix, including the generated sentences of the model without post-training. From the cases in Table \ref{tbl:visualization}, it is evident that the sentences generated by the compressed model are comparable to those produced by the original model. They exhibit fluency, relevance, and informativeness regarding the given topic. Nevertheless, during our experiments, we observed that the pruned model's performance deviates from that of the original model, particularly when generating lengthy sentences. Occasionally, it may generate sentences that are meaningless or contain repetitive tokens.
+
+\begin{table}[t!]
+    \centering
+    \vspace{-4mm}
+    \caption{Some examples of generations obtained with the original model and the pruned model.} \label{tbl:visualization}
+    \resizebox{\linewidth}{!}{
+    \tiny
+    \begin{tabular}{p{0.8cm}|p{5cm}|p{4.8cm}}
+        \toprule
+        Model & Original Model & Pruned Model \\
+        \midrule
+         LLaMa & \ul{The universe is the entirety of space, time, matter, and energy that exists.} It includes all matter and energy, whether visible or not, and in fact the whole universe is invisible. There are many theories regarding its origin and ultimate fate... & \ul{The universe is the entirety of space, time, matter, and energy that exists.} The laws that make up physics — electrons orbiting atoms, magnets attracting other objects, planets orbiting the Sun—have been consistent over ...\\
+        \midrule
+        Vicuna & \ul{10 steps to build an ios app:} 1. Research and develop the idea. 2. Decide on the platform you want to use (iOS, Android, or both). 3. Create a plan and budget. 4. Hire a team of developers. 5. Design the user interface (UI). 6. Develop the user interface (UI). 7. Test and iterate on the app. 8. Submit the app to the app store. 9. Optimize the app for performance and user experience (UX). 10. Market and promote the app. & \ul{10 steps to build an ios app:} 1. Plan your app: decide what it should do, what it will look like, and what it will cost to build it. 2. Hire a developer: A good iOS developer will help you design the user interface, create the app, and make sure it’s bug-free. 3. Create a user interface: This is where the magic happens. Your app’s user interface will be designed and mocked up at this point... \\
+        \midrule
+        ChatGLM & \ul{Write a poetry about love and peace.} 
+        In the midst of life's hustle and bustle, I find your love a soothing peace. It is a feeling that cannot be conveyed, A connection that cannot be distanced.
+        With your smile, your eyes, your embrace, I feel a sense of belonging that only you can give. It is a love that lasts forever, A love that cannot be defeat...
+        & \ul{Write a poetry about love and peace.} Love and peace, two such wonderful things\textbackslash\ A pure and endless desire in my heart\textbackslash\ And both of them, I must seek for\textbackslash\ A long, long time, I know..\textbackslash\ Love, I know, is a feeling of being\textbackslash\ A perfect partner, in every sense\textbackslash\ And peace, I need it, so much, one day\textbackslash\ A long, long way, my heart will go..\\%In the midst of the world below,   A world of passion and battle above,   One day, in the midst of the heat,   I knew that I would find my way home. From the love of a man I know,   And the peace of a place so strong,   I found a place where I'd close my eyes,   And feel all the weight of the world... \\ %Love and peace, two things so pure. A touch from every heart to heart there's a way. From love that's deep and true, and from peace that's free. A bond that can only be found in these two things... \\
+        \bottomrule
+    \end{tabular}
+    }
+\end{table}
+
+\section{Conclusion} 
+
+In this paper, we propose LLM-Pruner, a structured pruning approach for large language models. LLM-Pruner aims to compress sizable language models in a task-agnostic manner while minimizing the dependency on the original training corpus and preserving the linguistic capabilities of LLMs. LLM-Pruner accomplishes this by iteratively examining each neuron within the model as a trigger for identifying dependency groups, thereby constructing the LLM's dependency graph. Subsequently, LLM-Pruner assesses the importance of these groups using both parameter-wise and weight-wise estimation. Finally, we utilize LoRA for fast recovery and adjustment of the pruned model. We evaluate the efficacy of LLM-Pruner on three distinct models—LLaMA, Vicuna, and ChatGLM—utilizing various zero-shot datasets. Our experimental results indicate that LLM-Pruner successfully prunes the model, reducing computational burden while retaining its zero-shot capabilities. Nevertheless, considerable performance degradation occurs when employing high pruning rates, such as the removal of 50\% of LLaMA's parameters, resulting in a substantial decline in model performance. Additionally, we observe instances in which the model generates incoherent sentences. Addressing the challenges associated with compressing LLMs at higher pruning rates remains a challenging task.
+
+\medskip
+
+\clearpage
+{
+\small
+}
+
+\clearpage
+
+\end{document}

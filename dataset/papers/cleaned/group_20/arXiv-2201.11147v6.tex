@@ -1,0 +1,418 @@
+\title{OntoProtein: Protein Pretraining With Gene Ontology Embedding}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+Self-supervised protein language models have proved their effectiveness in learning the proteins representations. With the increasing computational power, current protein language models pre-trained with millions of diverse sequences can advance the parameter scale from million-level to billion-level and achieve remarkable improvement. However, those prevailing approaches rarely consider incorporating knowledge graphs (KGs), which can provide rich structured knowledge facts for better protein representations. We argue that informative biology knowledge in KGs can enhance protein representation with external knowledge. In this work, we propose \textbf{OntoProtein}, the first general framework that makes use of structure in GO (Gene Ontology) into protein pre-training models. We construct a novel large-scale knowledge graph that consists of GO and its related proteins, and gene annotation texts or protein sequences describe all nodes in the graph. We propose novel contrastive learning with knowledge-aware negative sampling to jointly optimize the knowledge graph and protein embedding during pre-training.  Experimental results show that OntoProtein can surpass state-of-the-art methods with pre-trained protein language models in TAPE benchmark and yield better performance compared with baselines in protein-protein interaction and protein function prediction\footnote{Code and datasets are available in \url{https://github.com/zjunlp/OntoProtein}.}.
+\end{abstract}
+
+\section{Introduction}
+
+Protein science, the fundamental macromolecules governing biology and life itself, has led to remarkable advances in understanding the disease therapies and human health (\cite{DBLP:conf/iclr/VigMVXSR21}). 
+As a sequence of amino acids, protein can be viewed precisely as a language, indicating that they may be modeled using neural networks that have been developed for natural language processing (NLP).
+Recent self-supervised pre-trained protein language models (PLMs) such as ESM (\cite{DBLP:conf/iclr/RaoMSOR21}), ProteinBERT (\cite{brandes2021proteinbert}), ProtTrans (\cite{DBLP:journals/corr/abs-2007-06225}) which can learn powerful protein representations, have achieved promising results in understanding the structure and functionality of the protein. 
+Yet existing PLMs for protein representation learning generally cannot sufficiently capture the biology factual knowledge, which is crucial for many protein tasks but is usually sparse and has diverse and complex forms in sequence.
+
+By contrast, knowledge graphs (KGs) from gene ontology\footnote{\url{http://geneontology.org/}} contain extensive biology structural facts, and knowledge embedding (KE) approaches (\cite{DBLP:conf/nips/BordesUGWY13}, \cite{DBLP:conf/acl/ZhengWCYZZZQMZ20}) can efficiently embed them into continuous vectors of entities and relations. 
+For example, as shown in Figure \ref{intro}, without knowing \emph{PEX5} has specific biological processes and cellular components, it is challenging to recognize its interaction with other proteins. 
+Furthermore, since \emph{protein's shape determines its function}, it is more convenient for models to identify protein's functions with the prior knowledge of protein functions having similar shapes.
+Hence, considering rich knowledge can lead to better protein representation and benefits various biology applications, e.g., protein contact prediction, protein function prediction, and protein-protein interaction prediction. 
+However, different from knowledge-enhanced approaches in NLP {\color{highlight} (\cite{DBLP:conf/acl/ZhangHLJSL19}, \cite{DBLP:journals/tacl/WangGZZLLT21}, \cite{DBLP:conf/acl/WangTDWHJCJZ21}) }, protein sequence and gene ontology are two different types of data. 
+Note that protein sequence is composed of amino acids while gene ontology is a knowledge graph with text description; thus, severe issues of structured knowledge encoding and heterogeneous information fusion remain. 
+
+In this paper, we take the first to propose protein pre-training with gene ontology embedding (\textbf{OntoProtein}), which is the first general framework to integrate external knowledge graphs into protein pre-training.  
+We propose a  hybrid encoder to represent language text and protein sequence and introduce contrastive learning with knowledge-aware negative sampling to jointly optimize the knowledge graph and the protein sequence embedding during pre-training. 
+For the KE objective, we encode the node descriptions (go annotations) as their corresponding entity embeddings and then optimize them following vanilla KE approaches (\cite{DBLP:conf/nips/BordesUGWY13}). 
+We further leverage gene ontology of molecular function, cellular component, and biological process and introduce a knowledge-aware negative sampling method for the KE objective. 
+For the MLM {\color{highlight} (Mask Language Modeling)} objective, we follow the approach of existing protein pre-training approaches (\cite{DBLP:conf/iclr/RaoMSOR21}). 
+OntoProtein has the following strengths:
+
+\begin{figure*}[t]
+\centering
+\includegraphics[scale=0.36]{figs/case_first_new_change.pdf}
+\caption{
+{\color{highlight}
+\textbf{Left}: A protein example with biology knowledge (molecular function, biological process and cellular component): $K^{+}$ (potassium ion) Cyclic nucleotide-gated cation channel protein. \textbf{Right}: The corresponding sub-graph regarding $K^{+}$ carrier proteins in \textbf{ProteinKG25}. \textbf{Yellow} nodes are protein sequences and \textbf{blue} nodes are GO (Gene Ontology) entities with biological descriptions.
+}
+}
+\label{intro}
+\end{figure*}
+
+(1) OntoProtein inherits the strong ability of protein understanding from PLMs with the MLM object.
+(2) OntoProtein can integrate biology knowledge into protein representation with the supervision from KG by the KE object.
+(3) OntoProtein constitutes a model-agnostic method and is readily pluggable into a wide range of protein tasks without additional inference overhead since we do not modify model architecture but add new training objectives. 
+
+For pre-training and evaluating OntoProtein, we need a knowledge graph with large-scale biology knowledge facts aligned with protein sequences.
+Therefore, we construct \textbf{ProteinKG25}, which contains about 612,483 entities, 4,990,097 triples, and aligned node descriptions from GO annotations. 
+To the best of our knowledge, it is the first large-scale KG dataset to facilitate protein pre-training.
+We deliver data splits for both the inductive and the transductive settings to promote future research. 
+
+To summarize, our contribution is three-fold:
+(1) We propose OntoProtein, the first knowledge-enhanced protein pre-training approach that brings promising improvements to a wide range of protein tasks. 
+(2) By contrastive learning with knowledge-aware sampling to jointly optimize knowledge and protein embedding, OntoProtein shows its effectiveness in widespread downstream tasks, including protein function prediction, protein-protein interaction prediction, contact prediction, and so on. 
+(3) We construct and release the ProteinKG25, a novel large-scale KG dataset, promoting the research on protein language pre-training. 
+(4) We conduct extensive experiments in widespread protein tasks, including TAPE benchmark, protein-protein interaction prediction, and protein function prediction, which demonstrate the effectiveness of our proposed approach.  
+
+\begin{figure*}[t]
+\centering
+\includegraphics[scale=0.43]{figs/model_new.pdf}
+\caption{Overview of our proposed OntoProtein, which jointly optimize knowledge graph embedding and masked protein model (Best viewed in color.).
+}
+\label{arc}
+\end{figure*}
+
+\section{Methodologies}
+We begin to introduce our approach of protein pre-training with ontology embedding (OntoProtein), as shown in Figure \ref{arc}.
+OntoProtein incorporates external knowledge from Gene Ontology (Go) into language representations by jointly optimizing two objectives. 
+We will first introduce the hybrid encoder, masked protein modeling, and knowledge encoder, and then we will present the details of contrastive learning with knowledge-aware negative sampling. 
+Finally, we will illustrate the overall pre-training objects. 
+
+\subsection{Hybrid Encoder}
+We first introduce the hybrid encoder to represent protein and GO knowledge. 
+For the protein encoder, we use the pre-trained ProtBert from \cite{DBLP:journals/corr/abs-2007-06225}.
+ProtBert is pre-trained using the BERT architecture with UniRef100 datasets.
+Compared to BERT \cite{DBLP:conf/naacl/DevlinCLT19}, ProtBert encodes amino acid sequences into token level or sentence level representations, which can be used for downstream protein tasks such as contacts prediction tasks.
+The encoder  takes a protein sequence of $N$ tokens $(x_1,...,x_N)$ as inputs, and computes contextualized amnio acid representation $H_{Protein}^{i}$ and sequence representation $H_{Protein}$ 
+{\color{highlight}via \textit{mean pooling}. 
+To bridge the gap between text and protein, we utilize affine transformation (an extra linear layer) to project those representation to the same space.}
+We will discuss details of learning protein representation in Section \hyperref[sec:MLM]{Mask Protein Modeling}.
+
+For the Go encoder, we leverage BERT (\cite{DBLP:conf/naacl/DevlinCLT19}), a Transformer (\cite{DBLP:conf/nips/VaswaniSPUJGKP17}) based text encoder for biological  descriptions in Gene Ontology entities.
+Specifically, we utilize the pre-trained language model from (\cite{pubmedbert})\footnote{\url{https://huggingface.co/microsoft/BiomedNLP-PubMedBERT-base-uncased-abstract-fulltext}}.
+The encoder takes a sequence of $N$ tokens $(x_1,...,x_N)$ as inputs, and computes  Go representations $H_{GO}\in R^{N\times d}$  by averaging all the token embeddings.
+
+Since the relations in Gene Ontology are important for representing the knowledge of biology features, thus, we utilize a relation encoder with the random initialization, and those embeddings of relations will be optimized and updated during pre-training.
+
+ 
+\subsection{Knowledge Embedding}
+ \label{sec:KE}
+ {\color{highlight} We leverage the knowledge embedding (KE) objective to obtain representations in the pre-training process since Gene Ontology is actually a factual knowledge graph.}
+Similar to \cite{DBLP:conf/nips/BordesUGWY13}, we use distributed representations to encode entities and relations. 
+The knowledge graph here consists of lots of triples to describe relational facts.
+We define a triplet as $(h, r, t)$, where $h$ and $t$ are head and tail entities, $r$ is the relation whose type usually is pre-defined in the schema\footnote{The schema of the knowledge graph can be found in Appendix \ref{app:dataset}}.
+Note that there are \textbf{two different types of nodes} $e_{GO}$ and $e_{protein}$ in our knowledge graph. 
+$e_{GO}$ is denoted as nodes that exist in the gene ontology, such as molecular function or cellular component nodes, and $e_{GO}$ can be described by annotation texts.
+$e_{protein}$ is the protein node that links to the gene ontology, and we also represent $e_{protein}$ with amnio acids sequences.
+Concretely, the triplets in this knowledge graph can be divided into two groups, $triple_{GO2GO}$ and $triple_{Protein2GO}$.
+To integrate multi-modal descriptions into the same semantic space and address the heterogeneous information fusion issue, we utilize hybrid encoders introduced in the previous Section.
+Note that protein encoder and GO encoder represent protein sequence and GO annotations separately.
+
+\subsection{Masked Protein Modeling}
+\label{sec:MLM}
+We use masked protein modeling to optimize protein representations.
+The masked protein modeling is similar to masked language modeling (MLM).
+During model pre-training, we use a 15\% probability to mask each token (amino acid) and leverage a cross-entropy loss $\ell_{MLM}$ to estimate these masked tokens.
+We initialize our model with the pre-trained model of ProtBert and regard $\ell_{MLM}$ as one of the overall objectives of OntoProtein by jointly training KE (knowledge embedding) and MLM.
+Our approach is model-agnostic, and other pre-trained models can also be leveraged.
+
+\subsection{Contrastive Learning with Knowledge-aware Negative Sampling}
+
+Knowledge embedding (KE) is to learn low-dimensional representations for entities and relations, and contrastive estimation represents a scalable and effective method for inferring connectivity patterns. 
+Note that a crucial aspect of contrastive learning approaches is the choice of corruption distribution that generates hard negative samples, which force the embedding model to learn discriminative representations and find critical characteristics of observed data.
+However, previous approaches either employ too simple corruption distributions, i.e., uniform, yielding easy uninformative negatives, or sophisticated adversarial distributions with challenging optimization schemes.
+Thus, in this paper, we propose contrastive learning with knowledge-aware negative sampling, an inexpensive negative sampling strategy that utilizes the rich GO knowledge to sample negative samples.
+Formally, the KE objective can be defined as: 
+\begin{equation}
+\label{eq:1}
+{\color{highlight} 
+\ell_{KE}=-\log{\sigma (\gamma-d(h,t))} - \sum_{i=1}^{n}{\frac{1}{n}\log{\sigma(d(h_i', t_i')-\gamma)} } 
+}
+\end{equation}
+
+$(h_i', t_i')$ is the negative sample, in which head or tail entities are random sampled to construct the corrupt triples.
+$n$ is the number of negative samples, $\sigma$ is the sigmoid function, and $\gamma$ means the margin.
+$d$ is the scoring function, and we use TransE (\cite{DBLP:conf/nips/BordesUGWY13}) for simplicity, where 
+\begin{equation}
+{\color{highlight} 
+d_r(h, t) = \left \| h + r - t \right \| 
+}
+\end{equation}
+
+Specifically, we define triple sets and entity sets as $T$ and $E$, all triplets are divided into two groups.
+If the head entity is protein node and the tail entity is GO node, we denote the triple as $T_{protein-GO}$.
+Similarly, if head and tail entities are both GO nodes, we denote them as $T_{GO-GO}$.
+As Gene Ontology describes the knowledge of the biological domain concerning three aspects, all entities in Gene Ontology belong to MFO (Molecular Function),  CCO (Cellular Component), or BPO (Biological Process).
+
+To avoid plain negative samples, for those $T_{GO-GO}$ triples, we sample triples by replacing entities with the same aspect (MFO, CCO, BPO)\footnote{For $T_{protein-GO}$ triples, it is also intuitive to replace the proteins with their homologous proteins to generate hard negative triples, and we leave this for future works.}. 
+Finally, we define the negative triple sets $T'$ and {\color{highlight} positive triple as $(h, r, t)$, the negative sampling process can be described as follows}:
+{\color{highlight}
+\begin{equation}
+\begin{aligned}
+&T_{GO-GO (h,r,t)}^{'}=\{(h',r,t)\mid h'\in E', h\in E' \} \cup \{ (h,r,t')\mid t'\in E', t\in E' \}
+\\
+&T_{Protein-GO (h,r,t)}^{'} = \{ (h,r,t')\mid t'\in E' \}
+\\
+\end{aligned}
+\end{equation}
+
+where $ E' \in \{ E_{MFO}, E_{CCO}, E_{BPO} \}$, and we only replace the tail entities for  $T_{Protein-GO}$ triples.
+}
+
+\subsection{Pre-training Objective}
+We adopt the mask protein modeling object and knowledge embedding objective to construct the overall object of the OntoProtein.
+We jointly optimize the overall object as follows:
+\begin{equation}
+\ell = \alpha \ell_{KE} + \ell_{MLM}
+\end{equation}
+where $\alpha$ is the hyper-parameter. 
+Our approach can be embedded into existing fine-tuning scenarios.
+ 
+\section{Experiment}
+Extensive experiments have been conducted to prove the effectiveness of our approach.
+In the pre-training stage, we construct a new knowledge graph dataset that consists of Gene Ontology and public annotated proteins.
+Our proposed model is pre-trained with this dataset and evaluated in several downstream tasks.
+We evaluate OntoProtein in protein function prediction, protein-protein interaction and  TAPE benchmark (\cite{DBLP:conf/nips/RaoBTDCCAS19}).
+
+\begin{figure*}[t]
+\centering
+\includegraphics[scale=0.48]{figs/dataset.pdf}
+\caption{\textbf{Top}: Data Distribution of GO Terms. \textbf{Bottom}: Statistics of Protein-GO Term.}
+\label{dataset}
+\end{figure*}
+
+\subsection{Datasets}
+ 
+\paragraph{Pre-training Dataset}
+To incorporate Gene Ontology knowledge into language models, we build a new pre-training dataset called ProteinKG25\footnote{\url{https://zjunlp.github.io/project/ProteinKG25/}}, which is a large-scale KG dataset with aligned descriptions and protein sequences respectively to GO terms\footnote{The structure of GO can be described in terms of a graph, where each GO term is a node, and the relationships between the terms are edges between the nodes.} and proteins entities. 
+Gene Ontology consists of a set of GO terms (or concepts) with relations that operate between them, e.g., molecular function terms describe activities that occur at the molecular level.
+A GO annotation is a statement about the function of a particular gene or gene product, e.g., the gene product “cytochrome c” can be described by the molecular function oxidoreductase activity.
+Due to the connection between Gene Ontology and Gene Annotations, we combine the two structures into a unified knowledge graph. 
+For each GO term in Gene Ontology, we align it to its corresponding name and description and concatenate them by a colon as an entire description.
+For each protein in Gene annotation, we align it to the Swiss-Prot\footnote{\url{https://www.uniprot.org/}}, a protein knowledge database, and extract its corresponding sequence as its description.
+In ProteinKG25, there exists 4,990,097 triples, including 4,879,951 $T_{protein-GO}$ and 110,146 $T_{GO-GO}$ triples. 
+Figure \ref{dataset} illustrate the statistics of our ProteinKG25.
+Detailed construction procedure and analysis of pre-train datasets can be found in Appendix \ref{app:dataset}.
+ 
+\paragraph{Downstream Task Dataset}
+
+We use TAPE as the benchmark (\cite{DBLP:conf/nips/RaoBTDCCAS19}) to evaluate protein representation learning.
+There are three types of tasks in TAPE, including structure, evolutionary, and engineering for proteins.
+Following \cite{DBLP:conf/icml/RaoLVMCASR21}, we select 6 representative datasets including secondary structure (SS), contact prediction to evaluate OntoProtein.
+
+Protein-protein interactions (PPI) are physical contacts of high specificity established between two or more protein molecules; we regard PPI as a sequence classification task and use three datasets with different sizes for evaluation. 
+STRING is built by \cite{DBLP:conf/ijcai/LvHBZ21}, which contains 15,335 proteins and 593,397 PPIs.
+We also use SHS27k and SHS148k, which are generated by \cite{DBLP:journals/bioinformatics/ChenJZCZCZW19}.
+
+Protein function prediction aims to assign biological or biochemical roles to proteins, and we also regard this task as a sequence classification task.  
+We build a new evaluation dataset based on our ProteinKG25 following the standard CAFA protocol (\cite{zhou2019cafa}). 
+Specifically, we design two evaluation settings, the transductive setting and the inductive setting, which simulate two scenarios of gene annotation in reality. 
+In the transductive setting, the model can generate embeddings of unseen protein entities with entity descriptions. 
+On the contrary, for the inductive setting, those entities have occurred in the pre-training stage. 
+The detailed construction of the dataset can be found in Appendix \ref{app:dataset}. 
+As shown in Figure \ref{dataset}, proteins are, on average, annotated by 2 terms in CCO, 4 in MFO, and 3 in BPO, indicating that protein function prediction can be viewed as a multi-label problem.
+{\color{highlight}
+Notably, we notice that leaf GO terms tend to have  more specific concepts than non-leaf GO terms. 
+Meanwhile, there exists a challenging long-tail issue for the function prediction task. 
+}
+
+ 
+\subsection{Results}
+\begin{table}[]
+\centering
+\begin{tabular}{lcccccc}
+\toprule
+\multirow{2}{*}{Method} & \multicolumn{3}{c}{Structure} & Evolutionary & \multicolumn{2}{c}{Engineering} \\ 
+                        & SS-Q3   & SS-Q8   & Contact   & Homology     & Fluorescene     & Stability     \\ \midrule
+LSTM            & 0.75 & 0.59 & 0.26 & 0.26 & 0.67 &  0.69 \\
+TAPE Transformer & 0.73 & 0.59 & 0.25 & 0.21 & {\textbf{0.68}} &  0.73 \\
+ResNet          & 0.75 & 0.58 & 0.25 & 0.17 &  0.21 &  0.73 \\
+MSA Transformer & - & \textbf{0.73} & \textbf{0.49} & - & - & - \\
+ProtBert        & 0.81 & 0.67 & 0.35 & {\color{highlight} \textbf{0.29}} & 0.61 & {\color{highlight} \textbf{0.82}} \\
+OntoProtein     & \textbf{0.82} & 0.68 & 0.40 & 0.24 & 0.66 & 0.75 \\
+\bottomrule
+\end{tabular}
+\caption{
+Results on TAPE Benchmark. 
+SS is a secondary structure task that evaluates in CB513.
+In contact prediction, we test medium- and long-range using P@L/2 metrics.
+In protein engineering tasks, we test fluorescence and stability prediction using spearman's $\rho$ metric.%\protect\footnotemark.
+}
+\label{tape}
+\end{table}
+
+\subsection*{TAPE Benchmark}
+\paragraph{Baselines}
+In TAPE, we evaluate our OntoProtein compared with five baselines. 
+The first is the model with LSTM encoding of the input amino acid sequence, which provides a simple baseline. 
+The second is TAPE Transformer that provides a basic transformer baseline.
+We further select  ResNet from \cite{DBLP:conf/cvpr/HeZRS16} as a baseline.
+The forth is the MSA Transformer (\cite{DBLP:conf/icml/RaoLVMCASR21}).
+Note that MSA Transformer takes advantage of multiple sequence alignments (MSAs) and is the current state-of-the-art approach.
+Finally, we use ProtBert (\cite{DBLP:journals/corr/abs-2007-06225}) with 30 layers of BERT encoder, which is the largest pre-trained model among baselines.
+
+\paragraph{Results}
+We detail the experimental result on TAPE in Table \ref{tape}.
+Concretely, we notice that OntoProtein yields better performance in all token level tests.
+For the second structure (SS-Q3 and SS-Q8) and contact prediction, OntoProtein outperforms TAPE Transformer and ProtBert, showing that it can benefit from those informative biology knowledge graphs in pre-training.
+Moreover, OntoProtein can achieve comparable performance with MSA transformer.
+Note that our proposed OntoProtein does not leverage the information from MSAs.
+However, with external gene ontology knowledge injection, OntoProtein can obtain promising performance.
+In sequence level tasks, OntoProtein can achieve better performance than ProtBert in fluorescence prediction. 
+However, we observe that OntoProtein does not perform well in protein engineering, homology, and stability prediction, which are all regression tasks.
+We think this is due to the lack of sequence-level objectives in our pre-training object, and we leave this for future work.
+
+\subsection*{Protein-Protein Interaction}
+\paragraph{Baselines}
+We choose four representative methods as baselines for protein-protein interaction.
+PIPR (\cite{DBLP:journals/bioinformatics/ChenJZCZCZW19}), {\color{highlight} DNN-PPI (\cite{li2018deep}) and DPPI (\cite{DBLP:journals/bioinformatics/HashemifarNKX18})} are  deep learning based methods.
+GNN-PPI (\cite{DBLP:conf/ijcai/LvHBZ21}) is a graph neural network based method for better inter-novel-protein interaction prediction.
+To evaluate our OntoProtein, we replace the initial protein embedding part of GNN-PPI with ProtBERT and OntoProtein as baselines.
+
+\paragraph{Results}
+
+From Table \ref{tab:ppi_result}, we observe that the performance of OntoProtein is better than PIPR, which demonstrates that external structure knowledge can be beneficial for protein-protein interaction prediction. 
+We also notice th         at our method can achieve promising improvement in smaller dataset SHS2K, even outperforming GNN-PPI and GNN-PPI (ProtBert).
+With a larger size of datasets, OntoProtein can still obtain comparable performance to GNN-PPI and GNN-PPI (ProtBert).
+
+\begin{table}[]
+    \centering
+    \begin{tabular}{l cccccc}
+    \toprule
+    \multicolumn{1}{l}{} &
+    \multicolumn{2}{c}{\textbf{SHS27k}} &
+    \multicolumn{2}{c}{\textbf{SHS148k}} &
+    \multicolumn{2}{c}{\textbf{STRING}} \\
+    \cmidrule(lr){2-3} \cmidrule(lr){4-5} \cmidrule(lr){6-7}
+    \textbf{Methods} & BFS & DFS & BFS & DFS & BFS & DFS \\
+    \midrule
+    {\color{highlight} DPPI}  & {\color{highlight} 41.43} & {\color{highlight} 46.12} & {\color{highlight} 52.12} & {\color{highlight} 52.03} & {\color{highlight} 56.68} & {\color{highlight} 66.82} \\
+    {\color{highlight} DNN-PPI} & {\color{highlight} 48.90} & {\color{highlight} 54.34} & {\color{highlight} 57.40} & {\color{highlight} 58.42} & {\color{highlight} 53.05}  & {\color{highlight} 64.94} \\
+    PIPR & 44.48 & 57.80 & 61.83 & 63.98 & 55.65 & 67.45 \\
+    GNN-PPI & 63.81 & 74.72 & 71.37 & 82.67 & 78.37 & 91.07 \\
+    GNN-PPI (ProtBert) & 70.94 & 73.36 & 70.32 & 78.86 & 67.61 & 87.44 \\
+    {\color{highlight} GNN-PPI (OntoProtein)$^\dagger$} & {\color{highlight}\textbf{72.26}} & {\color{highlight}\textbf{78.89}} & {\color{highlight} \textbf{75.23}} & {\color{highlight}77.52 } &  {\color{highlight} 76.71 } & {\color{highlight}\textbf{91.45}} \\
+    \bottomrule
+    \end{tabular}
+    \caption{
+    Protein-Protein Interaction Prediction Results.
+    Breath-First Search (BFS) and Depth-First Search (DFS) are strategies that split the training and testing PPI datasets. 
+    }
+    \label{tab:ppi_result}
+\end{table}
+
+\begin{table}[]
+\centering
+\begin{tabular}{lcccccc}
+    \toprule
+    \multicolumn{1}{l}{} & \multicolumn{3}{c}{\textbf{Transductive}} & \multicolumn{3}{c}{\textbf{Inductive}}  \\
+    \cmidrule(lr){2-4} \cmidrule(lr){5-7}
+    \textbf{Method} & BPO & MFO & CCO & BPO & MFO & CCO \\
+    \midrule
+    ProtBert & 0.58 & 0.13 & 8.47 & 0.64 & 0.33 & 9.27 \\
+    OntoProtein & 0.62 & 0.13 & 8.46 & 0.66 & 0.25 & 8.37 \\
+    \bottomrule
+\end{tabular}
+\caption{
+Protein Function Prediction Results on three sub-sets with two settings. 
+BPO  refers to Biological Process, 
+MFO refers to Molecular Function,
+and CCO refers to Cellular Component. 
+}
+\label{result:protein_function}
+\end{table}
+ 
+\subsection*{Protein Function Prediction}
+\paragraph{Baselines}
+For simplicity, we leverage Seq2Vec (\cite{littmann2021embeddings}) as the backbone for fair comparison and initialize embeddings with ProtBert and our OntoProtein.
+Note that our approach is model-agnostic, and other backbones can also be leveraged. 
+ 
+\paragraph{Results}
+We split the test sets into three subsets (BPO, MFO, and CCO) and evaluate the performance of models separately.
+From Table \ref{result:protein_function}, we notice that our OntoProtein can yield a 4\% improvement with transductive setting and 2\% advancement with inductive setting in BPO, further demonstrating the effectiveness of our proposed approach. 
+We also observe that OntoProtein obtain comparable performance in other subsets.
+Note that there exists a severe long-tail issue in the dataset, and knowledge injecting may affect the representation learning for the head but weaken the tail representation, thus cause performance degradation.
+We leave this for future works.
+
+\subsection{Analysis}
+Table \ref{Contact Prediction} illustrates a detailed experimental analysis on the contact prediction. 
+To further analyze the model’s performance, we conduct experiments to probe the performance of different sequences.
+Specifically, protein sequence lengths from short-range ($6 \le seq < 12$) to long-range ($24 \le seq$) are tested with three metrics (P@L, P@L/2, P@L/5).
+We choose several basic algorithms such as LSTM and TAPE transformer as baselines.
+For fairness, ProtBert is also leveraged for comparison.
+It can be seen that the performance of OntoProtein exceeds all other methods in all test settings, which is reasonable because the knowledge injected from Gene Ontology is beneficial.
+{\color{highlight} 
+Further, we random sample a protein instance from the test dataset and analyze its attention weight of OntoProtein. 
+We conduct visualization analysis as shown in Figure \ref{fig:attention} to compare the contacts among amino acids with the contact label matrix.
+}
+
+ 
+
+\begin{table}[]
+\begin{tabular}{p{3.0cm}p{0.6cm}p{0.8cm}p{0.8cm}p{0.6cm}p{0.8cm}p{0.8cm}p{0.6cm}p{0.8cm}p{0.8cm}}
+\toprule
+\multirow{2}{*}{}     & \multicolumn{3}{c}{$6 \le seq < 12$} & \multicolumn{3}{c}{$12 \le seq < 24$} & \multicolumn{3}{c}{$24 \le seq$} \\
+                      & P@L & P@L/2 & P@L/5 & P@L & P@L/2 & P@L/5 & P@L & P@L/2 & P@L/5     \\
+\midrule
+TAPE Transformer & 0.28   & 0.35   & 0.46   & 0.19    & 0.25   & 0.33   & 0.17   & 0.20  & 0.24  \\
+LSTM       & 0.26   & 0.36   & 0.49   & 0.20    & 0.26   & 0.34   & 0.20   & 0.23  & 0.27  \\
+ResNet     & 0.25   & 0.34   & 0.46   & 0.18    & 0.25   & 0.35   & 0.10   & 0.13  & 0.17  \\
+ProtBert       & 0.30 & 0.40 & 0.52 & 0.27 & 0.35 & 0.47 & 0.20 & 0.26 & 0.34 \\
+OntoProtein       & \textbf{0.37} & \textbf{0.46} & \textbf{0.57} & \textbf{0.32} & \textbf{0.40} & \textbf{0.50} & \textbf{0.24} & \textbf{0.31} & \textbf{0.39} \\
+\bottomrule
+\end{tabular}
+\caption{
+Ablation study of contact prediction. 
+$seq$ refers to the sequence length between amino acids.
+“P@K” is precision for the top $K$ contacts and $L$ is the length of the protein.}
+\label{Contact Prediction}
+\end{table}
+
+\begin{figure*}[t]
+\centering
+\includegraphics[scale=0.3]{figs/contact_label_attention.png}
+\caption{
+We randomly select a protein from the contact test dataset for visual analysis.
+\textbf{Left}: We visualize the 7th head in the last attention layer in OntoProtein. \textbf{Right}: It is the  contact label matrix.
+}
+\label{fig:attention}
+\end{figure*}
+
+\subsection{Discussion}
+Applying techniques from NLP to proteins opens new opportunities to extract information from proteins in a self-supervised, data-driven way. 
+Here we show for the first time that injecting external knowledge from gene ontology can help to learn protein representation better, thus, boosting the downstream protein tasks. 
+However, the gains in our proposed OntoProtein compared to previous pre-trained models using large-scale corpus is still relatively small. 
+Note that the knowledge graph ProteinKG25 can only cover a small subset of all proteins, thus, limiting the advancement.
+We will continue to maintain the knowledge graph by adding new facts from Gene Ontology. 
+Besides, previous studies (\cite{DBLP:conf/aaai/LiuZ0WJD020,DBLP:conf/ijcai/ZhangDCCZZC21}) indicate that not all external knowledge are beneficial for downstream tasks, and it is necessary to investigate when and how to inject external knowledge into pre-trained models effectively.
+Finally, our proposed approach can be viewed as jointly pre-training human language and protein (the language of life).
+Our motivation is to crack the language of life’s code with gene knowledge injected protein pre-training. 
+Our work is but a small step in this direction.  
+
+\section{Related Work}
+
+\subsection{Pre-trained Language Models}
+Up to now, various efforts have been devoted to exploring large-scale PTMs, either for NLP (\cite{DBLP:conf/naacl/PetersNIGCLZ18,DBLP:conf/naacl/DevlinCLT19}), or for CV (\cite{DBLP:conf/emnlp/TanB19}).
+Fine-tuning large-scale PTMs such as ELMo (\cite{DBLP:conf/naacl/PetersNIGCLZ18}), GPT3 (\cite{DBLP:conf/nips/BrownMRSKDNSSAA20}), BERT (\cite{DBLP:conf/naacl/DevlinCLT19}), XLNet (\cite{DBLP:conf/nips/YangDYCSL19}) UniLM (\cite{DBLP:conf/nips/00040WWLWGZH19}) for specific AI tasks instead of learning models from scratch has also become a consensus (\cite{DBLP:journals/corr/abs-2106-07139}). 
+Apart from the of large scale language models for natural language processing, there has been considerable interest in developing similar models for proteins (\cite{DBLP:journals/corr/abs-2108-07435,DBLP:journals/pnas/RivesMSGLLGOZMF21}).
+\cite{DBLP:conf/icml/RaoLVMCASR21} is the first to study protein Transformer language models, demonstrating that information about residue-residue contacts can be recovered from the learned representations by linear projections supervised with protein structures. 
+\cite{DBLP:conf/iclr/VigMVXSR21} performs an extensive analysis of Transformer attention, identifying correspondences to biologically relevant features, and also finds that different layers of the model are responsible for learning different features. 
+\cite{DBLP:journals/corr/abs-2007-06225} proposes ProtTrans, which explores the limits of up-scaling language models trained on proteins as well as protein sequence databases and compares the effects of auto-regressive and auto-encoding pre-training upon the success of the subsequent supervised training. 
+Human-curated or domain-specific knowledge is essential for downstream tasks, {\color{highlight} which is extensively studied such as  \cite{himmelstein2015heterogeneous}, \cite{smaili2018onto2vec}, \cite{smaili2019opa2vec}, \cite{hao2020bio},\, \cite{ioannidis2020drkg} }.  However these pre-training methods do not explicitly consider external knowledge like our proposed OntoProtein. 
+
+\subsection{Knowledge-enhanced Language Models}
+
+Background knowledge has been considered as an indispensable part of language understanding (\citep{DBLP:conf/ijcai/ZhangDCCZZC21,DBLP:conf/acl/DengZLHTCHC20,DBLP:journals/corr/abs-2109-08306,DBLP:conf/naacl/ZhangDSWCZC19,DBLP:conf/coling/YuZDYZC20,DBLP:journals/corr/abs-2109-00895,DBLP:conf/kdd/ZhangJD0YCTHWHC21,DBLP:journals/corr/abs-2104-07650,DBLP:journals/corr/abs-2201-03335,DBLP:conf/cpaior/Silvestri0M21,DBLP:journals/corr/abs-2112-01404,DBLP:journals/corr/abs-2201-05742,DBLP:journals/corr/abs-2201-05575}), which has inspired knowledge-enhanced models including ERNIE (Tsinghua) (\cite{DBLP:conf/acl/ZhangHLJSL19}), ERNIE (Baidu) (\cite{DBLP:journals/corr/abs-1904-09223}), KnowBERT (\cite{DBLP:conf/emnlp/PetersNLSJSS19}), WKLM (\cite{DBLP:conf/iclr/XiongDWS20}), LUKE (\cite{DBLP:conf/emnlp/YamadaASTM20}), KEPLER (\cite{DBLP:journals/tacl/WangGZZLLT21}), K-BERT (\cite{DBLP:conf/aaai/LiuZ0WJD020}), K-Adaptor (\cite{DBLP:conf/acl/WangTDWHJCJZ21}), and CoLAKE (\cite{DBLP:conf/coling/SunSQGHHZ20}). 
+ERNIE (\cite{DBLP:conf/acl/ZhangHLJSL19}) injects relational knowledge into the pre-trained model BERT, which aligns entities from Wikipedia to facts in WikiData.  
+KEPLER (\cite{DBLP:journals/tacl/WangGZZLLT21}) jointly optimizes knowledge embedding and pre-trained language representation (KEPLER), which can not only better integrate factual knowledge into PLMs but also effectively learn KE through the abundant information in the text.
+ 
+Inspired by these works, we propose OntoProtein that integrates external knowledge graphs into protein pre-training.
+To the best of our knowledge, we are the first to inject gene ontology knowledge into protein language models. 
+
+\section{Conclusion and Future Work}
+In this paper, we take the first step to integrating external factual knowledge from gene ontology into protein language models.
+We present protein pretraining with gene ontology embedding (OntoProtein), which is the first general framework to integrate external knowledge graphs into protein pre-training. 
+Experimental results on widespread protein tasks demonstrate that efficient knowledge injection helps understand and uncover the grammar of life.
+Besides, OntoProtein is compatible with the model parameters of lots of pre-trained protein language models, which means that users can directly adopt the available pre-trained parameters on OntoProtein without modifying the architecture. 
+These positive results point to future work in 
+(1) improving OntoProtein by injecting more informative knowledge with gene ontology selection; (2) extending this approach to sequence generating tasks for protein design.
+
+\section*{Acknowledgments}
+We  want to express gratitude to the anonymous reviewers for their hard work and kind comments. This work is funded by NSFCU19B2027/NSFC91846204, National Key R\&D Program of China (Funding No.SQ2018YFC000004), Zhejiang Provincial Natural Science Foundation of China (No. LGG22F030011), Ningbo Natural Science Foundation (2021J190), and Yongjiang Talent Introduction Programme (2021A-156-G). 
+
+\section*{Reproducibility Statement}
+Our code and datasets are all available in the \url{https://github.com/zjunlp/OntoProtein} for reproducibility.
+Hyper-parameters are provided in the Appendix \ref{apendix:hypter-parameters}.
+
+\end{document}

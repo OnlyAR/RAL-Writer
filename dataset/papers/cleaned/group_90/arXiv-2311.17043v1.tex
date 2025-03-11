@@ -1,0 +1,539 @@
+\title{LLaMA-VID: An Image is Worth 2 Tokens in Large Language Models}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+In this work, we present a novel method to tackle the token generation challenge in Vision Language Models (VLMs) for video and image understanding, called LLaMA-VID. 
+Current VLMs, while proficient in tasks like image captioning and visual question answering, face computational burdens when processing long videos due to the excessive visual tokens. 
+LLaMA-VID addresses this issue by representing each frame with two distinct tokens, namely context token and content token. 
+The context token encodes the overall image context based on user input, whereas the content token encapsulates visual cues in each frame. 
+This dual-token strategy significantly reduces the overload of long videos while preserving critical information. 
+Generally, LLaMA-VID empowers existing frameworks to support hour-long videos and pushes their upper limit with an extra context token. 
+It is proved to surpass previous methods on most of video- or image-based benchmarks. 
+Code is available at~\href{https://github.com/dvlab-research/LLaMA-VID}{https://github.com/dvlab-research/LLaMA-VID}.
+
+\end{abstract}
+
+\section{Introduction}
+Large Language Models (LLMs)~\cite{ChatGPT,zhang2022opt,llama}, through their capacity to generate contextually accurate responses, have significantly advanced the field of AI.
+Drawing from the strengths of LLMs, Vision Language Models (VLMs)~\cite{instructblip,llava,GPT4} have been developed to extend these capabilities to visual data, demonstrating their adeptness in tasks like image captioning and visual question answering. 
+However, a substantial challenge emerges in the context of long video, where an excessive number of tokens are required to represent consecutive frames. 
+The computational demands escalate with the video length, thereby constraining the practical application of VLMs for extensive videos.
+
+Recently, several approaches have been proposed to handle videos, moving beyond image-only VLMs.
+These methods aim to alleviate the token issue by utilizing representative queries~\cite{videochat,videollama} or applying temporal compression~\cite{videochatgpt,luo2023valley}.
+Despite these efforts, the challenge of long videos remains unresolved. 
+The primary obstacle stems from the excessive number of tokens required for each video frame. 
+For instance, models like BLIP~\cite{blip2,instructblip} and LLaVA~\cite{llava} require 32 and over 256 tokens respectively for a single image. 
+A video containing 10K frames would thus necessitate over 320K tokens, exceeding the capacity of current VLMs. 
+Furthermore, simple temporal compression can significantly damage the representation over long-term intervals. 
+This drawback hampers their performance, thereby underscoring the need for a robust solution.
+
+\begin{figure}[t!]
+\centering
+\includegraphics[width=0.89\linewidth]{Figure/intro.pdf} 
+\caption{
+The proposed LLaMA-VID achieves leading performance on most of benchmarks with 7B LLMs. The video-based and image-based benchmarks are noted in \textcolor{blue}{blue} and \textcolor{purple}{purple} color, respectively.
+Please refer to Tables~\ref{tab:main_video},~\ref{tab:main_video_gen}, and~\ref{tab:main_img} for more details.
+}
+\label{fig:intro}
+\end{figure}
+
+In this work, we present LLaMA-VID, a novel approach to effectively manage the token generation issue in long videos. 
+Our core idea is to represent each video frame with two distinct tokens: {\em context token} and {\em content token}. 
+The context token is designed to encode the overall context of the image based on user input, which efficiently condenses the broader picture into {\em a single token}. 
+Simultaneously, the content token captures finer aspects of each frame. 
+According to computational constraints, the length of content token can be extended to include more details, {\em e.g.}, 1 token/frame for video input and beyond 256 token/frame for single image. 
+In this way, the overload of long videos can be significantly reduced without sacrificing critical information.
+
+In particular, our method employs a dual-token generation strategy that is both efficient and effective. 
+For each frame, we first extract image features using a pre-trained vision transformer~\cite{vit}, akin to other VLMs~\cite{instructblip,llava}. 
+The key question is how to generate the context-related token according to user instructions.
+We provide the solution by leveraging the cross-modality design~\cite{devlin2018bert,blip2} for instruction-guided queries, which carry the interactive intention from users.
+For {\em context token}, these queries interact with previously generated image features in the designed attention module, termed as context attention.
+To generate {\em content token}, the image features are average pooled to formulate tokens that adapt to different settings.
+For instance, global pooling is adopted to maintain efficiency for video input while details are preserved with more tokens for single image input. 
+The context and content tokens are subsequently projected to the space of LLMs with simple linear layers for final prediction.
+Furthermore, to better support hour-long videos in VLMs, we construct an instruction-based dataset that contains 9K movie-level conversations for plot reasoning and detail understanding.
+
+Generally, LLaMA-VID can be distinguished from two aspects.
+On one hand, with the dual-token paradigm, each frame can be efficiently encoded with only two tokens, which empowers existing LLMs to support long videos.
+On the other hand, the context token aggregates the most informative feature of each image, which further extends the upper limit of VLMs with an extra token. 
+
+The overall framework, dubbed LLaMA-VID, can be easily instantiated with various decoders and LLMs, as elaborated in Section~\ref{sec:method}.
+Extensive empirical studies are conducted in Section~\ref{sec:experiment} to reveal the effectiveness of each component.
+Remarkably, our model can complete training within 2 days on a single machine with 8$\times$A100 GPUs, and it outperforms previous leading methods on most of video- and image-based benchmarks, as shown in Figure~\ref{fig:intro}.
+
+\section{Related Work}~\label{sec:related}
+In this section, we first review large language models and delve into recent advances in vision language models.
+\subsection{Large Language Models}
+The field of Natural Language Processing (NLP) has witnessed tremendous advancements with the evolution of LLMs.
+Transformer~\cite{vaswani2017attention} marked a pivotal milestone, with subsequent language models~\cite{devlin2018bert,liu2019roberta,zhang2022opt} demonstrating remarkable capabilities.
+GPT~\cite{brown2020language} revolutionized this field by utilizing generative pre-trained transformers for auto-regressive prediction, which is proved to be a potent language modeling paradigm. 
+Recent groundbreaking works, such as ChatGPT~\cite{ChatGPT}, GPT-4~\cite{GPT4}, and LLaMA~\cite{llama}, have pushed the boundaries even further. 
+Trained on vast amounts of text data, these models exhibit exceptional capabilities in complex linguistic tasks.
+To leverage the potential of pre-trained LLMs, instruction tuning~\cite{wei2021finetuned,ouyang2022training} is a crucial component for high-quality output.
+This strategy is widely adopted in open-source models like Alpaca~\cite{alpaca} and Vicuna~\cite{vicuna}, which improve over LLaMA~\cite{llama} using specially designed instruction pairs. 
+There are also researches~\cite{visualchatgpt,gpt4tools} that utilize the reasoning ability of LLMs and invoke pre-defined tools for visual applications.
+Different from them, we collect multi-modality instruction data that contains text, images, and videos in this work, which is employed to empower LLMs for long video processing.
+
+\subsection{Vision Language Models}
+The advancements in computer vision and NLP have led to the emergence of vision-language models (VLMs) that integrate vision models with language models for cross-modality understanding~\cite{cococap,msrvtt} and reasoning~\cite{vqav2,scienceqa,lai2023lisa}.
+Pioneering large-scale VLMs like CLIP~\cite{CLIP} and ALIGN~\cite{ALIGN} have extended language models to vision-language tasks. 
+The recent progress has seen an increasing focus on leveraging the power of LLMs.
+Notably, Flamingo~\cite{flamingo} and BLIP-2~\cite{blip2} utilize web-scale image-text pairs for cross-modality alignment, thereby enhancing learning performance.
+To further exploit the potential of such pre-trained models, InstructBLIP~\cite{instructblip} and MiniGPT-4~\cite{minigpt4} construct high-quality instruction pairs based on BLIP-2 and achieve superior results. 
+Simultaneously, LLaVA~\cite{llava} employs a simple linear projector with a few learnable parameters to align the image and text space of LLaMA.
+Given the tailored instruction data, this straightforward approach demonstrates strong capabilities.
+To support video understanding in LLMs, Video-LLaMA~\cite{videollama} and VideoChat~\cite{videochat} attempt to utilize BLIP-2 for video embedding extraction, while Video-ChatGPT~\cite{videochatgpt} proposes spatial and temporal pooling for video features.
+However, given the substantial number of tokens required for each frame, LLMs encounter significant challenges when processing extensive video sequences. 
+It prevents previous work from representing long video sequences that exceed a duration of one hour in LLMs.
+To solve the issue, we propose to efficiently encode each frame with only 2 tokens, which supports long video understanding in existing LLMs.
+
+\begin{figure*}[t!]
+\centering
+\includegraphics[width=0.98\linewidth]{Figure/main.pdf} 
+\caption{
+The framework of LLaMA-VID.
+With user directive, LLaMA-VID operates by taking either a {\em single image} or {\em video frames} as input, and generates responses from LLM.
+The process initiates with a visual encoder that transforms input frames into the visual embedding.
+Then, the text decoder produces text queries based on the user input.
+In context attention, the text query aggregates text-related visual cues from the visual embedding.
+For efficiency, an option is provided to downsample the visual embedding to various token sizes, or even to a single token.
+The text-guided {\em context token} and the visually-enriched {\em content token} are then formulated using a linear projector to represent each frame at time $t$.
+Finally, the LLM takes the user directive and all visual tokens as input and gives responses.
+}
+\label{fig:main}
+\end{figure*}
+
+\section{LLaMA-VID}~\label{sec:method}
+The framework of LLaMA-VID is conceptually simple: encoder and decoder are adopted to produce visual embedding and text-guided features, respectively; 
+context token and content token are transformed with the tailored token generation strategy; 
+instruction tuning is designed to unleash the potential of LLMs for image and video.
+
+\subsection{Encoder and Decoder}~\label{sec:sub_encoder}
+The proposed LLaMA-VID can be utilized to interact with single image or long videos.
+For clarity, we assume the input image is captured from a video sequence, as presented in Figure~\ref{fig:main}.
+Given a video frame ${\mathbf V}_t\in\mathbb{R}^{H\times W\times 3}$ at time $t$, a transformer-based visual encoder is first employed to produce the visual embedding  ${\mathbf X}_t\in\mathbb{R}^{N\times C}$. Here, $N=H/p\times W/p$ and $C$ indicate the number of image patches and embedding channels, respectively.
+The patch size $p$ is typically set to 14 for ViT-based backbones~\cite{vit,CLIP,evaclip}.
+Meanwhile, we take the user instruction as input and generate the text-guided query ${\mathbf Q}_t\in\mathbb{R}^{M\times C}$ with the produced ${\mathbf X}_t$, where $M$ denotes the number of queries.
+As depicted in Figure~\ref{fig:main}, this cross-modality interaction predominantly occurs in the text decoder, which can be easily instantiated with BERT~\cite{devlin2018bert} or QFormer~\cite{instructblip}, as compared in Table~\ref{tab:abla_text_vis}.
+In this way, the text query ${\mathbf Q}_t$ contains highlighted visual cues that are most related to the user instruction.
+
+\subsection{Token Generation}~\label{sec:sub_token}
+With the text query ${\mathbf Q}_t$ and visual embedding ${\mathbf X}_t$, we can easily generate representative tokens for LLMs.
+Specifically, context attention is designed to aggregate text-related visual features and condense them to a single context token.
+As shown in Figure~\ref{fig:main}, it takes ${\mathbf Q}_t$ and ${\mathbf X}_t$ as input and formulates the context-related embedding ${\mathbf E}_t\in\mathbb{R}^{1\times C}$ as
+
+\begin{algorithm}[t!]
+\caption{Pseudo Code for Token Generation.}
+\label{algo:code}
+\algcomment{\fontsize{7.2pt}{0em}\selectfont \texttt{F}: torch.nn.functional; \texttt{ctxproj}, \texttt{visproj}: predefined linear projectors.
+}
+\definecolor{codeblue}{rgb}{0.25,0.5,0.5}
+\lstset{
+  backgroundcolor=\color{white},
+  basicstyle=\fontsize{7.2pt}{7.2pt}\ttfamily\selectfont,
+  columns=fullflexible,
+  breaklines=true,
+  captionpos=b,
+  commentstyle=\fontsize{7.2pt}{7.2pt}\color{codeblue},
+  keywordstyle=\fontsize{7.2pt}{7.2pt},
+}
+\begin{lstlisting}[language=python]
+# B: batch size; C: channel size; n: content shape
+# M: query length; N: shape of flatten image pacthes; 
+# text_q: text query in shape (B, M, C)
+# vis_embed: visual embedding in shape (B, N, C)
+
+# Key part 1: calculate context-related embedding
+ctx_embed = text_q @ vis_embed.transpose(-1,-2)
+ctx_embed = ctx_embed / (vis_embed.shape[-1]**0.5)
+ctx_embed = (ctx_embed.softmax(-1)@vis_embed).mean(1)
+ctx_embed = self.ctxproj(ctx_embed[:,None])
+
+# Key part 2: calculate visual embedding
+cur_shape = int(vis_embed.shape[1]**0.5)
+vis_embed = vis_embed.reshape(B, cur_shape, -1, C)
+vis_embed = F.avg_pool2d(vis_embed.permute(0,3,1,2), kernel_size=cur_shape//n, stride=cur_shape//n)
+vis_embed = vis_embed.permute(0,2,3,1).flatten(1,2)
+vis_embed = self.visproj(vis_embed)
+
+# concat token in shape (B, n+1, C), n in [1,N]
+final_token = torch.cat([ctx_embed, vis_embed], dim=1)
+\end{lstlisting}
+\end{algorithm}
+
+\begin{equation}\label{equ:context_att}
+{\mathbf E}_t = {\mathrm {Mean}}({\mathrm {Softmax}}({\mathbf Q}_t \times {\mathbf X}^{\mathsf{T}}_t) \times {\mathbf X}_t),
+\end{equation}
+where the $\mathrm {Softmax}$ function and $\mathrm {Mean}$ operation are conducted along the $N$ and $M$ dimensions, respectively.
+Unlike QFormer~\cite{instructblip} that adopts 32 visual queries as LLMs tokens, we only utilize the text query ${\mathbf Q}_t$ to aggregate the visual features with high-response scores to input instructions.
+As a result, the most crucial visual cues related to user input are efficiently preserved in the condensed embedding ${\mathbf E}_t$. 
+The effectiveness of this context-related token generation is demonstrated in Table~\ref{tab:abla_token_type} and Figure~\ref{fig:heatmap}.
+Subsequently, a linear projector is utilized to transform the embedding ${\mathbf E}_t$ into the context token ${\mathbf E}^{T}_t \in\mathbb{R}^{1\times C}$, which aligns with the language space of LLMs. 
+Meanwhile, we employ an adaptive pooling strategy for the visual embedding according to computational constraints to produce the content token ${\mathbf E}^{V}_t \in\mathbb{R}^{n\times C}$, where $n\in[1,N]$.
+For instance, we maintain the original resolution of visual embedding ${\mathbf X}_t$ when input single image, while we downsample ${\mathbf X}_t$ to 1 token for long videos. 
+This approach significantly reduces the overload of LLMs for each frame, thereby supporting hour-long videos effectively.
+Finally, the generated context token ${\mathbf E}^{T}_t$ and the content token ${\mathbf E}^{V}_t$ are concatenated to represent the frame at time $t$. Along with frames at other timestamps, the entire video sequence is translated into the language space in token format, which is then used to generate responses from LLMs. 
+The whole process is summarized in Algorithm~\ref{algo:code}.
+
+\begin{figure}[t!]
+\centering
+\includegraphics[width=\linewidth]{Figure/data.pdf} 
+\caption{
+Multimodal data distribution and instruction format for model training in each stage.
+$\texttt{<image>}$ and $\texttt{<image-i>}$ denote the token for single image and the $i$-th video frame, respectively.
+}
+\label{fig:data}
+\end{figure}
+
+\subsection{Training Strategy}~\label{sec:sub_train}
+Training strategy, particularly instruction tuning, has proven to be crucial in LLMs~\cite{llama,alpaca,vicuna} and VLMs~\cite{instructblip,llava,llava1.5}.
+Considering training efficiency, in this work, we divide the training procedure into three stages, {\em i.e.}, modality alignment, instruction tuning, and long video tuning.
+
+\begin{figure}[t!]
+\centering
+\includegraphics[width=\linewidth]{Figure/long_movie.pdf} 
+\caption{
+An example to construct instruction pairs for the movie Titanic.
+Given the movie synopsis and script, we utilize the developed LLMs like GPT-4~\cite{GPT4} and Claude-2~\cite{Claude2} to generate movie summaries, plot-related QA pairs, and general reasoning QA pairs.
+}
+\label{fig:long_movie}
+\end{figure}
+
+\vspace{0.5em}
+\noindent
+\textbf{Modality Alignment.} 
+As shown in Figure~\ref{fig:main}, each video frame is projected into the space of LLMs in each forward pass.
+Therefore, it is crucial to ensure visual features are well aligned with the language space.
+To this end, we construct a compact dataset that contains 790K high-quality image- and video-caption pairs.
+As illustrated in Figure~\ref{fig:data}, it mainly consists of 558K image-caption pairs from the LLaVA-filtered CC3M dataset~\cite{cc3m} and 232K video-caption pairs sampled from the WebVid 2.5M dataset~\cite{webvid}.
+The instruction format for each modality is presented in Figure~\ref{fig:data}.
+In this stage, we primarily optimize the context attention and projectors in Figure~\ref{fig:main}, while freezing the pre-trained modules like the visual encoder and text decoder.
+
+\vspace{0.5em}
+\noindent
+\textbf{Instruction Tuning.} 
+To enhance the multi-modality understanding of LLMs, we build the instruction pairs from~\cite{llava1.5} and~\cite{videochatgpt}.
+In particular, the constructed dataset mainly involves content from three sources, {\em i.e.}, 40K text conversations from ShareGPT~\cite{ShareGPT}, 625K single- or multi-turn visual QA pairs from~\cite{llava,vqav2,gqa,okvqa,ocrvqa,aokvqa,textcaps,referitgame,refcoco,vg}, and 98K video QA pairs from~\cite{activitynet}.
+For the instruction, we adopt different formats for text, image, and video input, as illustrated in Figure~\ref{fig:data}.
+And the input prompt $\texttt{<prompt>}$ and answer $\texttt{<answer>}$ vary with datasets.
+Please refer to~\cite{llava1.5} and~\cite{videochatgpt} for more details.
+Meanwhile, the image token $\texttt{<image-i>}$ is randomly inserted at the beginning or end of the user input during our training.
+In instruction tuning, all the modules are optimized except the frozen visual encoder.
+
+\begin{table*}[t!]
+
+ \centering
+\begin{tabular}{llc|ccccccccccc}
+  \toprule
+  \multirow{2}{*}{Method} & \multirow{2}{*}{LLM} & \multirow{2}{*}{Res.} & \multicolumn{2}{c}{\bf MSVD-QA} & & \multicolumn{2}{c}{\bf MSRVTT-QA} & & \multicolumn{2}{c}{\bf ActivityNet-QA} \\ \cline{4-5} \cline{7-8} \cline{10-11}
+  & & & Acc & Score & & Acc & Score & & Acc & Score \\
+  \midrule
+  FrozenBiLM~\cite{frozenbilm} & DeBERTa-V2 & 224 & 32.2 & -- & & 16.8 & -- & & 24.7 & -- \\
+  VideoLLaMA~\cite{videollama} & Vicuna-7B & 224 & 51.6 & 2.5 & & 29.6 & 1.8 & & 12.4 & 1.1 \\
+  LLaMA-Adapter~\cite{llamaadapter} & LLaMA-7B & 224 & 54.9 & 3.1 & & 43.8 & 2.7 & & 34.2 & 2.7 \\
+  VideoChat~\cite{videochat} & Vicuna-7B & 224 & 56.3 & 2.8 & & 45.0 & 2.5 & & 26.5 & 2.2 \\
+  Video-ChatGPT~\cite{videochatgpt} & Vicuna-7B & 224 & 64.9 & \underline{3.3} & & 49.3 & 2.8 & & 35.2 & 2.7 \\
+  BT-Adapter~\cite{btadapter} & Vicuna-7B & -- & 67.5 & {\bf 3.7} & & 57.0 & \underline{3.2} & & 45.7 & \underline{3.2} \\
+  \midrule
+  \rowcolor{mygray}
+  {\bf LLaMA-VID} & Vicuna-7B & 224 & \underline{69.7} & {\bf 3.7} & & \underline{57.7} & \underline{3.2} & & \underline{47.4} & {\bf 3.3} \\
+  \rowcolor{mygray}
+  {\bf LLaMA-VID} & Vicuna-13B & 224 & {\bf 70.0} & {\bf 3.7} & & {\bf 58.9} & {\bf 3.3} & & {\bf 47.5} & {\bf 3.3} \\
+  \bottomrule
+\end{tabular}
+ \caption{Comparison with leading methods on 4 zero-shot video QA datasets. 
+ We report results with 2 tokens for each frame.
+ For fair comparisons, our model is trained with data of stage 1 and stage 2 without long video tuning in Figure~\ref{fig:data}.
+ Res indicates image resolution.
+ }
+ \label{tab:main_video}
+\end{table*}
+
+\vspace{0.5em}
+\noindent
+\textbf{Long Video Tuning.} 
+To further unleash the potential for hour-long videos, we construct 15K long QA pairs, including 9K conversions in movie scenes and 6K data sampled from LongLoRA~\cite{longlora} for token expanding.
+Specifically, we utilize more than 400 long movies and corresponding scripts in MovieNet~\cite{movienet} to build the training set.
+The key components for instruction generation are visualized in Figure~\ref{fig:long_movie}.
+Generally, the generated dataset includes QA pairs from three aspects: video summary, movie plot, and detail reasoning. 
+For video summaries, we collect movie synopses to produce brief and detailed summaries for each movie using developed LLMs like GPT-4~\cite{GPT4}. 
+It brings about 1K summary-level instruction pairs in total.
+For plot-level data, we take the entire movie synopsis as input and leverage GPT-4~\cite{GPT4} to generate plot-related and character-related QA pairs.
+These include plot understanding, description, analysis, character relationship, personality, and behavior. 
+In particular, we generate 5 plot-related pairs and 5 character-related pairs for each movie, resulting in 4K plot-level QA data.
+As for detail-level data, we feed the long movie script into Claude-2~\cite{Claude2} and generate 5 plot-related reasoning pairs and 5 detail-related descriptions for each movie, which brings 4K pairs in total.
+With long videos and the generated pairs, we perform instruction tuning by concatenating visual tokens and subtitle tokens for each frame, as depicted in Figure~\ref{fig:data}.
+In this way, LLaMA-VID can well support 64K tokens with more than 3-hour video as input.
+Please refer to {\em supplementary material} for more details.
+
+\begin{table*}[t!]
+ \centering
+\begin{tabular}{llc|ccccc}
+  \toprule
+  Method & LLM & Res. & {\bf Correctness} & {\bf Detail} & {\bf Context} & {\bf Temporal} & {\bf Consistency} \\
+  \midrule
+  VideoLLaMA~\cite{videollama} & Vicuna-7B & 224 & 1.96 & 2.18 & 2.16 & 1.82 & 1.79 \\
+  LLaMA-Adapter~\cite{llamaadapter} & LLaMA-7B & 224 & 2.03 & 2.32 & 2.30 & 1.98 & 2.15 \\
+  VideoChat~\cite{videochat} & Vicuna-7B & 224 & 2.23 & 2.50 & 2.53 & 1.94 & 2.24 \\
+  Video-ChatGPT~\cite{videochatgpt} & Vicuna-7B & 224 & 2.40 & 2.52 & 2.62 & 1.98 & 2.37 \\
+  BT-Adapter~\cite{btadapter} & Vicuna-7B & -- & 2.68 & 2.69 & 3.27 & 2.34 & 2.46 \\
+  \midrule
+  \rowcolor{mygray}
+  {\bf LLaMA-VID} & Vicuna-7B & 224 & \underline{2.96} & \underline{3.00} & \underline{3.53} & \underline{2.46} & \underline{2.51} \\
+  \rowcolor{mygray}
+  {\bf LLaMA-VID} & Vicuna-13B & 224 & {\bf 3.07} & {\bf 3.05} & {\bf 3.60} & {\bf 2.58} & {\bf 2.63} \\
+  \bottomrule
+\end{tabular}
+ 
+ \caption{Comparison with leading methods on the video-based generative performance benchmark~\cite{videochatgpt}.
+We report results with 2 tokens for each frame.
+For fair comparisons, our model is trained with data of stage 1 and stage 2 without long video tuning in Figure~\ref{fig:data}.
+Res indicates image resolution.
+{\em Correctness}, {\em Detail}, {\em Context}, {\em Temporal}, and {\em Consistency} indicate the evaluation metric of Correctness of Information, Detail Orientation, Contextual Understanding, Temporal Understanding, and Consistency, respectively.
+ }
+ \label{tab:main_video_gen}
+\end{table*}
+
+\begin{table*}[t!]
+\centering
+\scalebox{1.0}{
+\begin{tabular}{l l p{5mm} | p{8mm}P{10mm}P{8mm}P{8mm}P{8mm}P{8mm}P{8mm}p{8mm} }
+\toprule
+Method & LLM & Res. & {\bf GQA} & {\bf MMB} & {\bf MME} & {\bf POPE} & {\bf SEED} & {\bf SQA}$^\text{I}$ & {\bf VizWiz} & {\bf VQA}$^\text{v2}$ \\
+\midrule
+InstructBLIP~\cite{instructblip} & Vicuna-7B & 224 & 49.2 & 36.0 & -- & -- & 53.4 & 60.5 & 34.5 & -- \\
+IDEFICS-9B~\cite{IDEFICS} & LLaMA-7B & 224 & 38.4 & 48.2 & -- & -- & -- & -- & 35.5 & 50.9 \\
+Qwen-VL$^\dagger$~\cite{bai2023qwen} & Qwen-7B & 448 & 59.3* & 38.2 & -- & -- & 56.3 & 67.1 & 35.2 & 78.8* \\
+Qwen-VL-Chat$^\dagger$~\cite{bai2023qwen} & Qwen-7B & 448 & 57.5* &  60.6 & 1487.5 & -- & 58.2 & 68.2 & 38.9 & 78.2* \\
+LLaVA-1.5~\cite{llava1.5} & Vicuna-7B & 336 & \underline{62.0}* & \underline{64.3} & \underline{1510.7} & \underline{85.9} &  \underline{58.6} & \underline{66.8} & \underline{50.0} & \underline{78.5}* \\
+\midrule
+\rowcolor{mygray}
+{\bf LLaMA-VID} & Vicuna-7B & 336 & {\bf 64.3}* & {\bf 65.1} & {\bf 1521.4} & {\bf 86.0} & {\bf 59.9} & {\bf 68.3} & {\bf 54.2} & {\bf 79.3}* \\
+\midrule
+BLIP-2~\cite{blip2} & Vicuna-13B & 224 & 41.0 & -- & 1293.8 & 85.3 & 46.4 & 61.0 & 19.6 & 41.0 \\
+InstructBLIP~\cite{instructblip} & Vicuna-13B & 224 & 49.5 & -- & 1212.8 & 78.9 & -- & 63.1 & 33.4 & -- \\
+Shikra~\cite{chen2023shikra} & Vicuna-13B & 224 & -- & 58.8 & -- & -- & -- & -- & -- & \underline{77.4}* \\
+IDEFICS-80B~\cite{IDEFICS} & LLaMA-65B & 224 & 45.2 & 54.5 & -- & -- & -- & -- & 36.0 & 60.0 \\
+LLaVA-1.5~\cite{llava1.5} & Vicuna-13B & 336 & \underline{63.3}* & {\bf 67.7} & \underline{1531.3} & \underline{85.9} & \underline{61.6} & {\bf 71.6} & \underline{53.6} & {\bf 80.0}* \\
+\midrule
+\rowcolor{mygray}
+{\bf LLaMA-VID} & Vicuna-13B & 336 & {\bf 65.0}* & \underline{66.6} & {\bf 1542.3} & {\bf 86.0} & {\bf 62.3} & \underline{70.0} & {\bf 54.3} & {\bf 80.0}* \\
+\bottomrule
+\end{tabular}
+}
+\caption{Comparison with leading methods on 8 benchmarks. 
+Here, we use the same training and instruction finetuning data as that in LLaVA-1.5.
+We report results with 1 context token and $n$ content tokens, where $n$ is kept the same with that in LLaVA-1.5, {\em i.e.}, $n=(336/14)^2=576$.
+For fair comparisons, our model is trained without video data of stage 1 and stage 2 in Figure~\ref{fig:data}.
+Res indicates input image resolution.
+$^*$ and $^\dagger$ denote the {\em train} subset is included for training and the data is not publicly available, respectively.}
+\label{tab:main_img}
+\end{table*}
+
+\section{Experiments}~\label{sec:experiment}
+In this section, we provide the experimental setup and comparisons with leading methods on several benchmarks.
+More details are attached in {\em supplementary material}.
+
+\subsection{Experimental Setup}
+\noindent
+\textbf{Implementation Details.}
+In this work, we instantiate the model with the pre-trained EVA-G~\cite{evaclip} for visual encoder and QFormer~\cite{instructblip} for text decoder by default.
+During training, we keep the visual encoder fixed in all stages and freeze the text decoder, as well as the LLM, in the modality alignment stage, except for the BERT module in Table~\ref{tab:abla_text_vis} that is not pre-trained.
+Following the strategy in~\cite{llava1.5}, we optimize trainable parameters with the designed data and instructions in Figure~\ref{fig:data}, running for 1 epoch in each stage.
+For video input, we extract frames at a speed of 1 FPS.
+All models are trained using 8$\times$NVIDIA A100 GPUs.
+Additional hyperparameters are provided in the {\em supplementary material}.
+
+\vspace{1.0em}
+\noindent
+\textbf{Datasets.}
+In this study, we construct the training set mainly from~\cite{llava1.5,webvid,videochatgpt,movienet}, as illustrated in Section~\ref{sec:sub_train}.
+Moreover, we report results on several video- and image-based benchmarks.
+In particular, for video input, we evaluate the zero-shot performance on the open-ended QA benchmarks like MSVD~\cite{msvd}, MSRVTT~\cite{msrvtt}, ActivityNet~\cite{activitynet}, and the newly-proposed generative performance benchmark~\cite{videochatgpt}.
+As for image-based evaluation, we conduct experiments on several widely-adopted benchmarks, including GQA~\cite{gqa}, MMB (MMBench)~\cite{mmbench}, MME~\cite{mme}, POPE~\cite{pope}, SEED~\cite{seed}, SQA$^\text{I}$ (Image-based setting in ScienceQA)~\cite{scienceqa}, VQA$^\text{T}$ (TextVQA)~\cite{textvqa}, VizWiz~\cite{vizwiz}, and VQA$^\text{v2}$ (VQA V2)~\cite{vqav2}.
+
+\begin{figure*}[t!]
+\centering
+\includegraphics[width=\linewidth]{Figure/demo.pdf} 
+\caption{
+Examples of LLaMA-VID with single image, short video, and hour-long video using Vicuna-7B based models.
+}
+\label{fig:demo}
+\end{figure*}
+
+\subsection{Main Results}
+\noindent
+\textbf{Results on Video-based Benchmarks.}
+In Table~\ref{tab:main_video}, we provide a comparative evaluation of LLaMA-VID against various state-of-the-art methods across three zero-shot video QA benchmarks: MSVD-QA~\cite{msvd}, MSRVTT-QA~\cite{msrvtt}, and ActivityNet-QA~\cite{activitynet}.
+Notably, the results are reported with only two tokens for each frame.
+It is evident that LLaMA-VID, employing Vicuna-7B and Vicuna-13B as the LLMs, consistently delivers superior performance across all datasets. 
+On the MSVD-QA and MSRVTT-QA datasets, it achieves the accuracy of 69.7\% and 57.7\% with Vicuna-7B, surpassing the previous leading approach~\cite{btadapter} with absolute gains of 2.2\% and 0.7\%, respectively.
+As for the ActivityNet-QA dataset, LLaMA-VID attains top performance in accuracy and the highest score of 3.3.
+In Table~\ref{tab:main_video_gen}, we also carry out experiments on the newly proposed video-based generative performance benchmark~\cite{videochatgpt}.
+Our LLaMA-VID is validated to achieve the best performance across all the evaluation metrics, surpassing previous approaches by a large margin.
+And we find that the performance can be further improved as the LLMs scale up.
+In general, LLaMA-VID is demonstrated to bring robust performance on all benchmarks, validating its effectiveness and efficiency for video processing.
+
+\vspace{1.0em}
+\noindent
+\textbf{Results on Image-based Benchmarks.}
+As illustrated in Section~\ref{sec:sub_token}, LLaMA-VID not only efficiently represents long video, but also expands the upper limit of VLMs with an additional context token.
+In Table~\ref{tab:main_img}, we perform comparisons with leading VLMs on 8 widely-adopted benchmarks.
+It should be noted that we maintain the same training data and image resolution as in LLaVA-1.5~\cite{llava1.5} for fair comparisons.
+It is evident that LLaMA-VID outperforms other leading methods across most of benchmarks with different LLMs.
+In particular, with Vicuna-7B as the LLM, LLaMA-VID attains the best results across all the datasets and surpasses LLaVA-1.5 with significant gains in GQA, MME, and VizWiz, where the improvement reaches up to 2.3\%, 10.7, and 4.2\%, respectively.
+With a larger Vicuna-13B as the LLM, LLaMA-VID also outperforms other methods in 6 benchmarks and achieves top-2 in the other datasets.
+This demonstrates the generality of the proposed LLaMA-VID, which can be scaled up with a stronger foundation model.
+In summary, LLaMA-VID is proven to push the upper bound of VLMs, especially in efficient settings.
+
+\noindent
+\textbf{Qualitative Results.}
+In Figure~\ref{fig:demo}, we apply LLaMA-VID to different types of data, including single images, short videos, and long movies.
+We represent each image with 577 tokens for single images and 2 tokens for videos.
+LLaMA-VID demonstrates various capabilities with different inputs.
+Specifically, for single images, it focuses on details and accurately recognizes the character without any text clues.
+Moreover, it can also connect the image content to the plot of the game in multi-turn conversations.
+Given a short trailer video, LLaMA-VID summarizes the overall plot and infers the movie name, producer, and the type of movie. 
+As for a 3-hour movie, the proposed model adeptly describes the storyline and demonstrates plot-related reasoning and detailed understanding.
+
+\subsection{Component-wise Analysis}~\label{sec:exp_abla}
+In this subsection, we conduct ablation studies with input resolution 224 and 2 tokens for each image by default.
+Here, we mainly perform experiments on image-based settings to investigate the effectiveness of each component.
+
+\vspace{1.0em}
+\noindent
+\textbf{Generated Token Types.}
+As illustrated in Figure~\ref{fig:main}, each image is represented with a context token and a content token in LLMs.
+To validate the effectiveness of each part, we conduct experiments with different types of tokens in Table~\ref{tab:abla_token_type}. 
+Without the context token, the compressed content token, which encodes each image with 1 token, cannot adjust to input instructions, leading to subpar performance.
+Compared with a single content token, the instruction-guided context token results in significant gains across all datasets with only 1 token.
+With both tokens for each image, the model achieves the best performance across all benchmarks.
+It shows that both instruction cues in the context token and the image content itself in the content token are important.
+
+\begin{table}[t]
+ \centering
+ \resizebox{0.49\textwidth}{12mm}{
+\begin{tabular}{cc|cccc}
+  \toprule
+  {\em context} & {\em content} & {\bf GQA} & {\bf POPE} & {\bf SQA$^\text{I}$} & {\bf VQA$^\text{T}$}  \\
+  \midrule
+  \xmark & \cmark & 53.3 & 80.9 & 66.1 & 46.5 \\
+  \cmark & \xmark & 54.3 & 82.4 & 67.7 & 48.3 \\
+  \rowcolor{mygray}
+  \cmark & \cmark & {\bf 55.5} & {\bf 83.1} & {\bf 68.8} & {\bf 49.0} \\
+  \bottomrule
+\end{tabular}
+}
+ \caption{Comparison with different token types.
+We report results with 1 {\em context} token (if exists) and 1 {\em content} token.
+ }
+ \label{tab:abla_token_type}
+\end{table}
+
+\vspace{1.0em}
+\noindent
+\textbf{Generated Token Numbers.}
+In Table~\ref{tab:abla_token_num}, we conduct experiments with different numbers of tokens for further investigation.
+With an image size 224$\times$224, we set up experiments with $n$ content tokens, where $n=(224/14)^2=256$ for uncompressed settings in the first two rows.
+The results clearly show that the context token consistently improves performance across different benchmarks with only 1 extra token.
+When we compress the content token to $1/4$ with $n=64$, the performance drops about 1\% to 2\% but increases 1\% in SQA$^\text{I}$. 
+Considering the extra efficient setting for hour-long videos, we compress the content token to $1/256$ with $n=1$ by default.
+Compared to the original setting without context token, we can reduce the computational cost to $1/128$ with about 2\%-6\% performance drop, which is generally acceptable.
+The linear increase in performance presents significant potential for token compression.
+For instance, we can dynamically compress the content token to different numbers according to resource budget and content importance.
+Interestingly, the model achieves peak performance in SQA$^\text{I}$ with only 2 tokens.
+This could be attributed to the fact that problems in ScienceQA~\cite{scienceqa} focus more on visual-based reasoning rather than image details.
+As demonstrated in Tables~\ref{tab:main_video} and~\ref{tab:main_video_gen}, with only 2 tokens for each image, LLaMA-VID still outperforms all previous work in different video-based benchmarks.
+This makes it feasible to enable LLMs for hour-long video processing.
+
+\begin{table}[t]
+ \centering
+\begin{tabular}{cc|cccc}
+  \toprule
+  {\em context} & {\em content} & {\bf GQA}  & {\bf POPE} & {\bf SQA$^\text{I}$} & {\bf VQA$^\text{T}$} \\
+  \midrule
+  0 & 256 & 61.9 & 85.5 & 67.5 & 53.0 \\
+  \midrule
+  1 & 256 & {\bf 63.0} & {\bf 86.6} & 67.7 & {\bf 53.8} \\
+  1 & 64 & 60.8 & 85.1 & 68.7 & 52.3 \\
+  1 & 16 & 58.2  & 83.1 & 67.4 & 50.8 \\
+  1 & 4 & 56.2  & 83.5 & 68.7 & 49.1 \\
+  \rowcolor{mygray}
+  1 & 1 & 55.5  & 83.1 & {\bf 68.8} & 49.0 \\
+
+  \bottomrule
+\end{tabular}
+ \caption{Comparison with different token numbers.
+We report results with various numbers of {\em context} token and {\em content} token.
+ }
+ \label{tab:abla_token_num}
+\end{table}
+
+\begin{table}[t]
+ \centering
+\begin{tabular}{c|cccc}
+  \toprule
+  {\em text} & {\bf GQA}  & {\bf POPE} & {\bf SQA$^\text{I}$} & {\bf VQA$^\text{T}$} \\
+  \midrule
+  -- & 53.3  & 80.9 & 66.1 & 46.5 \\
+  BERT & 54.1 & 80.8 & 67.9 & 48.1 \\
+  \rowcolor{mygray}
+  QFormer & {\bf 55.5} & {\bf 83.1} & {\bf 68.8} & {\bf 49.0} \\
+  \bottomrule
+\end{tabular}
+  \caption{Comparison with different text decoders.
+We report results with 1 {\em context} token (if exists) and 1 {\em content} token.
+ }
+ \label{tab:abla_text_vis}
+\end{table}
+
+\vspace{1.0em}
+\noindent
+\textbf{Text Decoder.}
+As depicted in Figure~\ref{fig:main}, the text decoder plays an essential role in producing instruction-guided context cues.
+Here, we further perform comparisons with different text decoders in Table~\ref{tab:abla_text_vis}.
+We mainly instantiate the text decoder with two types of modules, namely BERT~\cite{devlin2018bert} and QFormer~\cite{instructblip}.
+For BERT, we randomly initialize it as a cross-modality decoder and only retain the first two layers.
+As for QFormer, we utilize the pre-trained modules and fix them for modality alignment.
+Even with a simple 2-layer BERT, as shown in Table~\ref{tab:abla_text_vis}, the generated context token achieves significant gains in most of benchmarks.
+This proves the effectiveness of the paradigm for context token generation.
+With a pre-trained text decoder like QFormer, the model can be further enhanced and attains peak performance in all datasets with 2.2\% to 2.7\% significant gain.
+
+\begin{figure}[t!]
+\centering
+\includegraphics[width=\linewidth]{Figure/heatmap.pdf} 
+\caption{
+High response areas with top scores to input question in Equation~\ref{equ:context_att}.
+We present the response of first two queries in ${\mathbf Q}_t$.
+Images are randomly sampled from VQA V2~\cite{vqav2} {\em test-dev} set.
+}
+\label{fig:heatmap}
+\end{figure}
+
+\vspace{1.0em}
+\noindent
+\textbf{Response in Context Attention.}
+To more vividly explore the context attention, we visualize the high response areas with the top 20 scores in Figure~\ref{fig:heatmap}.
+Specifically, we draw the normalized heatmap for the first two queries in ${\mathbf Q}_t$ before applying the $\text{Softmax}$ function, which is used to formulate context token in Equation~\ref{equ:context_att}.
+As shown in Figure~\ref{fig:heatmap}, the text-guided query ${\mathbf Q}_t$ effectively focuses on important areas relevant to the input questions.
+For example, in the second row, when inquiring whether the image depicts a fishing village, the query ${\mathbf Q}_t$ focuses more on buildings along the river and a seagull.
+These are all typical characteristics to distinguish a fishing village in common sense.
+Other examples also confirm that the designed context attention successfully achieves its goal of formulating the context token under instruction guidance.
+More visualizations can be found in the attached {\em supplementary material}.
+
+\section{Conclusion}
+We have introduced LLaMA-VID, a simple yet effective token generation approach for VLMs.
+The central concept behind LLaMA-VID is to represent an image with the context token and the content token.
+In particular, the context token is generated according to input instructions, and the content token is produced based on the image content.
+Depending on the budget, the content token can be compressed to one token or expressed without compression.
+It allows us to represent a single image with preserved details and efficiently encode each video frame with only two tokens.
+Moreover, we have constructed an instruction dataset for hour-long video understanding.
+Our experiments on several video- and image-based benchmarks prove the superiority of our method.
+We hope that LLaMA-VID can serve as a strong benchmark for efficient visual representation.
+
+\end{document}

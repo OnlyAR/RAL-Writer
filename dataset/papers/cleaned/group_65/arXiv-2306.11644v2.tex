@@ -1,0 +1,723 @@
+\title{Textbooks Are All You Need}
+
+\begin{document}
+
+\title{Textbooks Are All You Need}
+
+\author{Suriya Gunasekar
+\and Yi Zhang
+\and Jyoti Aneja
+\and Caio C\'esar Teodoro Mendes\
+\and Allie Del Giorno
+\and Sivakanth Gopi
+\and Mojan Javaheripi
+\and Piero Kauffmann
+\and Gustavo de Rosa
+\and Olli Saarikivi
+\and Adil Salim
+\and Shital Shah
+\and Harkirat Singh Behl
+\and Xin Wang
+\and S\'ebastien Bubeck
+\and Ronen Eldan
+\and Adam Tauman Kalai
+\and Yin Tat Lee
+\and Yuanzhi Li}
+
+\date{Microsoft Research}
+
+\maketitle
+
+\begin{abstract}
+We introduce \textbf{phi-1}, a new large language model for code, with significantly smaller size than competing models: \textbf{phi-1} is a Transformer-based model with $1.3$B parameters, trained for $4$ days on $8$ A100s, using a selection of ``textbook quality" data from the web ($6$B tokens) and synthetically generated textbooks and exercises with GPT-3.5 ($1$B tokens). Despite this small scale, \textbf{phi-1} attains \textbf{pass@1} accuracy $50.6\%$ on HumanEval and $55.5\%$ on MBPP. It also displays surprising emergent properties compared to \textbf{phi-1-base}, our model {\em before} our finetuning stage on a dataset of coding exercises, and \textbf{phi-1-small}, a smaller model with 350M parameters trained with the same pipeline as \textbf{phi-1} that still achieves $45\%$ on HumanEval.
+\end{abstract}
+
+\section{Introduction}
+The art of training large artificial neural networks has made extraordinary progress in the last decade, especially after the discovery of the Transformer architecture \cite{Vas17}, yet the science behind this success remains limited. Amidst a vast and confusing array of results, a semblance of order emerged around the same time as Transformers were introduced, namely that performance improves somewhat predictably as one scales up either the amount of compute or the size of the network \cite{hestness2017deep}, a phenomenon which is now referred to as {\em scaling laws} \cite{kaplan2020scaling}. The subsequent exploration of scale in deep learning was guided by these scaling laws \cite{gpt3}, and discoveries of variants of these laws led to rapid jump in performances \cite{hoffmann2022an}. In this work, following the footsteps of Eldan and Li \cite{eldan2023tinystories}, we explore the improvement that can be obtained along a different axis: the {\em quality} of the data. It has long been known that higher quality data leads to better results, e.g., data cleaning is an important part of modern dataset creation \cite{raffel2020exploring}, and it can yield other side benefits such as somewhat smaller datasets \cite{longpre2023pretrainer, yu2023selective} or allowing for more passes on the data \cite{muennighoff2023scaling}. The recent work of Eldan and Li on TinyStories (a high quality dataset synthetically generated to teach English to neural networks) showed that in fact the effect of high quality data extends well past this: improving data quality can dramatically change the shape of the scaling laws, potentially allowing to match the performance of large-scale models with much leaner training/models. In this work we go beyond the initial foray of Eldan and Li to show that high quality data can even \textbf{improve} the SOTA of large language models (LLMs), while dramatically reducing the dataset size and training compute. Importantly, smaller models requiring less training can significantly reduce the environmental cost of LLMs \cite{bender2021dangers}.
+
+We focus our attention on LLMs trained for code, and specifically writing simple Python functions from their docstrings as in \cite{humaneval}. The evaluation benchmark proposed in the latter work, HumanEval, has been widely adopted for comparing LLMs' performance on code. We demonstrate the power of high quality data in breaking existing scaling laws by training a $1.3$B-parameter model, which we call \textbf{phi-1}, for roughly $8$ passes over $7$B tokens (slightly over $50$B total tokens seen) followed by finetuning on less than 200M tokens. Roughly speaking we pretrain on ``textbook quality'' data, both synthetically generated (with GPT-3.5) and filtered from web sources, and we finetune on ``textbook-exercise-like'' data. Despite being several orders of magnitude smaller than competing models, both in terms of dataset and model size (see Table~\ref{fig:comparison}), we attain $50.6\%$ pass@1 accuracy on HumanEval and 55.5\% pass@1 accuracy on MBPP (Mostly Basic Python Programs), which are one of the best self-reported numbers using only one LLM generation. In Section \ref{sec:training}, we give some details of our training process, and we discuss evidence for the importance of our data selection process in achieving this result. Moreover, despite being trained on \textbf{much fewer tokens} compared to existing models, \textbf{phi-1} still displays emergent properties. In Section \ref{sec:sparks} we discuss these emergent properties, and in particular we confirm the hypothesis that the number of parameters plays a key role in emergence (see e.g., \cite{stack2022emergent}), by comparing the outputs of \textbf{phi-1} with those of \textbf{phi-1-small}, a model trained with the same pipeline but with only $350$M parameters. The methodology used in this section is reminiscent of the Sparks of AGI paper \cite{sparks} that argued for moving away from static benchmarks to test LLMs' performance. Finally in Section \ref{sec:gpteval} we discuss alternative benchmarks to evaluate the model and in Section \ref{sec:contaim} we study possible contamination of our training data with respect to HumanEval. We release the model for usage and evaluation by the broader community, but omit some details of the synthetic data generation, for proprietary reasons. %
+
+\begin{table}
+\begin{center}
+\small
+\begin{tabular}{llllll}
+\hline
+Date & Model & Model size & Dataset size & HumanEval & MBPP \\
+& & (Parameters) & (Tokens) & (Pass@1) & (Pass@1) \\
+\hline
+2021 Jul & Codex-300M \cite{humaneval} & 300M & 100B & 13.2\% & - \\
+2021 Jul & Codex-12B \cite{humaneval} & 12B & 100B & 28.8\% & - \\
+2022 Mar & CodeGen-Mono-350M \cite{nijkamp2022codegen} & 350M & 577B & 12.8\% & - \\
+2022 Mar & CodeGen-Mono-16.1B \cite{nijkamp2022codegen} & 16.1B & 577B & 29.3\% & 35.3\% \\
+2022 Apr & PaLM-Coder \cite{chowdhery2022palm} & 540B & 780B & 35.9\% & 47.0\% \\
+2022 Sep & CodeGeeX \cite{zheng2023codegeex} & 13B & 850B & 22.9\% & 24.4\% \\
+2022 Nov & GPT-3.5 \cite{gpt4} & 175B & N.A. & 47\% & - \\
+2022 Dec & SantaCoder \cite{allal2023santacoder} & 1.1B & 236B & 14.0\% & 35.0\% \\
+2023 Mar & GPT-4 \cite{gpt4} & N.A. & N.A. & 67\% & - \\
+2023 Apr & Replit \cite{replit} & 2.7B & 525B & 21.9\% & - \\ %
+2023 Apr & Replit-Finetuned \cite{replit} & 2.7B & 525B & 30.5\% & - \\
+2023 May & CodeGen2-1B \cite{nijkamp2023codegen2} & 1B & N.A. & 10.3\% & - \\
+2023 May & CodeGen2-7B \cite{nijkamp2023codegen2} & 7B & N.A. & 19.1\% & - \\
+2023 May & StarCoder \cite{li2023starcoder} & 15.5B & 1T & 33.6\% & 52.7\% \\ %
+2023 May & StarCoder-Prompted \cite{li2023starcoder} & 15.5B & 1T & 40.8\% & 49.5\%\\
+2023 May & PaLM 2-S \cite{anil2023palm} & N.A. & N.A. & 37.6\% & 50.0\% \\
+2023 May & CodeT5+ \cite{wang2023codet5+} & 2B & 52B & 24.2\% & - \\
+2023 May & CodeT5+ \cite{wang2023codet5+} & 16B & 52B & 30.9\% & - \\
+2023 May & InstructCodeT5+ \cite{wang2023codet5+} & 16B & 52B & 35.0\% & - \\
+2023 Jun & WizardCoder \cite{luo2023wizardcoder} & 16B & 1T & 57.3\% & 51.8\% \\
+\hline
+2023 Jun & \textbf{phi-1} & 1.3B & 7B & 50.6\% & 55.5\% \\
+\hline
+\end{tabular}
+\end{center}
+\caption{We use self-reported scores whenever available. Despite being trained at vastly smaller scale, \textbf{phi-1} outperforms competing models on HumanEval and MBPP, except for GPT-4 (also WizardCoder obtains better HumanEval but worse MBPP).}
+\label{fig:comparison}
+\end{table}
+
+\paragraph{More related works}
+Our work is part of the recent program of using LLMs for program synthesis, see \cite{humaneval, codegen} for more references on this. Our approach is also part of the emerging trend of using existing LLMs to synthesize data for the training of new generations of LLMs, \cite{wang2022self, alpaca, mukherjee2023orca, lin2023differentially, jung2023impossible}. There is an ongoing debate about whether such ``recursive training" might lead to narrower scope for the resulting LLM \cite{shumailov2023model,gudibande2023false}, see \cite{mukherjee2023orca} for a counterviewpoint. Note that in this paper we focus on a narrow task, similarly to \cite{jung2023impossible}, in which case it seems plausible to attain better performance than the teacher LLM on that specific task (as is argued in the latter paper). 
+
+\section{Training details and the importance of high-quality data} \label{sec:training}
+
+\begin{figure}[htb]
+\centering
+\includegraphics[width=0.65\textwidth]{figures/new_data_results.png}
+\caption{Pass@1 accuracy (\%) on HumanEval. %
+The grouping of bar plots correspond to the usual scaling dimensions of either increasing the compute time (more passes on the data, here from $26$B tokens seen to $76$B) or increasing the number of parameters of the model (here from $350$M to $1.3$B). %
+Each column within a group corresponds to different training datasets: (A) The first (orange) column represents the performance of models trained on the standard dataset of deduplicated Python files from The Stack (plus StackOverflow for 1.3B parameter model); (B) The second (light green) column represents the performance of models trained with our new dataset composition \textit{CodeTextbook}; (C) Finally, the third (dark green) column corresponds to the respective second column models finetuned on our new CodeExercises dataset.  %
+{For the 1.3B models, \phione and \phionebase are checkpoints after training on 51B tokens (770 GPU hours) and The Stack+ model was trained for 76B tokens and 1090 GPU hours.}
+We highlight %
+that even without any finetuning, our \phionebase model trained on \textit{CodeTextbook} dataset achieves 29\% HumanEval performance with a mere 1.3B parameter model. The previous smallest model that achieves close to 30\% performance on HumanEval was Replit-Finetuned at 2.7B parameters, which was trained with 100 times more training tokens than us \cite{replit}. On top of this, finetuning on our CodeExercises dataset to obtain \phione not only gives us our top performance of 51\% on HumanEval, but also unlocks further unexpected coding capabilities (see Section~\ref{sec:sparks}).}
+\label{fig:summary}
+\end{figure}
+
+As alluded to in the title of the paper, the central ingredient our model relies on  textbook-quality training data. Unlike previous work that used standard sources of text data for code generation, such as The Stack \cite{kocetkov2022stack} (which contains sourcecode from repositories  with permissive licenses) and other web-based datasets (e.g., StackOverflow and CodeContest \cite{li2022competition}), we argue that these sources are not optimal for teaching the model how to reason and plan algorithmically. On the other hand, our model architecture and training methods are fairly conventional (Section~\ref{sec:arch}), so we devote this section primarily to explaining how we curated our data. 
+
+The standard code datasets \cite{kocetkov2022stack, li2022competition} form a large and diverse corpus covering broad range of topics and use cases. However, based on manual inspection of random samples we observe that many of these snippets are not very instructive for learning the basics of coding, and suffer from several drawbacks:
+\begin{itemize}
+\item 
+Many samples are not self-contained, meaning that they depend on other modules or files that are external to the snippet, making them hard to understand without additional context.
+\item 
+Typical examples do not involve any meaningful computation, but rather consist of trivial or boilerplate code, such as defining constants, setting parameters, or configuring GUI elements.
+\item 
+Samples that do contain algorithmic logic are often buried inside complex or poorly documented functions, making them difficult to follow or learn from.
+\item 
+The examples are skewed towards certain topics or use cases, resulting in an unbalanced distribution of coding concepts and skills across the dataset.
+\end{itemize}
+
+One can only imagine how frustrating and inefficient it would be for a human learner to try to acquire coding skills from these datasets, as they would have to deal with a lot of noise, ambiguity, and incompleteness in the data. We hypothesize that these issues also affect the performance of language models, as they reduce the quality and quantity of the signal that maps natural language to code. We conjecture that language models would benefit from a training set that has the same qualities as a good ``textbook'': it should be clear, self-contained, instructive, and balanced.
+
+In this work, we address this challenge directly and show that by intentionally selecting and generating high-quality data, we can achieve state-of-the-art results on code-generation tasks with a much smaller model and less compute than existing approaches. Our training relies on three main datasets: 
+\begin{itemize}
+\item 
+A \textit{filtered code-language} dataset, which is a subset of The Stack and StackOverflow, obtained by using a language model-based classifier (consisting of about 6B tokens).
+\item 
+A \textit{synthetic textbook} dataset consisting of $<$1B tokens of GPT-3.5 generated Python textbooks.
+\item
+A small \textit{synthetic exercises} dataset consisting of $\sim$180M tokens of Python exercises and solutions.
+\end{itemize}
+We describe those datasets in more detail in the next subsections. Taken together, the above datasets contain less than 7B tokens. We refer to the combination of \textit{filtered code-language} and \textit{synthetic textbook} datasets as ``CodeTextbook'' and use it in the pretraining phase to obtain our base model \phionebase\!\!---this model already achieves a competitive HumanEval performance of 29\%. Then we use the 180M token \textit{synthetic exercises} dataset, referred to as ``CodeExercises'', to finetune our \phionebase model to obtain \phione\!\!. Despite the small size of the ``CodeExercises'' dataset, finetuning with this dataset is crucial not only for large improvements in generating simple Python function as shown in Figure~\ref{fig:summary}, but more broadly to unlock many interesting emergent capabilities in our \phione model that are not observed in \phionebase (see Section~\ref{sec:sparks}). 
+
+\iffalse
+However, for learning foundational coding skills involving reasoning and algorithmic planning, many typical files, especially longer ones that dominate training loss, only provide a weak signal towards the task, due to the fact that typical examples in datasets such as The Stack have several drawbacks:
+
+Furthermore, even files containing simple algorithmic problems have limited documentation of the functionality leading to further diminished signals mapping natural language to code. 
+
+Thus, it is understandable that learning basic Python skills from such low signal sources would necessitate much longer training and/or larger models. In our work, we address this issue directly and show that by intentionally selecting for high quality data, we can beat the performance of models that are trained with orders of magnitude larger compute. 
+\fi
+
+\subsection{Filtering of existing code datasets using a transformer-based classifier}
+We begin with publicly available Python code datasets: we use the Python subset of the deduplicated version of The Stack and the StackOverflow, which together contain over 35 million files/samples, totalling over 35B tokens. We annotate the quality of a small subset of these files (about 100k samples) using GPT-4: given a code snippet, the model is \textbf{prompted} to ``determine its educational value for a student whose goal is to learn basic coding concepts".
+
+We then use this annotated dataset to train a  random forest classifier that predicts the quality of a file/sample using its output embedding from a pretrained codegen model as features. We note that unlike GPT-3.5, which we use extensively to generate synthetic content (discussed below), we use GPT-4 minimally only for annotations on the quality of a small subset of The Stack and StackOverflow samples. We thus view our usage of GPT-4 as merely a way to avoid tedious human-annotation efforts 
+\cite{dubois2023alpacafarm}. 
+
+\begin{AIbox}{\bf{\large Educational values deemed by the filter}}
+\vspace{0.2cm}
+\begin{minipage}[t]{0.48\linewidth}
+\centering
+
+\begin{tikzpicture}[thick]
+  \node {\textbf{High educational value}};
+\end{tikzpicture}
+\begin{lstlisting}[language=Python, style=mystyle]
+import torch
+import torch.nn.functional as F
+
+def normalize(x, axis=-1):
+    """Performs L2-Norm."""
+    num = x
+    denom = torch.norm(x, 2, axis, keepdim=True).expand_as(x) + 1e-12
+    return num / denom
+
+def euclidean_dist(x, y):
+    """Computes Euclidean distance."""
+    m, n = x.size(0), y.size(0)
+    xx = torch.pow(x, 2).sum(1, keepdim=True).expand(m, n)
+    yy = torch.pow(x, 2).sum(1, keepdim=True).expand(m, m).t()
+    dist = xx + yy - 2 * torch.matmul(x, y.t())
+    dist = dist.clamp(min=1e-12).sqrt()
+    return dist
+
+def cosine_dist(x, y):
+    """Computes Cosine Distance."""
+    x = F.normalize(x, dim=1)
+    y = F.normalize(y, dim=1)
+    dist = 2 - 2 * torch.mm(x, y.t())
+    return dist
+\end{lstlisting}  
+\end{minipage}\hfill
+\begin{minipage}[t]{0.5\linewidth}
+\centering
+\begin{tikzpicture}[thick]
+    \node {\textbf{Low educational value}};
+\end{tikzpicture} 
+
+\begin{lstlisting}[language=Python, style=mystyle]
+import re
+import typing
+...
+
+class Default(object):
+    def __init__(self, vim: Nvim) -> None:
+        self._vim = vim
+        self._denite: typing.Optional[SyncParent] = None
+        self._selected_candidates: typing.List[int] = []
+        self._candidates: Candidates = []
+        self._cursor = 0
+        self._entire_len = 0
+        self._result: typing.List[typing.Any] = []
+        self._context: UserContext = {}
+        self._bufnr = -1
+        self._winid = -1
+        self._winrestcmd = ''
+        self._initialized = False
+        self._winheight = 0
+        self._winwidth = 0
+        self._winminheight = -1
+        self._is_multi = False
+        self._is_async = False
+        self._matched_pattern = ''
+        ...
+\end{lstlisting}  
+\end{minipage}
+\end{AIbox}
+Our filtering methodology boosts our model performance significantly even without the synthetic datasets discussed below: for 350M parameter models trained on unfiltered Stack (deduplicated python) and StackOverflow, the HumanEval performance saturates at $12.19\%$ even after training for 96k steps ($\sim200$B tokens), while training on the filtered subset achieves $17.68\%$ on HumanEval after 36k steps. We further improve this to $20.12\%$ (reported in Figure~\ref{fig:summary}) by training on a combination of the filtered dataset and the synthetic textbooks dataset discussed below. 
+
+\subsection{Creation of synthetic textbook-quality datasets}
+One of the main challenges in creating a high-quality dataset for code generation is ensuring that the examples are diverse and non-repetitive. By diversity, we mean that the examples should cover a wide range of coding concepts, skills, and scenarios, and that they should vary in their level of difficulty, complexity, and style. Diversity is important for several reasons: it exposes the language model to different ways of expressing and solving problems in code, it reduces the risk of overfitting or memorizing specific patterns or solutions, and it increases the generalization and robustness of the model to unseen or novel tasks. However, achieving diversity is not trivial, especially when using synthetic data generated by another language model. Simply prompting the model to produce a coding textbook or a set of exercises, even with some variation in the instructions or the parameters, will likely result in a very homogeneous and redundant dataset, where the same concepts and solutions are repeated over and over with minor changes. This is because language models tend to follow the most probable or common paths given their training data and their priors, and they lack the creativity or the incentive to explore alternative or novel ways of generating code. Therefore, one needs to find the right ``trick'' that will induce the language model to be more creative and diverse in its output, while still maintaining the quality and the coherence of the examples. Inspired by \cite{eldan2023tinystories}, where a diverse set of short stories were created by including a random subset of words chosen from some fixed vocabulary in the prompt and requiring that they would be somehow combined in the generated text, we look for ways to inject randomness into the prompt in a way that gives rise to the generation of a diverse dataset.
+
+\subsubsection*{The synthetic textbook dataset}
+This dataset consists of less that 1B tokens of GPT-3.5 generated Python textbooks, synthesized to provide a high-quality source of natural language heavy text interleaved with relevant code snippets. We further targeted the content of these textbooks to cover topics that promote reasoning and basic algorithmic skills. Here, diversity is obtained by providing constraints on topics and target audience of the generated textbook.  The following is an example text from the synthetic textbook:
+\begin{AIbox}{}
+\begin{lstlisting}[language=markdown]
+To begin, let us define singular and nonsingular matrices. A matrix is said to be singular if its  determinant is zero. On the other hand, a matrix is said to be nonsingular if its determinant is not zero. Now, let's explore these concepts through examples.
+
+Example 1: Consider the matrix A = np.array([[1, 2], [2, 4]]). We can check if this matrix is singular or nonsingular using the determinant function. We can define a Python function, `is_singular(A)`, which  returns true if the determinant of A is zero, and false otherwise.
+\end{lstlisting}\vspace{-1em}
+\begin{lstlisting}[language=Python, style=mystyle]
+
+import numpy as np
+def is_singular(A):
+    det = np.linalg.det(A)
+    if det == 0:
+        return True
+    else:
+        return False
+
+A = np.array([[1, 2], [2, 4]])
+print(is_singular(A)) # True
+\end{lstlisting}
+
+\end{AIbox}
+\begin{comment}
+\begin{minted}[breaklines, breaksymbol=, baselinestretch=1, fontsize=\scriptsize]{markdown}
+# Chapter: The use of Python Libraries/Modules for Market Research Analyst
+...
+### Subsection 2: Formatting Currency
+Currency is a significant aspect in market research, and it is essential to format it correctly for analysis. Python provides the `locale` module for formatting currency. This module contains functions that enable us to format currency based on location.
+
+```Python
+import locale
+# setting the locale to the United States
+locale.setlocale(locale.LC_ALL, 'en_US.UTF-8')
+# formatting currency
+formatted_currency = locale.currency(12345.67)
+print(formatted_currency)
+...
+\end{minted}
+\end{comment}
+
+\subsubsection*{The CodeExercises dataset}
+This is a small \textit{synthetic exercises} dataset consisting of less than 180M tokens of Python exercises and solutions. Each exercise is a docstring of a function that needs to be completed. The goal of this dataset is to align the model to perform function completion tasks based on natural language instructions. This dataset was also generated by GPT-3.5, where the main means of eliciting diversity is by constraining the function names. For this dataset in particular, we conduct explicit decontamination and alternative evaluations in the following sections to ensure that problems similar to those from HumanEval benchmark are not seen during finetuning. %
+The following snippet illustrates a synthetically generated  exercise.%
+\begin{AIbox}{}
+\begin{lstlisting}[language=Python, style=mystyle]
+def valid_guessing_letters(word: str, guesses: List[str]) -> List[str]:
+    """
+    Returns a list of valid guessing letters, which are letters that have not been guessed yet and 
+    are present in the word.
+    Parameters:
+    word (str): The word to guess.
+    guesses (List[str]): A list of letters that have already been guessed.
+    Returns:
+    List[str]: A list of valid guessing letters.
+    """
+    valid_letters = []
+    for letter in word:
+        if letter not in guesses and letter not in valid_letters:
+            valid_letters.append(letter)
+    return valid_letters
+\end{lstlisting}
+\end{AIbox}
+\iffalse
+\subsection{Curating textbook-quality training data} 
+Our data curation process relies on filtering of standard code and language corpus as well as generating targeted synthetic data with the help of GPT-3.5 \cite{ouyang2022training,gpt4}. 
+
+Our training relies three main datasets:
+
+\begin{itemize}
+\item
+A \textit{filtered code-language} dataset primarily consisting of a subset of The Stack. We begin with now easily available sources of Python code dataset: we use the Python subset of the deduplicated version of The Stack and the StackOverflow, which together contain over 35 million files/samples, totalling over 35B tokens. We annotate the quality of a small subset of these files (less that 100k samples) using GPT-4. We then use this annotated dataset to train a  random forest classifier that predicts the quality of a file/sample  using its output embedding from a pretrained codegen model as features. We note that unlike GPT-3.5, which we use extensively to generating synthetic content (discussed below), we use GPT-4 minimally only for annotations on the quality on a small subset of The Stack and StackOverflow samples. We view our usage of GPT-4 as merely a way to avoid tedious human-annotation efforts \cite{dubois2023alpacafarm}. 
+\lightred{examples?}
+
+\item
+A \textit{synthetic textbook} dataset consisting of less that 1B tokens of GPT-3.5 generated Python textbooks. This dataset was synthesized to provide a high-quality source of natural language heavy text interleaved with relevant code snippets. We further targeted the content of these textbooks to cover topics that promote reasoning and basic algorithmic skills. 
+
+More broadly, when generating synthetic datasets using GPT-3.5, we focus on creating content that is useful, targeted, and self-contained, but also diverse in coverage. In particular, without creative ways of introducing diversity, GPT-3.5 generates a lot of repetitive content \cite{eldan2023tinystories}. For our synthetic textbooks, we create diversity by providing constraints on topics and target audience of the generated textbook.
+ \lightred{examples?}
+
+\item
+A small \textit{synthetic exercises} dataset consisting of less than 180M tokens of Python exercises and solutions. Each exercise is a docstring of a function that needs to be completed. The goal of this dataset is to align the model to perform function completion tasks based on natural language instructions. This dataset was also generated by GPT-3.5, where we elicit diversity by constraining the function names. For this dataset in particular, we conduct explicit decontamination to ensure that problems similar to those from HumanEval benchmark are not seen during finetuning. We discuss the decontamination procedure and alternate evaluations in later sections. \lightred{examples?}
+
+\end{itemize}
+Together the above datasets contain less than 7B tokens: $\sim$6B tokens obtained after filtering of existing large code and language datasets, and $<$1B tokens synthetically generated using GPT-3.5. 
+We call the combination of \textit{filtered code-language} and \textit{synthetic textbook} datasets as ``CodeTextbook'' and this dataset is used for pretraining our base model \phionebase\!\!---this model already achieves a competitive HumanEval performance of 29\%. We call the final, 180M token \textit{synthetic exercises} dataset as ``CodeExercises'' and use it for finetuning our \phionebase model to \phione\!\!. Despite the small size of the ``CodeExercises'' dataset, finetuning with this dataset is crucial not only for large improvements in generating simple Python function as shown in Figure~\ref{fig:}, but more broadly to unlock many interesting emergent capabilities in our \phione model that are not observed in \phionebase (see Section~\ref{sec:sparks}). 
+\fi
+\subsection{Model architecture and training}\label{sec:arch}
+ We use a decoder only transformer \cite{Vas17} model using the FlashAttention implementation of multi-head attention (MHA) \cite{dao2022flashattention}. %
+ We also use MHA and MLP layers in parallel configuration following some recent models like CodeGen \cite{codegen}, PaLM \cite{chowdhery2022palm}, and GPT-NeoX \cite{gpt-neox-library}. The architecture for our 1.3B parameter \phione model consists of 24 layers, hidden dimension of 2048, MLP-inner dimension of 8192, and 32 attention heads of dimension 64 each. The smaller 350M parameter \phionesmall model consists of 20 layers, hidden dimension of 1024, MLP-inner dimension of 4096, and 16 attention heads of dimension 64 each. We also use a rotary position embedding \cite{rope-paper} with rotary dimension 32. These architectural choices were adopted from \cite{codegen}. We also use the same tokenizer as codegen-350M-mono \cite{codegen}. Aside from FlashAttention, our models \emph{do not} use other  techniques like Fill-In-the-Middle (FIM) \cite{bavarian2022efficient}, or Multi-Query-Attention (MQA) \cite{raffel2020exploring} that  could further boost performance and efficiency \cite{li2023starcoder}. 
+
+For both pretraining and finetuning, we concatenate  our respective datasets into a single dimensional array with ``$\langle|\text{endoftext}|\rangle$'' token used for separating the files. We train our models on sequence length of 2048 sliced from our dataset array with next-token prediction loss. We use fp16 training with AdamW optimizer, linear-warmup-linear-decay learning rate schedule, and attention and residual dropout of 0.1. We train on 8 Nvidia-A100 GPUs using deepspeed. Our pretrained base model \phionebase was obtained in under 4 days of training. Finetuning to obtain \phione used an additional 7 hours on the same hardware.
+
+\paragraph{Pretraining.}\phionebase  was trained on the CodeTextbook dataset (filtered code-language corpus and synthetic textbooks). We use effective batch size  1024 (including data parallelism and gradient accumulation), maximum learning rate 1e-3 with warmup over 750 steps, and weight decay  $0.1$, for a total of 36,000 steps. We use the checkpoint at 24,000 steps as our \phionebase --  this is equivalent to $\sim$ 8 epochs on our CodeTextbook dataset for a total of little over 50B total training tokens. Despite the small size and computation, this model already achieves a 29\% accuracy on HumanEval. 
+
+\paragraph{Finetuning.} \phione is obtained by finetuning \phionebase on the CodeExercises dataset. For finetuning, we use the same setup as pretraining, but different hyperparameters: we use effective batchsize of 256, maximum learning rate 1e-4 with 50 steps of warmup, and weight decay 0.01. We train for total of 6,000 steps and pick the best checkpoint (saved every 1000 steps). 
+
+\section{Spikes of model capability after finetuning on CodeExercises} \label{sec:sparks}
+
+Figure \ref{fig:summary} showed that the largest improvement in HumanEval resulted from finetuning on the small CodeExercises dataset ($<$200M tokens).  CodeExercises consist exclusively of short Python tasks using only basic Python libraries. In this section, we demonstrate that, quite remarkably \textbf{the model after finetuning also exhibits a substantial improvement in executing tasks that are \textit{not} featured in the finetuning dataset}. This includes managing intricate algorithmic tasks and using external libraries. 
+This suggests that our finetuning process might have helped the model in reorganizing and consolidating the knowledge acquired during pretraining, even if such knowledge is not explicitly present in our CodeExercises dataset. In this section we will focus on qualitatively comparing and contrasting the capabilities of our finetuned model \phione and its pretrained 1.3B parameter base model \phionebase\!\!. %
+
+\subsection{Finetuning improves the model's understanding}
+Using a simple Python function that we created ourselves, we observe below that the model shows a much higher level of understanding and compliance with the instructions after finetuning. In particular, we see that {\phionebase} struggles with the logical relationships in the prompts, while \phione can interpret the question and generate the answer correctly. In this example, even our 350M \phionesmall model shows some level of understanding of the problem even though the resulting solution is wrong. %
+We see such  trends consistently in our interactions, see Appendix \ref{sec:additional_example} for another example.
+\begin{AIbox}{}
+\textbf{Prompt:}\\ \tt{\footnotesize""" Alice, Bob and Charles are playing games. Alice first pick a random number from 333 to 678, Bob then pick a number starting from Alice's number to 888, Charles then pick a number starting from 123 to Bob's number. Alice gets one point if Alice's number minus Charles's number is divisible by the floor of the square root of Bob's number, otherwise Bob gets one point. Simulate Alice's and Bob's points in 30 iterations.\newline"""}
+\\
+\begin{minipage}[t]{0.33\linewidth}
+\textbf{\phione}
+\begin{lstlisting}[language=Python, style=mystyle]
+points = [0, 0]
+for i in range(30):
+    alice_num = random.randint(333, 678)
+    bob_num = random.randint(alice_num, 888)
+    charles_num = random.randint(123, bob_num)
+    if (alice_num - charles_num) @\%@ int(bob_num ** 0.5) == 0:
+        points[0] += 1
+    else:
+        points[1] += 1
+return f"Alice: {points[0]}, Bob: {points[1]}"
+\end{lstlisting}
+\end{minipage}
+\begin{minipage}[t]{0.33\linewidth}
+\textbf{\phionebase}
+\begin{lstlisting}[language=Python, style=mystyle]
+self.points = 0
+self.alice = 333
+self.bob = 678
+self.charles = 888
+self.bob_points = 0
+self.alice_points = 0
+self.iterations = 30
+self.alice_turn = True
+self.bob_turn = True
+self.alice_turn_points = 0
+self.bob_turn_points = 0
+self.alice_turn_points_history = []
+self.bob_turn_points_history = []
+self.alice_turn_points_history
+    .append(self.alice_points)
+self.bob_turn_points_history
+    .append(self.bob_points)
+\end{lstlisting}
+\end{minipage}
+\begin{minipage}[t]{0.33\linewidth}
+\textbf{\phionesmall}
+\begin{lstlisting}[language=Python, style=mystyle]
+indices = []
+import random
+alice_points = 0
+bob_points = 0
+for i in range(30):
+    alice_num = random.randint(333, 678)
+    bob_num = random.randint(123, bob_num)
+    if (alice_num - bob_num) @\%@ math.floor(math.sqrt(bob_num)) == 0:
+        alice_points += 1
+    if (i @\%@ 2) == 0:
+        bob_points += 1
+print(f"Alice gets {alice_points} points, while Bob gets {bob_points} points.")
+\end{lstlisting}
+\end{minipage}
+\end{AIbox}
+
+\subsection{Finetuning improves the model's ability to use external libraries} 
+
+We demonstrate here that finetuning on CodeExercises unexpectedly improves the model's ability to use external libraries such as Pygame and Tkinter, eventhough our exercises \textbf{do not} contain these libraries. This suggests that our finetuning not only improves the tasks we targeted, but also makes unrelated tasks easier to distill from pretraining. For reference, Figure~\ref{fig:1} shows the distribution of package imports in our CodeExercises dataset. 
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.8\linewidth]{figures/import_log_bar_plot.png}
+    \caption{The number of imports among $\sim$880K exercises in CodeExercises (we ignore libraries imported less than 10 times). The plot code is generated by \phione   with the prompt: ``I have a dictionary, first sort the dictionary using the value, from largest to smallest. Then generate a pyplot bar plot. First set font size to be 7, then rotate the x-axis label by 90 degree, the x-axis is the key, y-axis is the value of the dictionary. Use log-scale on y-axis. Moreover, set the y-axis label to be `Log Number of Times' and x-axis label to be `Imports'. Set dpi to be 1000.''}
+    \label{fig:1}
+\end{figure}
+\paragraph{PyGame example.} We start with a PyGame that asks the model to generate code to move a ball:
+
+\begin{AIbox}{}
+\textbf{Prompt:}\newline \tt{\footnotesize """ Write a PyGame. There is a ball. At every iteration, (1). The x-axis of the ball increases by a random integer between (-10, 10), (2). The y-axis of the ball increases by a random integer between (-20, 20). The $x$-axis of the ball should stay inside 0-400, and y-axis of the ball should stay inside 0-600. When the user press 'space', set the $x$-axis of the ball to 200 and y-axis of the ball to 400.\newline """}
+\\
+\\
+\begin{minipage}[t]{0.33\linewidth}
+\textbf{\phione}
+\begin{lstlisting}[language=Python, style=mystyle]
+...
+screen = pygame.display.set_mode((400, 600))
+x, y = 0, 0
+while True:
+    for event in pygame.event.get():
+        ...
+        elif event.type == pygame.KEYDOWN:
+            if event.key == pygame.K_SPACE:
+                x = 200
+                y = 400
+    x += random.randint(-10, 10)
+    y += random.randint(-20, 20)
+    if x < 0:
+        x = 0
+    elif x > 400:
+        x = 400
+    if y < 0:
+        y = 0
+    elif y > 600:
+        y = 600
+    screen.fill((255, 255, 255))
+    pygame.draw.circle(screen, (255, 0, 0), (x, y), 10)
+    pygame.display.update()
+\end{lstlisting}
+\end{minipage}
+\begin{minipage}[t]{0.33\linewidth}
+\textbf{\phionebase}
+\begin{lstlisting}[language=Python, style=mystyle]
+...
+ball_x = random.randint(-10, 10)
+ball_y = random.randint(-20, 20)
+ball_vx = random.randint(-5, 5)
+ball_vy = random.randint(-5, 5)
+...
+screen = pygame.display.set_mode((800, 600))
+...
+while not done:
+    for event in pygame.event.get():
+        ...
+        elif event.type == pygame.KEYDOWN:
+            if event.key == pygame.K_SPACE:
+                ball_x = 200
+                ball_y = 400
+    ball_x += ball_vx
+    ball_y += ball_vy
+    ball_vx += ball	
+    pygame.display.flip()
+\end{lstlisting}
+\end{minipage}
+\begin{minipage}[t]{0.33\linewidth}
+\textbf{\phionesmall}
+\begin{lstlisting}[language=Python, style=mystyle]
+...
+x, y = 0, 0
+dx, dy = random.randint(-10, 10), random.randint(-20, 20)
+while True:
+    screen.fill((0, 0, 0))
+    pygame.draw.rect(screen, (255, 255, 255), (x, y, 400, 600))
+    pygame.display.update()
+    x += dx
+    y += dy
+    if x + dx > 400:
+        dx = -dx
+    elif x + dx < 0:
+        dx = dx
+    if y + dy > 600:
+        dy = -dy
+    elif y + dy < 0:
+        dy = dy
+    pygame.time.wait(50)
+\end{lstlisting}
+\end{minipage}
+\end{AIbox}
+
+The above code snippet shows the main loop of a simple PyGame program that bounces a ball on the screen.
+\phione correctly applies the PyGame functions to update and draw the ball, as instructed by the prompt. \phionebase and \phionesmall produce function calls that are syntactically correct but semantically irrelevant. We can see that \phionebase shows some ability to use the appropriate API calls, but it fails to follow the logic of the task, while \phionesmall after finetuning understands the logic but does not have enough capacity to learn the correct function calls.
+\clearpage
+\paragraph{TKinter example.} Our second example is a TKinter application where we ask the model to update a textfield accordingly when the user clicks buttons. 
+
+\begin{AIbox}{}
+\textbf{Prompt:}\\ \tt{\footnotesize """ Write a tkinter application, there is a textfield on top, a submit button at the button and a recover button next to it. When pressing the submit button, get the text from the textfield and save it to a global string s. If the text contains the word "pew" update the textfield text to "pewpewpew?", otherwise, add "no pew..." to the end. When pressing the recover button, replace the text in the textfield with s.\newline """}
+\\
+\\
+\begin{minipage}[t]{0.475\linewidth}
+\textbf{\phione}
+\begin{lstlisting}[language=Python, style=mystyle]
+...
+global s
+s = ""
+def submit():
+    global s
+    text = textfield.get()
+    if "pew" in text:
+        textfield.delete(0, tk.END)
+        textfield.insert(0, "pewpewpew...")
+    else:
+        textfield.delete(0, tk.END)
+        textfield.insert(0, text + "no pew...")
+    s = text
+
+def recover():
+    global s
+    textfield.delete(0, tk.END)
+    textfield.insert(0, s)
+
+textfield = tk.Entry(root)
+textfield.pack()
+submit_button = tk.Button(root, text="Submit", command=submit)
+submit_button.pack()
+recover_button = tk.Button(root, text="Recover", command=recover)
+recover_button.pack()
+root.mainloop()
+\end{lstlisting}
+\end{minipage}
+\begin{minipage}[t]{0.525\linewidth}
+\textbf{\phionebase}
+\begin{lstlisting}[language=Python, style=mystyle]
+global s
+s = s.replace("pew", "pewpewpew")
+if "pew" in s:
+    s = s.replace("pew", "pewpewpew")
+else:
+    s = s + "no pew..."
+text.delete(0.0, END)
+text.insert(0.0, s)
+def main():
+    global s
+    s = "pewpewpew"
+    text.delete(0.0, END)
+    text.insert(0.0, s)
+    text.tag_add("button", "<Button-1>", "<Button-3>")
+    text.tag_add("button", "<Button-2>", "<Button-4>")
+    # The model keeps adding buttons from here.
+\end{lstlisting}
+\textbf{\phionesmall}
+\begin{lstlisting}[language=Python, style=mystyle]
+import tkinter as tk 
+root = tk.Tk()
+global s
+text = ""
+while True:
+    event, values = tk.popup()
+    if event == "submit":
+        text += values.split()[0] + " "
+    elif event == "textfield":
+        s += values.split()[0] + " "
+    elif event == "submit-button-text":
+        text = values.split()[0] + " "
+    elif event == "text-button-text":
+        s = text
+    if "pew" in text:
+        text = text.replace("pew", "pewpewpew")
+    if "no pew" in text:
+        break
+tk.destroy()
+\end{lstlisting}
+\end{minipage}
+\end{AIbox}
+
+The three models' completions show a huge gap in their prompt understanding. Both \phionebase and \phionesmall fail to use the correct Tkinter APIs and make up meaningless function calls. On the other hand, \phione implements the GUI and all the functions correctly (except that it did not copy ``pewpewpew?" correctly). We present two additional examples in Appendix \ref{sec:additional_example} for \textbf{pytorch} and \textbf{pyplot}.
+\clearpage
+\paragraph{Chat mode example.} Finally, we show that \phione has a better chat capability than \phionebase despite that \textbf{chat data is exclusive in  pretraining, but not in the finetuning.}
+
+\begin{AIbox}{}
+\textbf{Prompt:} \\
+\tt{\footnotesize Student: I have a Python pyplot, I want to increase its resolution and rotate it, what should I do? TA:}
+\\
+\begin{minipage}[t]{0.5\linewidth}
+\textbf{\phione}
+\begin{lstlisting}[language=markdown, style=mystyle]
+1. Set the 'dpi' parameter to the desired resolution (e.g. 300 for 300 DPI)
+2. Use the 'rotate' function from the 'matplotlib.pyplot' module to rotate the plot by 90 degrees clockwise
+Here's an example:
+
+\end{lstlisting}\vspace{-1em}
+\begin{lstlisting}[language=Python, style=mystyle]
+import matplotlib.pyplot as plt
+fig, ax = plt.subplots()
+ax.plot([1, 2, 3], [4, 5, 6])
+# Set the resolution to 300 DPI
+ax.set_dpi(300)
+# Rotate the plot by 90 degrees clockwise
+ax.rotate(90)
+\end{lstlisting}
+\end{minipage}
+\begin{minipage}[t]{0.5\linewidth}
+\textbf{\phionebase}
+\begin{lstlisting}[language=markdown, style=mystyle]
+You can use the `setp()` function to set the 
+resolution and the `set_rotation()` function to 
+rotate the plot. <|endoftext|>
+\end{lstlisting}
+\textbf{\phionesmall}
+\begin{lstlisting}[language=markdown, style=mystyle]
+I am a Python pyplot, and I want to increase its 
+resolution and rotate it, what should I do?
+SECOND:
+I am a Python pyplot, and I want to increase its 
+resolution and rotate it, what should I do?
+THIRD:...
+\end{lstlisting}
+\end{minipage}
+\end{AIbox}
+
+\section{Evaluation on unconventional problems with LLM grading} \label{sec:gpteval}
+
+A potential concern with the surprisingly good performance of \textbf{phi-1} on HumanEval (see Table~\ref{fig:comparison} and Figure \ref{fig:summary}) is that there might be memorization stemming from contamination of the synthetic CodeExercises dataset. %
+We study this potential contamination directly in Section~\ref{sec:contaim}, while this section addresses the concern with a new evaluation that is designed to be unconventional enough to be unlikely to appear in our training dataset.
+
+To minimize bias and leakage, the new evaluation problems were created by a dedicated team that did not access the CodeExercises dataset or the final model. They created 50 new problems in the same format as HumanEval with instructions to design problems that are unlikely to appear in real-world code bases or as coding exercises. Here is an example of such a problem:
+
+\begin{AIbox}{}
+\begin{lstlisting}[language=Python, style=mystyle]
+def sort_concat_square_deduplicate(list1, list2, my_threshold):
+  """
+  This functions takes two lists of integers, sorts each of them in ascending order,
+  concatenates them, squares the entries at even indices, filters out entries
+  smaller than my_threshold and then removes duplicates. The resulting list is
+  returned.
+  """
+\end{lstlisting}
+\end{AIbox}
+
+One of the challenges of evaluating language models on coding tasks is that the output of the model is often binary: either the code passes all the unit tests or it fails. However, this does not capture the nuances of the model's performance, as it might have produced a code that is almost correct but has a minor error, or a code that is completely wrong but coincidentally passes some tests. Arguably, a more informative way of assessing the model's coding skills is to compare its output with the correct solution and grade it based on how well it matches the expected logic. This is similar to how humans are evaluated on coding interviews, where the interviewer does not only run the code but also examines the reasoning and the quality of the solution. 
+
+To evaluate candidate solutions, we therefore adopt the approach of \emph{using GPT-4 to grade the solution} (such as in \cite{eldan2023tinystories}). This approach has two distinct advantages: (1) by using GPT-4 as a grader, we can leverage its knowledge and generative abilities to obtain a more fine-grained and meaningful signal of the student model's coding capabilities, and (2) it obviates the need for tests\footnote{Developing rigorous sets of tests can be a significant undertaking, as demonstrated by~\cite{evalplus}.}. Our prompt instructs the LLM to evaluate a student's solution first in a short verbal evaluation followed by grades from 0 to 10.
+
+\begin{table}
+\small
+\begin{center}
+\begin{tabular}{llllll}
+\hline
+Model & Size & Training tokens & Score & HumanEval\\ %
+\hline
+CodeGen-Mono-350M \cite{nijkamp2022codegen} & 350M & 577B & 19\% & 13\%\\ %
+CodeGen-Mono-16.1B \cite{nijkamp2022codegen} & 16.1B & 577B & 38\% & 29\% \\ %
+Replit \cite{replit} & 2.7B & 525B & 37\% & 22\%\\ %
+StarCoder \cite{li2023starcoder} & 15.5B & 1T & 51\% & 34\% \\ %
+\hline
+\textbf{phi-1-base} & 1.3B & 7B & 37\% & 29\% \\ %
+\textbf{phi-1-small} & 350M & 7B & 45\% & 45\% \\ %
+\textbf{phi-1} & 1.3B & 7B & 52\% & 51\% \\ %
+\hline
+\end{tabular}
+\caption{LLM graded Understanding scores on 50 new unconventional coding problems.}
+\label{fig:esoteric}
+\end{center}
+\end{table}
+
+See Table~\ref{fig:esoteric} for our results with \textbf{phi-1} and competing models.
+The grades on our new unconventional problems give the same ranking as HumanEval (see Table~\ref{fig:comparison}).
+\textbf{phi-1} again achieves a score significantly higher than StarCoder, as it did on HumanEval.
+Given that the new problems have had no chance to contaminate the training data and, furthermore, were \emph{designed to be outside the training distribution}, these results greatly increase our confidence in the validity of \textbf{phi-1}'s performance.
+
+\iffalse
+One possible objection to the work presented so far is that our synthetic finetuned data is not valid and the model achieves high scores on HumanEval and MBPP due to memorization. To address this concern, we will examine the issue of data contamination in section~\ref{sec:contaim} using various metrics. In this section, we will demonstrate that our model achieves a high score \textbf{based on actual understanding} by (1) designing a diverse set of unconventional questions that are unlikely to appear in any training dataset, and (2) perturbing or increasing the difficulty of the existing questions in Humaneval. Our results show that the model's performance is consistent across both scenarios. \textbf{
+Furthermore, we divided our group into two independent teams: one responsible for creating these testing dataset and the other for finetuning the model and generating the synthetic data. This way, we ensured that the dataset creators had no access to the synthetic data or the final model, and thus avoided any potential bias or leakage.}
+\fi
+
+\section{Data pruning for unbiased performance evaluation}
+\label{sec:contaim}
+
+In Figure~\ref{fig:summary}, we see that training on CodeExercises leads to a substantial boost in the performance of the model on the HumanEval benchmark. 
+To investigate this boost, we propose to prune the CodeExercises dataset by removing files that are ``similar" to those in HumanEval. This process can be viewed as a ``strong form" of data decontamination. We then retrain our model on such pruned data, and still observe strong performance on HumanEval. In particular, even after aggressively pruning more than 40\% of the CodeExercises dataset (this even prunes files that are only vaguely similar to HumanEval, see Appendix~\ref{sec:additional_example_contam}), the retrained \phione still outperforms StarCoder.
+
+We believe that such data pruning experiment is a fair way to evaluate performance, and is more insightful than standard ``contamination" studies in the literature that are usually based on measures of overlap between training and test data (e.g., Section 4.8 of~\cite{austin2021program}). For sake of completeness we start this section by conducting a standard contamination experiment, which shows that CodeExercises is \textbf{not contaminated} by HumanEval in this standard sense.
+
+\subsection{N-gram overlap}
+N-gram measures the similarity of text segments based on the shared n-word sequences. We calculate the n-gram overlap between the docstrings of each humaneval question and each exercise in the CodeExercises dataset that was generated. We found 4 humaneval questions with 13-gram overlap with at least one of the entries in our dataset.
+After further investigating, we found out that \textbf{all the 4 overlap cases in the 13-gram are all false positives} such as the example below. Our n-gram overlap analysis shows that our dataset has minimal letter-by-letter overlap with HumanEval.  
+
+\begin{AIbox}{}\hspace{-7pt}
+\begin{tabular}{p{0.48\textwidth}p{0.48\textwidth}}
+\textbf{HumanEval:} & \textbf{CodeExercises:}\\
+
+{\tt\scriptsize
+You are given a non-empty list of positive integers. Return the greatest integer that is greater than zero, and has a frequency greater than or equal to the value of the integer itself. \bf{The frequency of an integer is the number of times it appears in the list.}
+}
+&
+{\tt\scriptsize
+Calculates the power frequency analysis sum of a list of integers. The power frequency analysis sum is calculated by taking the sum of the squares of the frequencies of each unique integer in the list. \bf{The frequency of an integer is the number of times it appears in the list.}
+}
+\end{tabular}
+\end{AIbox}
+
+\subsection{Embedding and syntax-based similarity analysis}
+As we just saw, the n-gram analysis is not refined enough to find similar code snippets between HumanEval and CodeExercises. Instead we use a combination of embedding and syntax-based distances. For the embedding distance we compute the L2 distance between the embedding of the code snippets where the embedding is derived from a pre-trained CodeGen-Mono 350M model~\cite{nijkamp2022codegen}. We observe that the embedding distance is successful in capturing code pairs where the overall code semantics are similar, which can be inferred via the Python Docstring, function/class names, as well as the code structure. For the syntax-based distance we calculate the (string) edit distance between the abstract syntax trees (ASTs) of two given code snippets. The AST distance successfully identifies overlapping sections between code pairs while being agnostic to non-syntax text such as variable/function naming, comments, and Python Docstrings. For our pruning of CodeExercises we fix a threshold for the embedding distance, and we test several match rate $\tau$ for the AST distance. See Appendix~\ref{sec:additional_example_contam} for examples of code pairs that are captured with the embedding distance and various AST match rates $\tau$. We vary $\tau$ between $0.95$ and $0.8$, which corresponds to removing between $42.5K$ to $354K$ of the $879.5K$ total problems in CodeExercises.
+
+\newcommand{\maybebf}[1]{{#1}}
+\begin{table}[h]
+\small
+    \centering
+    \begin{tabular}{clcccc}
+    \cline{1-6}
+    $\tau$ & &  \begin{tabular}{@{}c@{}}Problem \\ Count\end{tabular} & \phione & \begin{tabular}{@{}c@{}}\phione \textbf{retrained} \\ \textbf{on pruned data}\end{tabular} & \begin{tabular}{@{}c@{}}StarCoder-Prompted \\\cite{li2023starcoder}\end{tabular} \\ \hline
+         
+         \multirow{3}{*}{0.95} & similar & 71 &  81.7\% & 74.6\% &  57.7\% \\ 
+         & non-similar & 93 &  26.9\% & 32.3\% &  29.0\% \\
+         & \maybebf{total} & \maybebf{164} &  \maybebf{50.6\%} & \maybebf{50.6\%} &  \maybebf{41.5\%} \\ \hline
+
+         \multirow{3}{*}{0.9} & similar & 93 &  63.4\% & 51.6\% &  48.4\% \\ 
+         & non-similar & 71 &  33.8\% & 36.6\% &  32.4\% \\ 
+         & \maybebf{total} & \maybebf{164} &  \maybebf{50.6\%} & \maybebf{45.1\%} &  \maybebf{41.5\%} \\ \hline
+
+         \multirow{3}{*}{0.85} & similar & 106 &  62.3\% & 52.8\% &  47.2\% \\ 
+         & non-similar & 58 &  29.3\% & 34.5\% &  31.0\% \\ 
+         & \maybebf{total} & \maybebf{164} & \maybebf{ 50.6\%} & \maybebf{46.3\%} &  \maybebf{41.5\%} \\ \hline
+
+         \multirow{3}{*}{0.8} & similar & 116 &  59.5\% & 52.6\% &  45.7\% \\ 
+         & non-similar & 48 &  29.2\% & 27.1\% &  31.2\% \\ 
+         & \maybebf{total} & \maybebf{164} &  \maybebf{50.6\%} & \maybebf{45.1\%} &  \maybebf{41.5\%} \\ \hline
+
+    \end{tabular}
+    \caption{Percentage of similar versus non-similar HumanEval problems correctly solved by different models. Similarity is determined based on whether or not the corresponding HumanEval problem has any close matches inside the CodeExercises dataset (for a given $\tau$). The problem count denotes the number of HumanEval problems within each subset. Here, $\tau$ is the threshold on AST-based match rate between codes for similarity check.}
+    \label{tab:decontamination}
+\end{table}
+
+Table~\ref{tab:decontamination} summarizes the performance of our retrained \phione on pruned datasets (with $\tau = 0.95, 0.9, 0.85$ and $0.8$) versus the original \phione trained on full CodeExercises and the $15.5B$-parameter StarCoder-prompted. We divide the HumanEval problems into two subsets (``similar" and ``non-similar") based on whether or not they have at least one close match (for this given $\tau$) inside the original CodeExercises dataset. We then report the accuracy of the models on each subset of HumanEval separately. As one can see, even after heavily pruning our dataset, \phione still outperforms StarCoder-Prompted by a large margin, which validates that our performance boost is not due to dataset ``contamination", even when the latter term is understood loosely. Note also that the accuracy of all models is lower on the HumanEval non-similar subset versus the similar one.
+
+\section{Conclusion}
+Just as a comprehensive, well-crafted textbook can provide a student with the necessary knowledge to master a new subject, our work demonstrates the remarkable impact of high-quality data in honing a language model's proficiency in code-generation tasks. By crafting ``textbook quality" data we were able to train a model that surpasses almost all open-source models on coding benchmarks such as HumanEval and MBPP despite being 10x smaller in model size and 100x smaller in dataset size. We hypothesize that such high quality data dramatically improves the learning efficiency of language models for code as they provide clear, self-contained, instructive, and balanced examples of coding concepts and skills.
+
+There remains a number of limitations of our model compared to larger models for code.  Firstly, \phione is specialized in Python coding, which restricts its versatility compared to multi-language models. Secondly, \phione lacks the domain-specific knowledge of larger models such as programming with specific APIs or using less common packages. Lastly, due to the structured nature of the datasets and the lack of diversity in terms of language and style, \phione is less robust to stylistic variations or errors in the prompt (for instance, its performance substantially degrades when there are grammatical mistakes in the prompt). We expand on these limitations and give examples of the failure modes of \phione in Appendix~\ref{app:limitations}. 
+
+None of these limitations seem fundamental, and with more work our approach could be used to tackle each one of them, although it is unclear what scaling might be necessary to overcome them (both for the model size and the dataset size). We also believe that significant gains could be achieved by using GPT-4 to generate the synthetic data instead of GPT-3.5, as we noticed that GPT-3.5 data has a high error rate. It is interesting that \phione is able to achieve such high coding proficiency despite those errors (a similar phenomenon was observed in \cite{allen2023physics} where a language model can be trained on data with 100\% error rate and still generate correct answers at test time).
+
+More generally, our work provides evidence that developing good methodology for creating high-quality datasets is a central direction of research for advancing natural language processing and related fields (see also \cite{jung2023impossible} for further evidence). However, creating high-quality datasets is not a trivial task, and it poses several challenges that need to be addressed. One challenge is to ensure that the dataset covers all the relevant content and concepts that one wants the model to learn, and that it does so in a balanced and representative way. Another challenge is to ensure that the dataset is truly diverse and non-repetitive, so that the model does not simply overfit to the data or memorize specific patterns or solutions. This requires finding ways to inject randomness and creativity into the data generation process, while still maintaining the quality and the coherence of the examples. Moreover, even after creating such datasets, we lack a good methodology to measure and evaluate the amount of diversity and redundancy in the data. For example, if we have a dataset with coding exercises, it is hard to determine how many different variations of each exercise exist, and how they are distributed across the dataset. Finally, as language models themselves will be used to curate data for future language models, it further increases the urgency on the ethical and social implications of training such models, such as the accountability, the transparency, and the bias of the data and the models that are involved in this process.
+
+\newpage
+
+\end{document}

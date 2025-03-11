@@ -1,0 +1,474 @@
+\title{Active Retrieval Augmented Generation}
+
+\begin{document}
+
+\maketitle
+\begin{abstract}
+Despite the remarkable ability of large language models (LMs) to comprehend and generate language, they have a tendency to hallucinate and create factually inaccurate output.
+Augmenting LMs by retrieving information from external knowledge resources is one promising solution.
+Most existing retrieval augmented LMs employ a retrieve-and-generate setup that only retrieves information once based on the input.
+This is limiting, however, in more general scenarios involving generation of long texts, where continually gathering information throughout generation is essential.
+In this work, we provide a generalized view of \emph{active retrieval augmented generation}, methods that actively decide when and what to retrieve across the course of the generation.
+We propose \textbf{F}orward-\textbf{L}ooking \textbf{A}ctive \textbf{RE}trieval augmented generation~(\textbf{\ours}), a generic method which iteratively uses a prediction of the upcoming sentence to anticipate future content, which is then utilized as a query to retrieve relevant documents to regenerate the sentence if it contains low-confidence tokens.
+We test \ours along with baselines comprehensively over 4 long-form knowledge-intensive generation tasks/datasets.
+\ours achieves superior or competitive performance on all tasks, demonstrating the effectiveness of our method.%
+\footnote{Code and datasets are available at \url{https://github.com/jzbjyb/FLARE}.}
+\end{abstract}
+
+\section{Introduction}
+
+Generative language models (LMs) \cite{gpt3-brown-2020,instructgpt3-ouyang-2022,gpt4-2023,palm-chowdhery-2022,opt-zhang-2022,llama-touvron-2023,zhao-llm-2023} have become a foundational component in natural language processing (NLP) systems with their remarkable abilities.
+Although LMs have memorized some world knowledge during training \cite{lama-petroni-2019,t5pack-roberts-2020,lpaqa-jiang-2020}, they still tend to hallucinate and create imaginary content~\cite{maynez-etal-2020-faithfulness,zhou-etal-2021-detecting}.
+Augmenting LMs with retrieval components that look up relevant information from external knowledge resources is a promising direction to address hallucination \cite{knnlm-2020-khandelwal,atlas-izacard-2022}.
+
+\begin{figure*}[tb]
+\includegraphics[width=0.9\textwidth, clip, keepaspectratio]{illustration.pdf}
+\centering
+\caption{An illustration of forward-looking active retrieval augmented generation (\ours). Starting with the user input $\bm{x}$ and initial retrieval results $\mathcal{D}_{\bm{x}}$, \ours iteratively generates a temporary next sentence (shown in \textcolor{gray}{\textit{gray italic}}) and check whether it contains low-probability tokens (indicated with \underline{underline}). If so (step 2 and 3), the system retrieves relevant documents and regenerates the sentence.}
+\label{fig:illustration}
+\end{figure*}
+
+Retrieval augmented LMs commonly use a retrieve-and-generate setup where they retrieve documents based on the user's input, and then generate a complete answer conditioning on the retrieved documents~\cite{drqa-chen-2017,realm-guu-2020,rag-lewis-2020,fid-2021-izacard,emdr2-2021-sachan,yono-2021-lee,reatt-jiang-2022,atlas-izacard-2022,webgpt-nakano-2021,webbrain-qin-2023,lazaridou-internet-2022,replug-shi-2023}.
+These single-time retrieval augmented LMs outperform purely parametric LMs, particularly for short-form knowledge-intensive generation tasks such as factoid question answering (QA) \cite{nq-kwiatkowski-2019,joshi-2017-triviaqa}, where \emph{the information needs are clear in the user's input, and it is sufficient to retrieve relevant knowledge once solely based on the input}.
+
+Increasingly powerful large LMs have also demonstrated abilities in more complex tasks that involve generating long-form output, such as long-form QA \cite{eli5-fan-2019,asqa-stelmakh-2022}, open-domain summarization \cite{wikisum-cohen-2021,wikiasp-hayashi-2021,openmds-giorgi-2022}, and (chain-of-thought; CoT) reasoning \cite{cot-wei-2022,2wikimultihopqa-ho-2020,strategyqa-geva-2021,hendrycks-2020-mass}.
+In contrast to short-form generation, long-form generation presents complex information needs that are \emph{not always evident from the input alone}. Similar to how humans gradually gather information as we create content such as papers, essays, or books, long-form generation with LMs would \emph{require gathering multiple pieces of knowledge throughout the generation process}.
+For example, to generate a summary about a particular topic, the initial retrieval based on the topic name (e.g., Joe Biden) may not cover all aspects and details.
+It is crucial to retrieve extra information as needed during generation, such as when generating a certain aspect (e.g., Joe Biden's education history) or a specific detail (e.g., the date of Joe Biden's presidential campaign announcement).
+
+Several attempts have been made to retrieve multiple times throughout generation.
+These attempts include methods that passively use the past context to retrieve additional information at a fixed interval \cite{knnlm-2020-khandelwal,retro-borgeaud-2022,icrlm-ram-2023,ircot-trivedi-2022} which might not accurately reflect what LMs intend to generate in the future or retrieve at inappropriate points.
+Some works in multihop QA decompose the full question into sub-questions, each of which is used to retrieve extra information~\cite{selfask-press-2022,react-yao-2022,decomp-khot-2022,dsp-khattab-2022}.
+
+We ask the following question: can we create a simple and generic retrieval augmented LM that \emph{actively decides when and what to retrieve} throughout the generation process, and are applicable to a variety of long-form generation tasks?
+We provide a generalized view of active retrieval augmented generation.
+Our hypothesis regarding \emph{when to retrieve} is that LMs should retrieve information only when they lack the required knowledge to avoid unnecessary or inappropriate retrieval that occurs in passive retrieval augmented LMs \cite{knnlm-2020-khandelwal,retro-borgeaud-2022,icrlm-ram-2023,ircot-trivedi-2022}.
+Given the observation that large LMs tend to be well-calibrated and low probability/confidence often indicates a lack of knowledge \cite{mostlyknow-kadavath-2022}, we adopt an active retrieval strategy that only retrieves when LMs generate low-probability tokens.
+When deciding \emph{what to retrieve}, it is important to consider what LMs intend to generate in the future, as the goal of active retrieval is to benefit future generations.
+Therefore, we propose anticipating the future by generating a temporary next sentence, using it as a query to retrieve relevant documents, and then regenerating the next sentence conditioning on the retrieved documents.
+Combining the two aspects, we propose \textbf{F}orward-\textbf{L}ooking \textbf{A}ctive \textbf{RE}trieval augmented generation (\textbf{\ours}), as illustrated in \autoref{fig:illustration}.
+\ours iteratively generates \emph{a temporary next sentence}, use it as the query to retrieve relevant documents \emph{if it contains low-probability tokens} and regenerate the next sentence until reaches the end.
+
+\ours is applicable to any existing LMs at inference time without additional training.
+Considering the impressive performance achieved by GPT-3.5 \cite{instructgpt3-ouyang-2022} on a variety of tasks, we examine the effectiveness of our methods on \texttt{text-davinci-003}.
+We evaluate \ours on 4 diverse tasks/datasets involving generating long outputs, including multihop QA (2WikiMultihopQA), commonsense reasoning (StrategyQA), long-form QA (ASQA), and open-domain summarization (WikiAsp) \cite{2wikimultihopqa-ho-2020,strategyqa-geva-2021,asqa-stelmakh-2022,wikiasp-hayashi-2021}.
+Over all tasks, \ours achieves superior or competitive performance compared to single-time and multi-time retrieval baselines, demonstrating the effectiveness and generalizability of our method.
+
+\section{Retrieval Augmented Generation}
+We formally define single-time retrieval augmented generation and propose the framework of active retrieval augmented generation.
+
+\subsection{Notations and Definitions}
+Given a user input $\bm{x}$ and a document corpus $\mathcal{D}=\{\bm{d}_i\}_{i=1}^{|\mathcal{D}|}$ (such as all Wikipedia articles), the goal of retrieval augmented LMs is to generate the answer $\bm{y}=[\bm{s}_1,\bm{s}_2,...,\bm{s}_m]=[w_1, w_2,...,w_n]$ containing $m$ sentences or $n$ tokens leveraging information retrieved from the corpus.
+
+In retrieval augmented LM, the LM typically pairs with a retriever that can retrieve a list of documents $\mathcal{D}_{\bm{q}}=\text{ret}(\bm{q})$ for a query $\bm{q}$; the LM conditions on both the user input $\bm{x}$ and retrieved documents $\mathcal{D}_{\bm{q}}$ to generate the answer.
+Since we focus on examining various methods of determining when and what to retrieve, we follow existing methods \cite{icrlm-ram-2023,ircot-trivedi-2022} to prepend the retrieved documents before the user input to aid future generation for both baselines and our method for fair comparisons: $\bm{y}=\text{LM}([\mathcal{D}_{\bm{q}},\bm{x}])$, where $[\cdot,\cdot]$ is concatenation following the specified order.
+
+\subsection{Single-time Retrieval Augmented Generation}\label{sec:baseline_single}
+The most common choice is to directly use the user input as the query for retrieval and generate the complete answer at once $\bm{y}=\text{LM}([\mathcal{D}_{\bm{x}},\bm{x}])$.
+
+\subsection{Active Retrieval Augmented Generation}\label{sec:activerag}
+To aid long-form generation with retrieval, we propose active retrieval augmented generation.
+It is a generic framework that actively decides when and what to retrieve through the generation process, resulting in the interleaving of retrieval and generation.
+Formally, at step $t (t \ge 1)$, the retrieval query $\bm{q}_t$ is formulated based on both the user input $\bm{x}$ and previously generated output $\bm{y}_{<t}=[\bm{y}_0,...,\bm{y}_{t-1}]$:
+\begin{equation*}
+\bm{q}_t=\text{qry}(\bm{x}, \bm{y}_{<t}),
+\end{equation*}
+where $\text{qry}(\cdot)$ is the query formulation function.
+At the beginning ($t=1$), the previous generation is empty ($\bm{y}_{<1}=\emptyset$), and the user input is used as the initial query ($\bm{q}_1=\bm{x}$).
+Given retrieved documents $\mathcal{D}_{\bm{q}_t}$, LMs continually generate the answer until the next retrieval is triggered or reaches the end:
+\begin{equation*}
+\bm{y}_t=\text{LM}([\mathcal{D}_{\bm{q}_t},\bm{x}, \bm{y}_{<t}]),
+\end{equation*}
+where $\bm{y}_t$ represents the generated tokens at the current step $t$, and the input to LMs is the concatenation of the retrieved documents $\mathcal{D}_{\bm{q}_t}$, the user input $\bm{x}$, and the previous generation $\bm{y}_{<t}$.
+We discard previously retrieved documents $\cup_{t'<t}\mathcal{D}_{\bm{q}_{t'}}$ and only use the retrieved documents from the current step to condition the next generation to prevent reaching the input length limit of LMs.
+
+\section{\ours: Forward-Looking Active REtrieval Augmented Generation}
+Our intuition is that (1) LMs should only retrieve information when they do not have the necessary knowledge to avoid unnecessary or inappropriate retrieval, and (2) the retrieval queries should reflect the intents of future generations.
+We propose two forward-looking active retrieval augmented generation (\ours) methods to implement the active retrieval augmented generation framework.
+The first method prompts the LM to generate retrieval queries when necessary while generating the answer using retrieval-encouraging instructions, denoted as \oursr.
+The second method directly uses the LM's generation as search queries, denoted as \oursd, which iteratively generates the next sentence to gain insight into the future topic, and if uncertain tokens are present, retrieves relevant documents to regenerate the next sentence.
+
+\begin{figure}[tb]
+\includegraphics[width=1.0\columnwidth, clip, keepaspectratio]{illustration_search.pdf}
+\centering
+\caption{An illustration of forward-looking active retrieval augmented generation with retrieval instructions (\oursr). It iteratively generates search queries (shown in \textcolor{gray}{\textit{gray italic}}) to retrieve relevant information to aid future generations.}
+\label{fig:illustration_search}
+\end{figure}
+
+\subsection{\ours with Retrieval Instructions}
+Inspired by Toolformer \cite{toolformer-schick-2023}, a straightforward way of expressing information needs for retrieval is to generate ``[Search(query)]'' when additional information is needed~\cite{toolformer-schick-2023}, e.g., ``The colors on the flag of Ghana have the following meanings. Red is for [Search(Ghana flag red meaning)] the blood of martyrs, ...''
+When working with GPT-3.5 models that offer only API access, we elicit such behavior by few-shot prompting~\cite{gpt3-brown-2020}.
+
+Specifically, for a downstream task, we place the search-related instruction and exemplars at the beginning as skill 1, followed by the instruction and exemplars of the downstream task as skill 2.
+Given a test case, we ask LMs to combine skills 1 and 2 to generate search queries while performing the task.
+The structure of the prompt is shown in Prompt~\autoref{prompt:search}, and full details can be found in Prompt~\autoref{prompt:2wiki_search}.
+\begin{prompt}[title={Prompt \thetcbcounter: retrieval instructions}, label=prompt:search]
+Skill 1. An instruction to guide LMs to generate search queries.\\
+Several search-related exemplars.\\
+\\
+Skill 2. An instruction to guide LMs to perform a specific downstream task (e.g., multihop QA).\\
+Several task-related exemplars.\\
+\\
+An instruction to guide LMs to combine skills 1 and 2 for the test case.\\
+The input of the test case.
+\end{prompt}
+As shown in \autoref{fig:illustration_search}, when the LM generates ``[Search(query)]'' (shown in \textcolor{gray}{\textit{gray italic}}), we stop the generation and use the query terms to retrieve relevant documents, which are prepended before the user input to aid future generation until the next search query is generated or reaches the end.
+Additional implementation details are included in \autoref{ap:flare}.
+
+\subsection{Direct \ours}
+Since we cannot fine-tune black-box LMs, we found queries generated by \oursr through retrieval instructions might not be reliable.
+Therefore, we propose a more direct way of forward-looking active retrieval that uses the next sentence to decide when and what to retrieve.
+
+\subsubsection{Confidence-based Active Retrieval}
+As shown in \autoref{fig:illustration}, at step $t$, we first generate a temporary next sentence $\hat{\bm{s}}_t=\text{LM}([\bm{x}, \bm{y}_{<t}])$ without conditioning on retrieved documents.
+Then we decide whether to trigger retrieval and formulate queries based on $\hat{\bm{s}}_t$.
+If the LM is confident about $\hat{\bm{s}}_t$, we accept it without retrieving additional information; if not, we use $\hat{\bm{s}}_t$ to formulate search queries $\bm{q}_t$ to retrieve relevant documents, and then regenerate the next sentence $\bm{s}_t$.
+The reason we utilize sentences as the basis of our iteration is due to their significance as semantic units that are neither too short nor too lengthy like phrases and paragraphs.
+However, our approach can also utilize phrases or paragraphs as the basis.
+
+Since LMs tend to be well-calibrated that low probability/confidence often indicates a lack of knowledge \cite{when-jiang-2021,mostlyknow-kadavath-2022,varshney-oqa-2022}, we actively trigger retrieval if any token of $\hat{\bm{s}}_t$ has a probability lower than a threshold $\theta \in [0, 1]$.
+$\theta=0$ means retrieval is never triggered, while $\theta=1$ triggers retrieval every sentence.
+\begin{equation*}
+\bm{y}_t = 
+\begin{cases}
+\hat{\bm{s}}_t \quad\quad \text{if all tokens of } \hat{\bm{s}}_t \text{ have probs} \ge \theta \\
+\bm{s}_t=\text{LM}([\mathcal{D}_{\bm{q}_t}, \bm{x}, \bm{y}_{<t}]) \quad\quad \text{otherwise}
+\end{cases}
+\end{equation*}
+where the query $\bm{q}_t$ is formulated based on $\hat{\bm{s}}_t$.
+
+\subsubsection{Confidence-based Query Formulation}
+One way to perform retrieval is to directly use the next sentence $\hat{\bm{s}}_t$ as the query $\bm{q}_t$.
+This shares a similar spirit with methods that use generated hypothetical titles or paragraphs from LMs as retrieval queries or evidences \cite{hyde-gao-2022,recitation-sun-2022,genorret-yu-2022,gar-mao-2021}.
+We generalize such techniques to long-form generation where active information access is essential.
+
+We found retrieving with the next sentence achieves significantly better results than with the previous context, as shown later in \autoref{sec:exp_ablation}.
+However, it has a risk of perpetuating errors contained in it.
+For example, if the LM produces the sentence ``Joe Biden attended the University of Pennsylvania'' instead of the correct fact that he attended the University of Delaware, using this erroneous sentence as a query might retrieve misleading information.
+We propose two simple methods to overcome this issue as illustrated in \autoref{fig:queryformulation}.
+
+\begin{figure}[tb]
+\includegraphics[width=1.0\columnwidth, clip, keepaspectratio]{queryformulation.pdf}
+\centering
+\caption{Implicit and explicit query formulation. Tokens with low probabilities are marked with \underline{underlines}.}
+\label{fig:queryformulation}
+\end{figure}
+
+\paragraph{Masked sentences as implicit queries.} The first method masks out low-confidence tokens in $\hat{\bm{s}}_t$ with probabilities below a threshold $\beta \in [0, 1]$, where a higher $\beta$ results in more aggressive masking.
+This removes potential distractions from the sentence to improve retrieval accuracy.
+
+\paragraph{Generated questions as explicit queries.} Another method is to generate explicit questions that target the low-confident span in $\hat{\bm{s}}_t$.
+For example, if the LM is uncertain about ``the University of Pennsylvania'', a question like ``Which university did Joe Biden attend?'' can help retrieve relevant information.
+Self-ask \cite{selfask-press-2022} achieved this by manually inserting follow-up questions into downstream task exemplars as shown later in Prompt~\autoref{prompt:selfask}, which requires task-specific annotation efforts.
+Instead, we developed a universal approach that generates questions for low-confidence spans without additional annotation.
+Specifically, We first extract all spans from $\hat{\bm{s}}_t$ with probabilities below $\beta$.
+For each extracted span $\bm{z}$, we prompt \texttt{gpt-3.5-turbo} to generate a question $\bm{q}_{t,\bm{z}}$ that can be answered with the span:
+\begin{prompt}[title={Prompt \thetcbcounter: zero-shot question generation}]
+User input $\bm{x}$.\\
+Generated output so far $\bm{y}_{\le t}$.\\
+\\
+Given the above passage, ask a question to which the answer is the term/entity/phrase ``$\bm{z}$''.
+\end{prompt}
+We retrieve using each generated question and interleave the returned documents into a single ranking list to aid future generations.
+In summary, queries $\bm{q}_t$ are formulated based on $\hat{\bm{s}}_t$ as follows:
+\begin{equation*}
+\bm{q}_t = 
+\begin{cases}
+\emptyset \quad\quad \text{if all tokens of } \hat{\bm{s}}_t \text{ have probs} \ge \theta \\
+\text{mask}(\hat{\bm{s}}_t) \text{ or } \text{qgen}(\hat{\bm{s}}_t) \quad\quad \text{otherwise}
+\end{cases}
+\end{equation*}
+
+\subsection{Implementation Details}
+\paragraph{Base LM} We validate our method on one of the most advanced GPT-3.5 LMs \texttt{text-davinci-003} by iteratively querying their API.\footnote{\url{
+https://api.openai.com/v1/completions} April 23.}
+
+\paragraph{Document corpus and retrievers.}
+Since we focus on the integration of retrieval and generation, we use off-the-shelf retrievers that take queries as inputs and return a list of relevant documents.
+For datasets that mainly rely on knowledge from Wikipedia, we use the Wikipedia dump from \citet{dpr-2020-karpukhin} and employ BM25 \cite{bm25-2009-robertson} as the retriever.
+For datasets that rely on knowledge from the open web, we use the Bing search engine as our retriever.\footnote{\url{https://www.microsoft.com/en-us/bing/apis/bing-web-search-api}}
+
+\paragraph{Retrieved document formatting.}
+Multiple retrieved documents are linearized according to their ranking and then added to the beginning of the user input using Prompt~\autoref{prompt:searchresults}.
+
+Other implementation details such as sentence tokenization and efficiency are included \autoref{ap:flare}.
+
+\section{Multi-time Retrieval Baselines}\label{sec:baseline_multi}
+Existing passive multi-time retrieval augmented LMs can also be formulated using our framework (\autoref{sec:activerag}).
+In this section, we formally introduce three baseline categories based on when and what to retrieve.
+These baselines are not exact reproductions of the corresponding paper because many design choices differ which makes direct comparisons impossible.
+We implemented them using the same settings, with the only variation being when and what to retrieve.
+
+\paragraph{Previous-window} approaches trigger retrieval every $l$ tokens, where $l$ represents the window size. Generated tokens from the previous window are used as the query:
+\begin{align*}
+\bm{q}_t &= \bm{y}_{t-1} \quad (t \ge 2), \\
+\bm{y}_t &= [w_{(t-1)l+1},..., w_{tl}].
+\end{align*}
+Some existing methods in this category are RETRO \cite{retro-borgeaud-2022}, IC-RALM \cite{icrlm-ram-2023}, which retrieve every few tokens, and KNN-LM \cite{knnlm-2020-khandelwal}, which retrieves every token.\footnote{Since KNN-LM uses the contextualized representation corresponding to the current decoding position to retrieve relevant information which encodes all previous tokens. Strictly speaking, $\bm{q}_t$ should be $\bm{y}_{<t}$.}
+We follow \citet{icrlm-ram-2023} to use a window size of $l=16$.
+
+\paragraph{Previous-sentence} approaches trigger retrieval every sentence and use the previous sentence as the query, and IRCoT \cite{ircot-trivedi-2022} belongs to this category:
+\begin{align*}
+\bm{q}_t &= \bm{y}_{t-1} \quad (t \ge 2), \\
+\bm{y}_t &= \bm{s}_t.
+\end{align*}
+
+\paragraph{Question decomposition} approaches manually annotated task-specific exemplars to guide LMs to generate decomposed sub-questions while producing outputs.
+For example, self-ask \cite{selfask-press-2022}, a method in this category, manually inserts sub-questions in exemplars using Prompt~\autoref{prompt:selfask}.
+For the test case, retrieval is triggered dynamically whenever the model generates a sub-question.
+
+The aforementioned approaches can retrieve additional information while generating.
+However, they have notable drawbacks: (1) Using previously generated tokens as queries might not reflect what LMs intend to generate in the future. (2) Retrieving information at a fixed interval can be inefficient because it might occur at inappropriate points. (3) Question decomposition approaches require task-specific prompt engineering, which restricts their generalizability in new tasks.
+
+\section{Experimental Setup}
+We evaluate the effectiveness of \ours on 4 diverse knowledge-intensive tasks using few-shot in-context learning \cite{radford-2019-gpt2,gpt3-brown-2020,liu-2023-ppp}.
+We follow previous works \cite{ircot-trivedi-2022} to sub-sample at most 500 examples from each dataset due to the cost of running experiments.
+Datasets, metrics, and settings are summarized in \autoref{tab:setting} of \autoref{ap:setting}.
+The hyperparameters of \ours are selected based on the development set and listed in \autoref{tab:hyperparam}.
+\ours refers to \oursd if not specifically stated.
+
+\paragraph{Multihop QA}
+The goal of multihop QA is to answer complex questions through information retrieval and reasoning.
+We use 2WikiMultihopQA \cite{2wikimultihopqa-ho-2020} which contains 2-hop complex questions sourced from Wikipedia articles that require composition, comparison, or inference, e.g., ``Why did the founder of Versus die?''
+We follow \citet{selfconsist-wang-2022} to generate both the chain-of-thought and the final answer.
+Experimental setting details are included in \autoref{ap:setting}.
+
+We use regular expressions to extract the final answer from the output and compare it with the reference answer using exact match (EM), and token-level \fone, precision, and recall.
+
+\paragraph{Commonsense reasoning}
+Commonsense reasoning requires world and commonsense knowledge to generate answers.
+We use StrategyQA \cite{strategyqa-geva-2021} which is a collection of crowdsourced yes/no questions, e.g., ``Would a pear sink in water?''
+We follow \citet{cot-wei-2022} to generate both the chain-of-thought and the final yes/no answer.
+Details are included in \autoref{ap:setting}. 
+
+We extract the final answer and match it against the gold answer using exact match.
+
+\paragraph{Long-form QA}
+Long-form QA aims to generate comprehensive answers to questions seeking complex information \cite{eli5-fan-2019,asqa-stelmakh-2022}.
+We use ASQA \cite{asqa-stelmakh-2022} as our testbed where inputs are ambiguous questions with multiple interpretations, and outputs should cover all of them.
+For example, ``Where do the Philadelphia Eagles play their home games?'' could be asking about the city, sports complex, or stadium. 
+We found in many cases it is challenging even for humans to identify which aspect of the question is ambiguous.
+Therefore, we created another setting (ASQA-hint) where we provide a brief hint to guide LMs to stay on track when generating answers.
+The hint for the above case is ``This question is ambiguous in terms of which specific location or venue is being referred to.''
+Experimental setting details are included in \autoref{ap:setting}.
+
+We use metrics from \citet{asqa-stelmakh-2022}, including EM, RoBERTa-based QA score (Disambig-\fone), ROUGE \cite{lin-2004-rouge}, and an overall score combining Disambig-\fone and ROUGE (DR).
+
+\begin{figure*}[tb]
+\includegraphics[width=1.0\textwidth, clip, keepaspectratio]{exp_all6.pdf}
+\centering
+\caption{Comparision between \ours and baselines across all tasks/datasets. We report the primary metric for each dataset: EM for 2WikiMultihopQA, StrategyQA, and ASQA, and UniEval for WikiAsp.}
+\label{fig:exp_all}
+\end{figure*}
+
+\paragraph{Open-domain summarization}
+The goal of open-domain summarization is to generate a comprehensive summary about a topic by gathering information from open web \cite{openmds-giorgi-2022}.
+We use WikiAsp \cite{wikiasp-hayashi-2021} which aims to generate aspect-based summaries about entities from 20 domains in Wikipedia, e.g., ``Generate a summary about Echo School (Oregon) including the following aspects: academics, history.''
+Experimental setting details are included in \autoref{ap:setting}.
+
+Metrics include ROUGE, named entity-based \fone, and UniEval \cite{unieval-zhong-2023} which measures factual consistency.
+
+\section{Experimental Results}
+We first report overall results across 4 tasks/datasets and compare the performance of \ours with all the baselines introduced in \autoref{sec:baseline_multi}.
+We then run ablation experiments to study the efficacy of various design choices of our method.
+
+\subsection{Comparison with Baselines}\label{sec:exp_main}
+\paragraph{Overall results.}
+The overall performance of \ours and baseline across all tasks/datasets are reported in \autoref{fig:exp_all}.
+\ours outperforms all baseline on all tasks/datasets, indicating that \ours is a generic method that can effectively retrieve additional information throughout the generation.
+
+Among various tasks, multihop QA shows the most significant improvement.
+This is largely due to the task's clear definition and specific objective of producing the final answer through a 2-hop reasoning process, which makes it easier for LMs to generate on-topic output.
+In contrast, ASQA and WikiAsp are more open-ended, which increases the difficulty of both generation and evaluation.
+The improvement on ASQA-hint is larger than that of ASQA because identifying ambiguous aspects is challenging even for humans in many cases, and providing a generic hint helps LMs to stay on topic.
+
+\begin{table}[tb]
+\small
+\centering
+\begin{tabular}{lcccc}
+\toprule
+\textbf{Methods} & \textbf{EM} & \textbf{\fone} & \textbf{Prec.} & \textbf{Rec.} \\
+\midrule
+No retrieval & 28.2 & 36.8 & 36.5 & 38.6 \\
+Single-time retrieval & 39.4 & 48.8 & 48.6 & 51.5 \\
+\midrule
+\multicolumn{5}{c}{\emph{Multi-time retrieval}} \\
+Previous-window & 43.2 & 52.3 & 51.7 & 54.5 \\
+Previous-sentence & 39.0 & 49.2 & 48.9 & 51.8 \\
+Question decomposition & 47.8 & 56.4 & 56.1 & 58.6 \\
+\oursr (ours) & 42.4 & 49.8 & 49.1 & 52.5 \\
+\oursd (ours) & \textbf{51.0} & \textbf{59.7} & \textbf{59.1} & \textbf{62.6} \\
+\bottomrule
+\end{tabular}
+\caption{\ours and baselines on 2WikiMultihopQA. Previous-window \cite{retro-borgeaud-2022,icrlm-ram-2023}, previous-sentence \cite{ircot-trivedi-2022}, and question decomposition \cite{selfask-press-2022,react-yao-2022} methods are reimplemented for fair comparisons.}
+\label{tab:2wikihop}
+\end{table}
+
+\begin{table*}[tb]
+\centering
+\begin{tabular}{@{}l@{\smallcol}c|c@{\smallcol}c@{\smallcol}c@{\smallcol}c|c@{\smallcol}c@{\smallcol}c@{\smallcol}c|c@{\smallcol}c@{\smallcol}c@{}}
+\toprule
+\textbf{Datasets} & \textbf{StrategyQA} & \multicolumn{4}{c|}{\textbf{ASQA}} & \multicolumn{4}{c|}{\textbf{ASQA-hint}} & \multicolumn{3}{c}{\textbf{WikiAsp}}  \\
+\textbf{Metrics} & \textbf{EM} & \textbf{EM} & \textbf{D-\fone} & \textbf{R-L} & \textbf{DR} & \textbf{EM} & \textbf{D-\fone} & \textbf{R-L} & \textbf{DR} & \textbf{UniEval} & \textbf{E-\fone} & \textbf{R-L} \\
+\midrule
+No retrieval & 72.9 & 33.8 & 24.2 & 33.3 & 28.4 & 40.1 & 32.5 & 36.4 & 34.4 & 47.1 & 14.1 & 26.4 \\
+Single-time retrieval & 68.6 & 40.0 & 27.1 & 34.0 & 30.4 & 43.2 & 34.8 & 37.4 & 36.0 & 52.4 & 17.4 & 26.9 \\
+\midrule
+\multicolumn{13}{c}{\emph{Multi-time retrieval}} \\
+Previous-window & 71.2 & 39.9 & 27.0 & \textbf{34.3} & 30.4 & 43.7 & 35.7 & 37.5 & 36.6 & 51.8 & 18.1 & 27.3 \\
+Previous-sentence & 71.0 & 39.9 & 27.9 & \textbf{34.3} & 30.9 & 44.7 & 35.9 & 37.5 & 36.7 & 52.6 & 17.8 & 27.2 \\
+\ours (ours) & \textbf{77.3} & \textbf{41.3} & \textbf{28.2} & \textbf{34.3} & \textbf{31.1} & \textbf{46.2} & \textbf{36.7} & \textbf{37.7} & \textbf{37.2} & \textbf{53.4} & \textbf{18.9} & \textbf{27.6} \\
+\bottomrule
+\end{tabular}
+\caption{Comparison between \ours and baselines on StrategyQA, ASQA, ASQA-hint, and WikiAsp. D-\fone is Disambig-\fone, R-L is ROUGE-L, and E-\fone is named entity-based \fone.}
+\label{tab:other}
+\end{table*}
+
+\paragraph{Thorough comparisons with baselines.}
+The performance of all baselines on 2WikiMultihopQA are reported in \autoref{tab:2wikihop}.
+\ours outperforms all baselines by a large margin, which confirms that forward-looking active retrieval is highly effective.
+Most multi-time retrieval augmented approaches outperform single-time retrieval but with different margins.
+The improvement of retrieving using the previous sentence is relatively small which we hypothesize is mainly because the previous sentence often describes entities or relations different from those in the next sentence in 2WikiMultihopQA.
+While the previous-window approach might use the first half of a sentence to retrieve information potentially helpful for generating the second half.
+Among all baselines, the question decomposition approach \cite{selfask-press-2022} achieves the best performance. which is not surprising since the in-context exemplars manually annotated with decomposed sub-questions (Prompt~\autoref{prompt:selfask}) guide LMs to generate sub-questions that align with the topic/intent of future generations.
+\ours outperforms this baseline, indicating that manual exemplar annotation is not necessary for effective future-aware retrieval.
+The gap between \oursr and question decomposition is large, indicating that teaching LMs to generate search queries using task-generic retrieval instructions and exemplars is challenging.
+
+We report all metrics for the other datasets in \autoref{tab:other}.
+\ours outperforms baselines with respect to all metrics.
+Retrieval using the previous window underperforms single-time retrieval on ASQA, which we hypothesize is because the previous window does not accurately reflect future intent.
+Since we focus on evaluating factuality, metrics with an emphasis on factual content (such as EM, Disambig-\fone, UniEval) are more reliable than metrics computed over all tokens (ROUGE-L).
+
+\subsection{Ablation Study}\label{sec:exp_ablation}
+
+\begin{table}[tb]
+\small
+\centering
+\begin{tabular}{@{}l@{\smallcol}c@{\smallcol}c@{\smallcol}c@{\smallcol}c|c@{\smallcol}c@{\smallcol}c@{\smallcol}c}
+\toprule
+& \multicolumn{4}{c|}{\textbf{2WikiMultihopQA}} & \multicolumn{4}{c}{\textbf{ASQA-hint}} \\
+& \textbf{EM} & \textbf{\fone} & \textbf{Prec.} & \textbf{Rec.} & \textbf{EM} & \textbf{D-\fone} & \textbf{R-L} & \textbf{DR} \\
+\midrule
+Previous & 39.0 & 49.2 & 48.9 & 51.8 & 42.5 & 34.1 & 36.9 & 35.5 \\
+Next & 48.8 & 57.6 & 57.1 & 60.5 & 45.9 & 35.7 & 37.5 & 36.6 \\
+\bottomrule
+\end{tabular}
+\caption{A head-to-head comparison between using the previous sentence and the next sentence for retrieval.}
+\label{tab:prev_next}
+\end{table}
+
+\begin{table}[tb]
+\small
+\centering
+\begin{tabular}{lcccc}
+\toprule
+\textbf{\#Tokens} & \textbf{EM} & \textbf{\fone} & \textbf{Prec.} & \textbf{Rec.} \\
+\midrule
+16 & 43.2 & 52.3 & 51.7 & 54.5 \\
+32 & 43.6 & 52.4 & 52.0 & 55.0 \\
+48 & 40.0 & 49.3 & 49.0 & 52.0 \\
+All & 39.0 & 48.5 & 48.2 & 51.1 \\
+\bottomrule
+\end{tabular}
+\caption{Previous-window approaches using different numbers of tokens as queries.}
+\label{tab:prev_tokens}
+\end{table}
+
+\paragraph{Importance of forward-looking retrieval.}
+We first validate that forward-looking retrieval is more effective than past-context-based retrieval.
+We run ablation experiments on 2WikiMultihopQA and ASQA-hint comparing retrieval using the previous versus the next sentence.
+Specifically, both methods retrieve every sentence and directly use the complete previous/next sentence as queries.
+As shown in \autoref{tab:prev_next}, using the next sentence to retrieve is clearly better than using the previous sentence, confirming our hypothesis.
+
+We also run previous-window approaches using different numbers of past tokens as queries.
+As shown in \autoref{tab:prev_tokens}, using too many tokens ($>32$) in the past hurts the performance, further confirming our hypothesis that previous context might not be relevant to intent of future generations.
+
+\begin{figure}[tb]
+\includegraphics[width=1.0\columnwidth, clip, keepaspectratio]{adaptive.pdf}
+\centering
+\caption{Performance (EM) of \ours with respect to the percentage of steps/sentences with retrieval on 2WikiMultihopQA and StrategyQA.}
+\label{fig:exp_adaptive}
+\end{figure}
+
+\paragraph{Importance of active retrieval.}
+Next, we investigate how active retrieval threshold $\theta$ affects performance.
+To alter our method from not retrieving to retrieving every sentence, we adjust the confidence threshold $\theta$ that determines when to trigger retrieval from 0 to 1.
+We then calculate the proportion of steps/sentences where retrieval is activated, and present the performance based on it.
+As shown in \autoref{fig:exp_adaptive}, on 2WikiMultihopQA, the performance plateaus when the retrieval percentage exceeds 60\%, indicating that retrieval when LMs are confident is not necessary.
+On StrategyQA, the performance drops when the retrieval percentage exceeds 50\%, indicating that unnecessary retrieval can introduce noise and impede the original generation process.
+We found triggering retrieval for 40\%-80\% of sentences usually leads to a good performance across tasks/datasets.
+
+\begin{table}[tb]
+\small
+\centering
+\begin{tabular}{lcccc}
+\toprule
+\textbf{$\beta$} & \textbf{EM} & \textbf{\fone} & \textbf{Prec.} & \textbf{Rec.} \\
+\midrule
+0.0 & 0.488 & 0.576 & 0.571 & 0.605 \\
+0.2 & 0.498 & 0.588 & 0.582 & 0.616 \\
+0.4 & 0.510 & 0.597 & 0.591 & 0.627 \\
+0.6 & 0.506 & 0.593 & 0.586 & 0.622 \\
+\bottomrule
+\end{tabular}
+\caption{Performance of \ours with respect to the masking threshold $\beta$ on 2WikiMultihopQA.}
+\label{tab:exp_mask}
+\end{table}
+
+\begin{table}[tb]
+\small
+\centering
+\begin{tabular}{l@{\smallcol}c@{\smallcol}c@{\smallcol}c@{\smallcol}c|c@{\smallcol}c@{\smallcol}c}
+\toprule
+& \multicolumn{4}{c|}{\textbf{ASQA-hint}} & \multicolumn{3}{c}{\textbf{WikiAsp}} \\
+& \textbf{EM} & \textbf{D-\fone} & \textbf{R-L} & \textbf{DR} & \textbf{UniEval} & \textbf{E-\fone} & \textbf{R-L} \\
+\midrule
+Implicit & 45.7 & 36.9 & 37.7 & 37.3 & 53.4 & 18.8 & 27.7 \\
+Explicit & 46.2 & 36.7 & 37.7 & 37.2 & 53.4 & 18.9 & 27.6 \\
+\bottomrule
+\end{tabular}
+\caption{A comparison between implicit and explicit query formulation methods in \ours.}
+\label{tab:implicit_explicit_query}
+\end{table}
+
+\paragraph{Effectiveness of different query formulation methods}
+We study implicit query formation by masking and explicit query formulation through question generation.
+In \autoref{tab:exp_mask}, we compare the performance of \ours with different masking thresholds $\beta$.
+Retrieving directly with the complete sentence ($\beta=0$) is worse than masking tokens with low probabilities, confirming our hypothesis that low-confidence erroneous tokens can distract retrievers.
+We compare implicit and explicit query formulation methods in \autoref{tab:implicit_explicit_query}.
+Performances of both methods are similar, indicating that both methods can effectively reflect information needs.
+
+\section{Related Work}
+We refer to \autoref{sec:baseline_single} and \autoref{sec:baseline_multi} for extensively discussion on single-time and multi-time retrieval augmented LMs, which is the most relevant area to this paper.
+
+\paragraph{Iterative and adaptive retrieval}
+Iterative retrieval and refinement has been studied in both text and code generation tasks \cite{peng-check-2023,repocoder-jiang-2023,zemlyanskiy-gr-2022,retfeed-yu-2023}.
+\ours differs from these methods in the granularity of generation and retrieval strategies.
+Adaptive retrieval has been studied in single-time retrieval scenarios based on either question popularity or generation probabilities \cite{mallen-nottrust-2022,oyster-li-2023}, while we focus on long-form generation requiring active information access.
+\paragraph{Browser-enhanced LMs} WebGPT \cite{webgpt-nakano-2021} and WebCPM \cite{webcpm-qin-2023} train LMs to interact with browser to enhance factuality using reinforcement learning or supervised training where multiple queries can be triggered before generation.
+\ours is built on text-based retrievers but can be combined with a browser to potentially improve retrieval quality.
+
+\section{Conclusion}
+To aid long-form generation with retrieval augmentation, we propose an active retrieval augmented generation framework that decides when and what to retrieve during generation.
+We implement this framework with forward-looking active retrieval that iteratively uses the upcoming sentence to retrieve relevant information if it contains low-confidence tokens and regenerates the next sentence.
+Experimental results on 4 tasks/datasets demonstrate the effectiveness of our methods.
+Future directions include better strategies for active retrieval and developing efficient LM architectures for active information integration.
+
+\section{Limitations}\label{sec:limit}
+We also conduct experiments on Wizard of Wikipedia \cite{wow-dinan-2019} and ELI5 \cite{eli5-fan-2019}, and found that \ours did not provide significant gains.
+Wizard of Wikipedia is a knowledge-intensive dialogue generation dataset where the output is relatively short ($\sim$20 tokens on average) so retrieving multiple disparate pieces of information might not be necessary.
+ELI5 \cite{eli5-fan-2019} is a long-form QA dataset requiring in-depth answers to open-ended questions.
+Due to issues mentioned in \citet{hurdle-krishna-2021} such as difficulties of grounding generation in retrieval and evaluation, both single-time retrieval and \ours did not provide significant gains over not using retrieval.
+From an engineering perspective, interleaving generation and retrieval with a naive implementation increases both overheads and the cost of generation.
+LMs need to be activated multiple times (once for each retrieval) and a caching-free implementation also requires recomputing the previous activation each time after retrieval.
+This issue can be potentially alleviated with special architectural designs that encode the retrieved documents $\mathcal{D}_{\bm{q}_t}$ and the input/generation ($\bm{x}$/$\bm{y}_{<t}$) independently.
+
+\section*{Acknowledgements}
+This work was supported in part by a grant from the Singapore Defence Science and Technology Agency and the IBM PhD Fellowship.
+We thank Chunting Zhou, Amanda Bertsch, Uri Alon, Hiroaki Hayashi, Harsh Trivedi, Patrick Lewis, Timo Schick, Kaixin Ma, Shuyan Zhou, and Songwei Ge for their insightful discussions and help with the experiments.
+
+\newpage
+
+\newpage
+
+\end{document}

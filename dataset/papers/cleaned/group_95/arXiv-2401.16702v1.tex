@@ -1,0 +1,507 @@
+\title{Multi-granularity Correspondence Learning from Long-term Noisy Videos}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+Existing video-language studies mainly focus on learning short video clips, leaving long-term temporal dependencies rarely explored due to over-high computational cost of modeling long videos. To address this issue, one feasible solution is learning the correspondence between video clips and captions, which however inevitably encounters the multi-granularity noisy correspondence (MNC) problem. To be specific, MNC refers to the clip-caption misalignment (coarse-grained) and frame-word misalignment (fine-grained), hindering temporal learning and video understanding. In this paper, we propose NOise Robust Temporal Optimal traNsport (Norton) that addresses MNC in a unified optimal transport (OT) framework. In brief, Norton employs video-paragraph and clip-caption contrastive losses to capture long-term dependencies based on OT. To address coarse-grained misalignment in video-paragraph contrast, Norton filters out the irrelevant clips and captions through an alignable prompt bucket and realigns asynchronous clip-caption pairs based on transport distance. To address the fine-grained misalignment, Norton incorporates a soft-maximum operator to identify crucial words and key frames. Additionally, Norton exploits the potential faulty negative samples in clip-caption contrast by rectifying the alignment target with OT assignment to ensure precise temporal modeling. Extensive experiments on video retrieval, videoQA, and action segmentation verify the effectiveness of our method. 
+Code is available at {\href{https://lin-yijie.github.io/projects/Norton}{https://lin-yijie.github.io/projects/Norton}}.
+\end{abstract}
+
+\section{Introduction}
+
+Video-Language Pre-training (VLP) has emerged as a popular approach for video understanding~\citep{milnce,bain2021frozen,ge2022bridging,wang2022contrastive,luo2020univl} in recent years. Although promising results have been achieved, the pioneer works are mainly devoted to learning short video clips while overlooking long-term temporal dependencies. In practice, it is generally acknowledged that the long-term temporal dependency plays an indispensable role in understanding the relationships and transitions over time in various applications such as video-paragraph retrieval~\citep{tempclr,sun2022long} and action segmentation~\citep{coin}.
+
+To learn the long-term temporal correspondence from the long videos, one important challenge is the heavy demand for computation resources. For example, \cite{tan,bertasius2021space} employ long-form vision transformers to capture the temporal correlation, which involves computing cross-attention among every frame in long videos. As long videos are typically composed of a sequence of short video clips according to ASR timestamps~\citep{milnce}, an alternative approach is to explore the temporal correlation among video clips and captions. For instance, TempCLR~\citep{tempclr} uses Dynamic Time Warping~\citep{muller2007dynamic,softdtw,zhou2009canonical} to measure the sequential distance between video clips and captions, and incorporates the temporal correlation across clips by contrasting the video with the paragraph. This strategy is remarkably efficient than directly modeling the entire video, making it an attractive option for learning long-term temporal correspondence.  
+
+\begin{figure}
+\centering
+\includegraphics[width=1\linewidth]{fig/motivation}
+\caption{Our observation on multi-granularity noisy correspondence (MNC) in video understanding. 
+(\textit{Left}) The green timeline denotes the alignable captions while the red timeline indicates the unalignable captions. The green text in $\mathbf{t}_5$ denotes partially correlated words w.r.t $\mathbf{v}_5$.
+ (\textit{Right}) The dashed line represents the original alignment according to timestamps and the red block indicates the misaligned clip-caption pair. The green block denotes the ground-truth alignment. The solid line denotes the re-alignment by Dynamic Time Warping~\citep{muller2007dynamic} which struggles to handle noisy correspondence well. 
+}
+\label{fig:BasicIdea}
+\end{figure}
+
+However, dividing long videos into short clips would inevitably introduce an accompanied challenge, \ie, multi-granularity noisy correspondence (MNC).
+As shown in Fig.~\ref{fig:BasicIdea}, MNC refers to the misaligned video-text pairs at two different granularities:
+i) \textit{Coarse-grained misalignment (Clip-caption).} Coarse-grained misalignment includes \textit{asynchronous} and \textit{irrelevant} misalignments according to whether a clip/caption is alignable with the captions/clips in the long video. 
+To be specific, asynchronous misalignment refers to temporal misalignment between subtitles and visual clips, \eg, $\mathbf{t}_1$ in Fig.~\ref{fig:BasicIdea}. It often occurs when people explain their actions before or after actually performing them, resulting in the mismatch between the order of statements and actions. 
+On the other hand, irrelevant misalignment refers to irrelevant or meaningless captions that cannot be aligned with any available video clips (\eg, $\mathbf{t}_2$ and $\mathbf{t}_6$ in Fig.~\ref{fig:BasicIdea}), and vice versa for video clips. According to~\cite{tan}, only 30\% of clip-caption pairs are visually aligned in HowTo100M~\citep{howto100m}, with even fewer 15\% being naturally well-aligned; 
+ii) \textit{Fine-grained misalignment (Frame-word).} Within each video clip, the narration sentences may only partially correlate with the visual frames. As depicted in Fig.~\ref{fig:BasicIdea}, ``the sugar goes on top" in $\mathbf{t}_5$ is strongly correlated with visual content $\mathbf{v}_5$ while the action ``watch the glaze take off" is uncorrelated. Irrelevant words or frames can distort the identification of crucial ones and result in inaccurate similarity measurements, further contaminating the clip-caption alignment. 
+Note that only a few methods~\citep{tan} consider the coarse-grained misalignment problem in temporal learning while none of them realize this fine-grained misalignment problem. 
+Undoubtedly, MNC poses a significant obstacle to effective temporal modeling.
+
+To this end, we propose NOise Robust Temporal Optimal traNsport (Norton), a unified optimal transport approach for addressing multi-granularity noisy correspondence in temporal learning. Specifically, Norton proposes a video-paragraph and a clip-caption contrastive loss based on optimal transport (OT) to explore the temporal correlations. 
+
+In video-paragraph contrast, Norton employs OT to measure sequence distances between video clips and captions from a fine-to-coarse perspective. To handle fine-grained misalignment, Norton incorporates a token-wise soft-maximum operator to identify crucial words and key frames within each clip-caption pair. This operator improves the measurement of clip-caption similarity from fine-grained multi-modal interactions. Building upon this clip-caption similarity, Norton establishes a flexible assignment between clips and captions by maximizing the global alignment similarity of OT. 
+Based on the transport assignment, Norton realigns each video clip to multiple related captions, and vice versa, thereby mitigating the asynchronous misalignment. To further address the irrelevant misalignment, Norton introduces an alignable prompt bucket which serves as a candidate alignable target for noisy clips or captions.
+By discarding the ones aligned to the bucket, Norton effectively filters out meaningless content during the OT process. Note that our late interaction between clips and captions through OT alleviates the computational cost of directly modeling long videos.
+
+In clip-caption contrast, Norton tackles the faulty negative problem~\citep{chuang2020debiased,yang2021partially} through OT. Specifically, semantically similar clip and captions would be wrongly treated as negatives in contrastive learning~\citep{chen2020simple,lin2021completer,lin2022dcp,liu2022scc} and impact the clip-wise representation. Norton leverages OT assignments of within-batch clip-caption pairs as additional supervision in clip-caption contrastive loss, which exploits potential faulty negative samples and improves temporal learning.
+
+The main contributions of this work are summarized below:
+\begin{itemize}
+[leftmargin=*,topsep=-1pt,itemsep=0ex]
+\item We reveal multi-granularity noisy correspondence problem in temporal learning, which refers to coarse-grained asynchronous and irrelevant misalignments, as well as fine-grained misalignment.
+\item We achieve efficient and robust  correspondence learning by incorporating several innovative components such as the soft-maximum operator, alignable prompt bucket, and faulty negative exploitation within the optimal transport framework. Extensive experiments on various tasks including video retrieval, videoQA, and action segmentation verify its effectiveness. 
+\end{itemize}
+
+\section{Related Work}
+
+\paragraph{Video Temporal Learning.} 
+Temporal learning is a critical yet challenging topic in video understanding. Traditional works focus on integrating spatial-temporal operations into convolution~\citep{feichtenhofer2019slowfast} or Transformer architectures~\citep{bertasius2021space,wang2022all,sun2022long}. Inspired by image-language pre-training approaches~\citep{clip,align}, recent works leverage natural language to guide video temporal learning. Among these works, one scheme is ``sorting the clips"~\citep{merlot,zeng2023tvtsv2,zeng2022learning,ma2023temporal} which involves ranking the video clips according to their sequential sentences. While effective, this framework generally requires encoding long video into one sequence and entails significant computational resources. Another type of scheme proposes to leverage Dynamic Time Warping~\citep{tempclr, muller2007dynamic,dropdtw} to measure the sequence distance between video clips and captions, and achieve temporal learning by aligning the video with the corresponding paragraph. 
+
+Although promising results have been achieved, existing temporal learning methods suffer from the noisy correspondence problem where the ground truth order of captions w.r.t. video clips does not conform to the original timestamp order. This issue can significantly impact temporal learning, leading to suboptimal results for sorting-based and DTW-based approaches. 
+Different from these works, this paper is dedicated to solving noisy correspondence in temporal learning and accordingly proposes an MNC-robust optimal transport framework that effectively measures sequence similarity between noisy video and paragraph.
+
+\paragraph{Noisy Correspondence Learning in Video-language Pre-training.} Video-language pre-training has achieved promising progress thanks to large-scale datasets such as HowTo100M~\citep{howto100m}. As the text description is often not well-aligned to the visual content~\citep{tan}, noisy correspondence learning~\citep{huang2021learning,gao2021clip2tv} becomes a new fashion in VLP. To be specific, MIL-NCE~\citep{milnce} first studies this problem by simply aligning each video clip with multiple adjacent sentences to mitigate the impact of noise.
+TAN~\citep{tan} proposes a co-training strategy that uses mutual agreement to filter out the noisy pairs. Different from the above on-the-fly noise rectified methods, Decembert~\citep{decembert} generates high-quality video descriptions using an off-the-shelf image captioning model from a data collection aspect.
+
+Our method differs from existing works in two key aspects. First, the above noisy correspondence methods only consider coarse-grained asynchrony while ignoring the frame-word misalignment problem. In contrast, we point out that fine-grained misalignment can impact temporal learning and accordingly propose a unified optimal transport approach that effectively addresses noisy correspondence at both coarse and fine-grained levels.
+Second, our method is computationally efficient with a low memory cost. It operates in a bootstrapping manner without requiring additional models, \eg, dual networks~\citep{tan}, momentum networks~\citep{albef,tan}, or image caption models~\citep{decembert}. These advantages make our approach more practical and scalable for real-world applications.
+
+\paragraph{Optimal Transport.} OT is originally proposed to depict the distance between two probability distributions. Recently, OT has gained significant attention in various fields such as domain adaptation~\citep{xu2020reliable}, clustering~\citep{caron2020unsupervised}, document matching~\citep{yu2022optimal,kusner2015word}, and sequence alignment~\citep{su2017order,liu2022learning}. However, none of these works specifically focus on the alignment of video and text, which is the primary focus of our research. In addition to addressing the traditional sequence alignment, we point out the fine-grained misalignment problem that is specific to video-text learning. Experimental results show that the proposed multi-grained alignment effectively improves temporal learning.
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=1\linewidth]{fig/framework}
+\caption{
+Overview of our multi-granularity correspondence learning. We perform video-paragraph contrastive learning to capture long-term temporal correlations from a fine-to-coarse perspective. Specifically, we first utilize the log-sum-exp operator on the frame-word similarity matrix to obtain fine-grained similarity between clip and caption. Additionally, we append an alignable prompt bucket on the clip-caption similarity matrix to filter out the irrelevant clips or captions. By applying Sinkhorn iterations on the clip-caption similarity matrix, we effectively tackle the asynchronous problem and obtain the optimal transport distance as the video-paragraph similarity.
+}
+\label{fig:framework}
+\end{figure}
+
+\section{Method}
+
+\label{sec:method}
+
+In this section, we first introduce the overall pre-training objective of Norton in Section~\ref{sec:3.1}. Subsequently, we elaborate on our multi-granularity correspondence learning in Section~\ref{sec:3.2} and explain how to exploit the faulty negative samples in clip-caption contrastive learning in Section~\ref{sec:3.3}. 
+
+\subsection{Pre-training Objective}
+\label{sec:3.1}
+
+Given an instructional video dataset $\mathcal{D}=\left\{\mathbf{V}_i, \mathbf{T}_i\right\}_{i=1}^N$, where $\mathbf{V}_i$ and $\mathbf{T}_i$ represent the video and paragraph of $i$-th instance, we formulate each video/paragraph as a sequence of video clips/captions according to the ASR timestamps. Specifically, we mark the video clips and captions in $i$-th video as $\{\mathbf{v}_a\}_{a=1}^n$ and $\{\mathbf{t}_b\}_{b=1}^m$. Here $\{\mathbf{v}_a^j\}_{j=1}^f$ and $\{\mathbf{t}_b^j\}_{j=1}^w$ represent the frames and words within $\mathbf{v}_a$ and $\mathbf{t}_b$, where $f$ and $w$ represent the length of the clip and caption. Based on the above definitions, we propose the following training objectives:
+\begin{equation}
+  \mathcal{L}=\mathcal{L}_{\text{clip}}+\lambda \mathcal{L}_{\text{video}},
+\end{equation}
+where video-paragraph contrastive loss $\mathcal{L}_{\text{video}}$ explores the temporal correlations between the long video $\mathbf{V}_i$ and its corresponding paragraph $\mathbf{T}_i$ through a novel noise robust temporal optimal transport distance. The clip-caption contrastive loss $\mathcal{L}_{\text{clip}}$ exploits potential faulty negative samples to improve clip representation and ensure accurate temporal modeling. We will elaborate on these two losses in the following sections.
+
+\subsection{Correspondence Learning via Robust Optimal Transport}
+\label{sec:3.2}
+
+As long videos are typically composed of a sequence of short video clips, we propose to use the optimal transport distance between video clips and captions as the similarity criterion for video-paragraph contrastive learning in a robust and efficient way. 
+
+Let $\mathbf{S} \in \mathbb{R}^{n\times m}$ denote the clip-caption similarity matrix where $[\mathbf{S}]_{a,b}$ measures the similarity between clip $\textbf{v}_a$ and caption $\textbf{t}_b$. $\mathbf{Q}\in \mathbb{R}_{+}^{n\times m}$ denotes the corresponding  transport assignment where $[\mathbf{Q}]_{a,b}$ represents the probabilities of aligning $\textbf{v}_a$ with $\textbf{t}_b$.
+Optimal transport seeks to establish a flexible alignment between clips and captions by maximizing global similarity $\langle \mathbf{Q}, \mathbf{S}\rangle=\operatorname{tr}(\mathbf{Q}^\top\mathbf{S})$.
+Formally, the objective of optimal transport is defined as follows:
+\begin{equation}
+  \begin{aligned}
+ \max _{\mathbf{Q} \in \mathcal{Q}} & \quad 
+ \langle\mathbf{Q},~ \mathbf{S}\rangle +\varepsilon H(\mathbf{Q})\\
+\text { s.t. } &  
+\quad 
+\mathcal{Q}=\left\{\mathbf{Q} \in \mathbb{R}_{+}^{n \times m} \mid \mathbf{Q} \mathbf{1}_m=\boldsymbol{\mu}, \mathbf{Q}^{\top} \mathbf{1}_n= \boldsymbol{\nu} \right\}.
+\end{aligned}
+\label{eq:ot}
+\end{equation}
+where $\mathbf{1}_m$ represents the vector of ones in dimension $m$, $\boldsymbol{\mu}\in \mathbb{R}^{n}$ and $\boldsymbol{\nu}\in \mathbb{R}^{m}$ indicate the relative importance of each clip or caption. Since each clip or caption is sampled independently, we choose uniform probability distribution $\boldsymbol{\mu}=\frac{1}{n} \mathbf{1}_n \text { and } \boldsymbol{\nu}=\frac{1}{m} \mathbf{1}_m$ to assign equal weight to each instance following~\cite{su2017order}.
+$H(\mathbf{Q})$ is an entropy regularizer derived from the optimization perspective~\citep{sinkhorn} and $\varepsilon$ controls its smoothness. 
+
+As illustrated in Eq.~(\ref{eq:ot}), optimal transport can realign each clip or caption to multiple related captions or clips based on global similarity, thus effectively resolving the potential asynchronous misalignment problem between the two modalities. The optimal $\mathbf{Q}^*$ of Eq.~(\ref{eq:ot}) has a simple normalized exponential matrix solution by Sinkhorn fixed point iterations~\citep{sinkhorn}, 
+\begin{equation}
+\begin{aligned}
+	  \mathbf{Q}^* & =  \operatorname{Diag}(\boldsymbol{\kappa}_1) \exp \left({ \mathbf{S}}/{\varepsilon}\right) \operatorname{Diag}(\boldsymbol{\kappa}_2),\\
+\text{  with iteratively updated}~&
+\boldsymbol{\kappa}_1 \leftarrow \boldsymbol{\mu} . /\left(\exp\left({ {\mathbf{S}}}/{\varepsilon}\right)\boldsymbol{\kappa}_2\right),  ~
+\boldsymbol{\kappa}_2 \leftarrow \boldsymbol{\nu} . /\left(\exp\left({\mathbf{S}^{\top}}/{\varepsilon}\right) \boldsymbol{\kappa}_1\right),
+\end{aligned}
+  \label{eq:q_ot}
+\end{equation}
+where $\boldsymbol{\kappa}_1 \in \mathbb{R}^n$, $\boldsymbol{\kappa}_2 \in \mathbb{R}^m$ are the non-negative left and right scaling vectors. 
+By utilizing OT distance between clips and captions as the video-paragraph similarity, our video-paragraph contrastive loss captures the long-term temporal dependencies as follows,
+\begin{equation}
+  \mathcal{L}_{\text{video}} = -
+    \sum_{i=1}^N
+    \left(
+  \log \frac{
+  \exp \left(\langle\mathbf{Q}_{ii},~\mathbf{S}_{ii}\rangle/ \tau\right)}
+  {
+  \sum_{j=1}^N \exp \left(\langle
+  \mathbf{Q}_{ij},~\mathbf{S}_{ij}\rangle / \tau\right)}
+  +
+  \log \frac{
+  \exp \left(\langle\mathbf{Q}_{ii},~\mathbf{S}_{ii}\rangle/ \tau\right)}
+  {
+  \sum_{j=1}^N \exp \left(\langle
+  \mathbf{Q}_{ji},~\mathbf{S}_{ji}\rangle / \tau\right)}
+  \right)
+  ,
+  \label{eq:lossseq}
+\end{equation}
+where $\mathbf{S}_{ij}\in \mathbb{R}^{n\times m}$ is the clip-caption similarity matrix between video $\mathbf{V}_i$ and paragraph $\mathbf{T}_j$, $\mathbf{Q}_{ij}$ is the corresponding transport assignment of $\mathbf{S}_{ij}$, and $\tau$ is a learnable temperature initialized as 0.07. Note that when calculating Eq.~(\ref{eq:lossseq}), we stop the gradient of the transport assignment $\mathbf{Q}$ to keep the stability of our video-paragraph contrastive loss. To ensure the discriminative capacity of the model, we search the nearest videos as the hard negative samples following~\cite{videoclip}. By using optimal transport to measure sequence distance instead of directly modeling the long videos, our method significantly reduces computational cost. A detailed training efficiency discussion is placed in Appendix~\ref{app:timecost}.
+
+ 
+
+However, the optimal transport objective Eq.~(\ref{eq:ot}) still has some limitations: i) OT estimates the sequence distance based on clip-caption similarity (coarse-grained), leaving word-frame misalignment (fine-grained) problem unexplored; ii) OT requires each source instance must exactly map to the targets, which is not practical when dealing with a large amount of meaningless text. To address these challenges, we propose a soft-maximum operator for fine-grained alignment and an alignment prompt bucket to filter out meaningless clips and captions for noise robust distance estimation.
+
+\paragraph{Fine-grained Alignment.}
+Most previous works~\citep{videoclip,tempclr,tan} typically encode frames or words to a global feature using $[\operatorname{CLS}]$ token or averaging the frame or word embeddings (\eg, $\operatorname{AvgPool}(\{\mathbf{v}_a^j\}_{j=1}^f)$). However, such strategies neglect fine-grained interactions between modalities and do not address the problem of frame-word misalignment.
+
+To address this issue, we propose a cross-modal late interaction mechanism to identify crucial words and key frames for fine-grained alignment inspired by~\cite{yao2021filip,wang2022disentangled}. Specifically, we define the fine-grained similarity between clip $\mathbf{v}_a$ and caption $\mathbf{t}_b$ as follows:
+\begin{equation}
+[\mathbf{S}]_{a,b}=\frac{1}{2} \left(\frac{1}{f}\sum_{i=1}^{f}\alpha \log  \left(\sum_{j=1}^w \exp (\frac{\mathbf{v}_a^i\cdot \mathbf{t}_b^j}{\alpha})\right) + \frac{1}{w}\sum_{i=1}^{w}\alpha \log  \left(\sum_{j=1}^f \exp (\frac{\mathbf{t}_b^i\cdot \mathbf{v}_a^j}{\alpha})\right)\right).
+\label{eq:finegraiend}
+\end{equation}
+
+Take the front part for example, for each frame in the video clip, we identify the most important words through a soft-maximum operation, \ie, log-sum-exp approximation~\citep{beck2012smoothing}, and then compute the average soft-maximum similarities of all frames as shown in Fig.~\ref{fig:framework}. Similarly, for each textual token, we also find its related video frames in the latter part of Eq.~(\ref{eq:finegraiend}). The parameter $\alpha$ magnifies the importance of the most relevant words or frames. As $\alpha$ approaches 0, the log-sum-exp approximates the maximum. Specifically, this soft-maximum operation allows us to reduce the negative influence of background words or frames on clip-caption similarity estimation.
+
+Though inspired from~\cite{wang2022disentangled,yao2021filip}, our method differs in several aspects. Firstly, we introduce a straightforward  log-sum-exp operator as a soft approximation of the maximum. This allows us to concentrate on more crucial words, making it particularly well-suited for video content as opposed to images. Experiments in Table~\ref{tab:ablations} demonstrate that our design yields a substantial improvement compared to solely focusing on the most important item. Secondly, we leverage the estimated clip-caption similarity for sequence alignment, effectively enhancing temporal learning. In contrast,~\cite{wang2022disentangled} exclusively concentrates on clip-caption alignment.
+
+  
+ 
+
+\paragraph{Alignable Prompt Bucket.} Optimal transport requires every source instance to exactly map to the targets. Yet, in real-world scenarios, a significant amount of captions and video clips might be noisy or irrelevant that cannot be aligned, \ie, coarse-grained irrelevant misalignments. Motivated by~\cite{sarlin2020superglue}, we propose an innovative solution that uses an alignable prompt bucket (APB) to filter out semantic irrelevant clips and captions.
+As shown in Fig.~\ref{fig:framework}, the prompt bucket consists of one new row and column, filled with the same value $p$. The prompt bucket is appended to the similarity matrix $\mathbf{S}$ that
+\begin{equation}
+  [\bar{\mathbf{S}}]_{a, m+1}=[\bar{\mathbf{S}}]_{n+1, b}=[\bar{\mathbf{S}}]_{n+1, m+1}=p,
+     ~
+     [\bar{\mathbf{S}}]_{a, b} =[{\mathbf{S}}]_{a, b}, 
+      ~
+     \forall
+  a \in [1,n],~  b \in [1,m].
+  \label{eq:s_hat}
+\end{equation}
+When calculating the transport distance given $\bar{\mathbf{S}}$, each video clip can be aligned with either available captions or the prompt bucket. 
+Substituting Eq.~(\ref{eq:ot}) with Eq.~(\ref{eq:s_hat}), we obtain the final optimal transport assignment by dropping the last row and column of the transport assignment, \ie, ${\bar{\mathbf{Q}}}^*= \bar{\mathbf{Q}}^*_{1: n,1:m}$.
+
+From an intuitional viewpoint, the prompt value $p$ in Eq.~(\ref{eq:s_hat}) serves as a similarity margin that distinguishes between alignable and unalignable clips and captions. If a video clip $\mathbf{v}_a$ lacks an alignable caption, its pairwise similarities with the set of captions $\{\mathbf{t}_b\}_{b=1}^m$ are generally small. Consequently, if the margin $p$ is larger than these pairwise similarity values, $\mathbf{v}_a$ is forced to align with the prompt bucket and subsequently filtered from the transport assignment. In our implementation, we determine the value of $p$ as the bottom 30\% similarity of the original aligned clip-caption pairs in a data-driven manner.
+
+\subsection{Clip-caption Alignment via Faulty Negative Exploitation}
+\label{sec:3.3}
+ 
+Since self-supervised contrastive learning~\citep{moco} relies on the random sampling of negative instances, captions that are semantically similar to the anchor clips can be treated as faulty negatives~\citep{han2020self,zolfaghari2021crossclr}, and vice versa. However, the existing one-hot target used in contrastive learning penalizes all negative predictions regardless of their correlations.
+
+To mitigate this issue, we propose to exploit the faulty negatives through optimal transport. Let $\hat{\mathbf{S}}\in \mathbb{R}^{B\times B}$ denotes the within-batch clip-caption similarity matrix where $B$ represents the number of clips/captions for all videos in the batch. We apply optimal transport on the similarity matrix $\hat{\mathbf{S}}$,
+\begin{equation}
+  \max _{\hat{\mathbf{Q}}\in \mathcal{\hat{Q}}}  \quad
+\langle\hat{\mathbf{Q}},~ \hat{\mathbf{S}}\rangle +\varepsilon H(\hat{\mathbf{Q}})
+\quad
+\text { s.t. }  
+~
+\mathcal{\hat{Q}}=\left\{\mathbf{\hat{Q}} \in \mathbb{R}_{+}^{B \times B} \mid \mathbf{\hat{Q}} \mathbf{1}_B=\frac{1}{B} \mathbf{1}_B, \mathbf{\hat{Q}}^{\top} \mathbf{1}_B= \frac{1}{B} \mathbf{1}_B \right\},
+\end{equation}
+where the transport assignment $\mathbf{\hat{Q}}$ attempts to realign the clips with similar captions (\ie, faulty negatives). After implementing the Sinkhorn algorithm described in Eq.~(\ref{eq:q_ot}), we utilize the clip-wise realigned targets $\hat{\mathbf{Q}}^*$ as additional supervision for contrastive learning,
+\begin{equation}
+\begin{aligned}
+\resizebox{1\linewidth}{!}{$
+  \mathcal{L}_{\text{clip}} = -
+\sum\limits_{i=1}^B\sum\limits_{j=1}^B
+[\mathbf{T}]_{i,j}
+\left(
+ \log \frac{
+  \exp \left(\mathbf{[\hat{S}]}_{i,j} / \tau\right)}
+  {
+  \sum_{k=1}^B \exp \left(\mathbf{[\hat{S}]}_{i,k}/ \tau\right)}
+ +
+ \log \frac{
+  \exp \left(\mathbf{[\hat{S}]}_{i,j} / \tau\right)}
+  {
+  \sum_{k=1}^B \exp \left(\mathbf{[\hat{S}]}_{k,j}/ \tau\right)}
+  \right)
+,  \mathbf{T} = \left(1-\beta\right) \mathbf{I}_{B} 
+ + \beta \hat{\mathbf{Q}}^*,
+$}
+  \end{aligned}
+\label{eq:lossclip}
+\end{equation}
+where $\beta$ is a weighted parameter that balances the identity target $\mathbf{I}_{B}$ and realigned targets $\mathbf{\hat{Q}}^*$. By replacing identity matrix $\mathbf{I}_B$ with estimated soft-alignment probabilities, the model can recalibrate the attractive and repulsive forces between clips and captions. Specifically, the entire training batch is treated as a support set~\citep{supportset} with a subset of relevant clips and captions. Our method enables the detection and correction of potential faulty negatives within the set.
+
+\begin{table}[t]
+\begin{minipage}[t]{0.55\linewidth}
+    {
+     \centering
+        \caption{Video-paragraph retrieval on YouCookII (\textit{Background Removed}). 
+        The best and second-best results are \textbf{bold} and \underline{underlined}, respectively.}
+\tablestyle{3pt}{1.05}
+            \label{tab:youcookfull}
+        {
+\begin{tabular}{lcccc}
+\shline
+Approach & Measure & R@1 & R@5 & R@10 \\
+\hline 
+ MIL-NCE~\citep{milnce} & Cap. Avg. & 43.1 & 68.6 & 79.1 \\
+ HT100M~\citep{howto100m} & Cap. Avg. & 46.6 & 74.3 & 83.7 \\
+ MCN \citep{chen2021multimodal} & Cap. Avg. & 53.4 & 75.0 & {81.4} \\
+ VideoCLIP~\citep{videoclip} & Cap. Avg. & \underline{74.5} & 94.5 & \textbf{97.9} \\
+ TempCLR~\citep{tempclr} & Cap. Avg. & \underline{74.5} & \underline{94.6} & 97.0 \\
+ Norton (Ours) & Cap. Avg. & \textbf{75.5} & \textbf{95.0} & \underline{97.7} \\
+\hline 
+ VideoCLIP~\citep{videoclip} & DTW & 56.0 & 89.9 & 96.3 \\
+ TempCLR~\citep{tempclr} & DTW & \underline{83.5} & \underline{97.2} & \underline{99.3} \\
+ Norton (Ours) & DTW & \textbf{88.7} & \textbf{98.8} & \textbf{99.5} \\
+\hline 
+ VideoCLIP~\citep{videoclip} & OTAM & 52.8 & 89.2 & 95.0\\
+ TempCLR~\citep{tempclr} & OTAM &
+	\underline{84.9}& \underline{97.9}& \underline{99.3}  \\
+ Norton (Ours) & OTAM & \textbf{88.9} & \textbf{98.4} & \textbf{99.5} \\
+\shline
+\end{tabular}
+}
+ }   
+ \end{minipage}
+ \hfill
+ \begin{minipage}[t]{0.37\linewidth}
+    {
+     \centering
+        \caption{Video-paragraph retrieval on YouCookII (\textit{Background Kept}).}
+   \label{tab:youcookfullbg}
+                \tablestyle{3pt}{1.04}
+{    \vspace{10.9pt}
+    \begin{tabular}{lccc}
+\shline
+
+Approach         & R@1  & R@5  & R@10 \\ \hline
+        \multicolumn{4}{c}{ Cap. Avg.} \\ \hline
+VideoCLIP       & \underline{73.6} & \textbf{94.7} & \textbf{98.4} \\
+TempCLR & 71.7&  94.5 & 97.9            \\
+Norton (Ours)    & \textbf{74.8}&\textbf{94.7}&\textbf{98.4}        \\  \hline
+\multicolumn{4}{c}{{DTW}} \\ \hline
+VideoCLIP  & 55.7 & 93.1 & \textbf{98.9}       \\
+TempCLR           &\underline{70.4}&  \underline{93.8} & \underline{97.9} \\
+Norton (Ours)         
+& \textbf{76.1} &\textbf{95.0} & {97.7}
+\\
+        \hline
+\multicolumn{4}{c}{OTAM} \\ \hline
+VideoCLIP   & 56.6& 92.8 &\textbf{98.9} \\
+TempCLR       & \underline{72.2}&  \underline{94.5} & \underline{97.7}           \\
+Norton (Ours)    & \textbf{73.6}& \textbf{94.7}& \underline{97.7} \\
+\shline
+    \end{tabular}
+}}
+\end{minipage}
+\end{table}
+
+\section{Experiments}
+We verify the effectiveness of Norton in comprehending both long and short videos across a range of downstream tasks. Additionally, we perform extensive ablation studies to analyze the impact of different design choices on the model's performance. For comprehensive training details, training efficiency results, and additional experiments please refer to the Appendix.
+
+\subsection{Comparisons on Video-paragraph Retrieval}
+\label{sec:4.1}
+
+As the main contribution of this work lies in long-term temporal learning, we first evaluate our method on the video-paragraph retrieval task. The objective of this task is to accurately find the corresponding video using a set of sentence queries that describe different parts of the long video.
+
+\paragraph{Setup and Metric.} 
+We evaluate the zero-shot performance of our method in two different settings, namely, \textit{Background Removed} and \textit{Background Kept}. 
+The former setting discards the text-uncorrelated video clips based on the timestamps, while the latter uses the full video. As timestamps may not always be available, paragraph retrieval with background is a more realistic scenario.
+To provide a comprehensive evaluation, we employ three standard strategies, namely,  \mbox{Cap. Avg.} (Caption Average), DTW, and OTAM (Ordered Temporal Alignment Module~\citep{otam}). Specifically, \mbox{Cap. Avg.} matches one clip for each caption and retrieves the video with the most matched clips. DTW and OTAM calculate the sequence distance by accumulating the clip-caption distance based on chronological order. We report recall metrics R@1, R@5, and R@10 for all setups.
+Specifically, R@1 indicates how often the correct prediction is the first result, which is highly desirable in many applications, while R@10 provides a wider scope and may be less critical as users typically focus on the top few results in practical scenarios.
+
+\paragraph{Datasets.} We conduct the evaluation on YouCookII~\citep{youcook} where the testing data consists of 436 videos with 3,350 clip-caption pairs in total. The videos existing in YouCookII have been removed from Howto100M~\citep{howto100m} following the same protocol as previous works~\citep{milnce,videoclip,tempclr}. 
+
+ \paragraph{Results.} 
+i) \textit{Background Removed}:
+As shown in Table~\ref{tab:youcookfull}, TempCLR~\citep{tempclr} performs remarkably better than VideoCLIP~\citep{videoclip} in terms of DTW and OTAM, as it is trained to explore the global temporal context. However, all these methods suffer from noisy correspondence in the temporal alignment.
+In contrast, our proposed robust optimal transport framework explicitly overcomes multi-granularity noisy correspondence. 
+Specifically, our method effectively improves the performance of all measurements by a large margin (+ 1\% \mbox{Cap. Avg.}, 5.2\% DTW, and 4\% OTAM in terms of R@1), indicating that our method learns better temporal information.
+ii) \textit{Background Kept}:
+As shown in Table~\ref{tab:youcookfullbg}, compared with the \textit{Background Removed} results, the recall of all methods dropped as the irrelevant information in the background can distract the video features. Nevertheless, our proposed method consistently outperformed VideoCLIP and TempCLR, even under such challenging conditions.
+
+\subsection{Evaluation on Diverse Downstream tasks}
+To verify the generalization of our method, we conduct experiments on three downstream tasks with four datasets described below. 
+
+\paragraph{Text-to-Video retrieval (clip level).} This task aims to find a corresponding video clip given a query caption. We use YouCookII~\citep{youcook} and MSR-VTT~\citep{msrvtt} to evaluate the transferability of our method. MSR-VTT~\citep{msrvtt} is a well-known retrieval benchmark containing 10,000 short videos with 20 captions each. Following~\cite{videoclip}, we utilize the 1,000 clip-caption test pairs for evaluation. For YouCookII, we use 3,350 clip-caption pairs as introduced in Section~\ref{sec:4.1}. 
+
+As shown in Table~\ref{tab:youcook}, our method achieves remarkable improvement over state-of-the-art methods on YouCookII. On MSR-VTT (Table~\ref{tab:msrvtt}), our method shows solid improvements especially about 1.9\% R@5 and 1.6\% R@10 zero-shot improvement compared with VideoCLIP. After fine-tuning, our method still reaches state-of-the-art R@1. Here we include SupportSet~\citep{supportset} and Frozen~\citep{bain2021frozen} for completeness, while they use different pre-training data such as 65 million Instagram videos~\citep{ghadiyaram2019large}, 2.5 million WebVid videos~\citep{bain2021frozen} and 3 million Google Conceptual Captions~\citep{sharma2018conceptual}.
+The results in this clip-caption retrieval experiment indicate that our method not only improves the global temporal information (long video retrieval as shown in Section~\ref{sec:4.1}), but also facilitates clip-level representation learning.
+
+\begin{table}[h]
+\parbox[t]{.54\textwidth}
+    {
+     \centering
+    \caption{Clip-caption retrieval on YouCookII. }
+    \label{tab:youcook}
+\tablestyle{1pt}{1.1}
+    {
+    \begin{tabular}{l|c|rrr}
+	\shline
+        Approach      & Feature   & R@1       & R@5       & R@10      \\
+        \hline
+  ActBERT~\citep{actbert}       & R101+Res3D & 9.6  & 26.7 & 38.0 \\
+ MIL-NCE~\citep{milnce}         & S3D-G      & 15.1 & 38.0 & 51.2 \\
+MCN~\citep{chen2021multimodal}       & R152+RX101 & 18.1 & 35.5 & 45.2 \\
+ TACo~\citep{yang2021taco} &S3D-G &19.9&43.2&55.7\\
+ VT-TWINS~\citep{vttwins}&	S3D-G       &9.7& 27.0 &38.8\\
+  MMFT~\citep{shvetsova2022everything} & S3D-G&19.8&42.9&55.1 \\             
+  TAN~\citep{tan} & S3D-G & 20.1& 45.5 &59.5  \\
+  VideoCLIP~\citep{videoclip}    & S3D-G      & 22.7 & \underline{50.4} & {63.1} \\
+  TempCLR~\citep{tempclr}                  & S3D-G      & \underline{23.3} & {51.0} & \textbf{64.5} \\
+   Norton (Ours)& S3D-G & \textbf{24.2}& \textbf{51.9} & \underline{64.1}\\   
+   
+        \shline          
+    \end{tabular}
+
+    }
+}
+\hfill
+\parbox[t]{.4\textwidth}
+    {    
+    \centering
+\captionof{table}{Action segmentation on COIN.}
+\tablestyle{-3pt}{1.1}
+\begin{tabular}{lc} 
+\shline
+\multirow{2}{*}{Approach} & Frame \\
+& Accuracy \\
+\hline 
+VAVA~\citep{liu2022learning}&47.3 \\
+ActBERT~\citep{actbert} & 57.0 \\
+Drop-DTW~\citep{dropdtw} & 59.6\\
+MIL-NCE~\citep{milnce}& 61.0 \\
+ClipBERT~\citep{clipbert}& 65.4\\
+TACo~\citep{yang2021taco}&68.4\\
+VideoCLIP~\citep{videoclip} & \underline{68.7} \\
+TempCLR~\citep{tempclr} & \underline{68.7} \\
+Norton (Ours) & \textbf{69.8} \\
+\shline
+\end{tabular}
+\label{tab:coin}
+    }
+\end{table}
+
+\begin{table}[h]
+\parbox[t]{.55\textwidth}
+    {
+\tablestyle{6pt}{1.0}
+\centering
+\caption{Text-to-video retrieval on MSR-VTT.}
+\label{tab:msrvtt}
+{
+\begin{tabular}{*l^c^c^c} 
+\shline
+Superivsed &  R@1  & R@5  & R@10  \\
+\hline
+\rowstyle{\color{hr}}{{SupportSet}~\citep{supportset} }& 30.1 & {58.5} & {69.3} \\
+\rowstyle{\color{hr}}{{Frozen}~\citep{bain2021frozen}} & 31.0 & 59.5& 70.5\\
+{{MMFT}~\citep{shvetsova2022everything}} &23.7 &52.1& 63.7\\
+VideoCLIP~\citep{videoclip} & \underline{30.9} & \underline{55.4} & \textbf{66.8} \\
+TempCLR~\citep{tempclr}& 30.6&55.1& 65.5 \\
+Norton (Ours) &\textbf{31.2}&\textbf{55.7}&\textbf{66.8}\\
+\hline 
+Zero-shot &  R@1  & R@5  & R@10  \\
+\hline 
+\rowstyle{\color{hr}}{SupportSet~\citep{supportset}} & 8.7 & 23.0 & 31.1 \\
+\rowstyle{\color{hr}}{{Frozen}~\citep{bain2021frozen}} & 23.2 & 44.6& 56.6\\
+MIL-NCE~\citep{milnce} & 9.9 & \underline{24.0} & \underline{32.4} \\
+{{MMFT}~\citep{shvetsova2022everything}} & 9.9 & \underline{24.0}&  \textbf{32.6}\\ 
+VT-TWINS~\citep{vttwins}	 &9.4  &23.4&{31.6}\\
+VideoCLIP~\citep{videoclip} & \underline{10.4} & 22.2 & 30.0 \\
+TempCLR~\citep{tempclr}& 10.1&22.2& 29.4 \\
+Norton (Ours) &\textbf{10.7}&\textbf{24.1}& {31.6}\\
+\shline
+\end{tabular}
+}
+}
+\hfill
+\parbox[t]{.42\textwidth}
+    {
+ \tablestyle{2pt}{1.14}
+ \centering
+    \caption{VideoQA on MSR-VTT.}
+    \label{tab:msrvttqa}
+\begin{tabular}{lc}
+\shline
+Superivsed & Accuracy \\
+\hline
+EITanque~\citep{kaufman2017temporal} & 65.5 \\
+MLB\citep{kim2016hadamard} & 76.1 \\
+JSFusion~\citep{jsfusion} & 83.4 \\
+ActBERT~\citep{actbert} & 85.7 \\
+ClipBERT~\citep{clipbert} & 88.2 \\
+MERLOT~\citep{merlot} & 90.9\\
+VideoCLIP~\citep{videoclip} & {92.1} \\
+TempCLR~\citep{tempclr} & \underline{92.2}\\
+Norton (Ours) & \textbf{92.7}\\
+\hline 
+Zero-shot & Accuracy \\
+\hline
+VideoCLIP~\citep{videoclip}  & {73.9} \\
+TempCLR~\citep{tempclr} & \underline{74.4}\\ 
+Norton (Ours) & \textbf{77.1}
+\\ 
+\shline
+\end{tabular}
+}
+\end{table}
+
+\paragraph{VideoQA.} We conduct the multiple choice VideoQA experiment on MSR-VTT~\citep{jsfusion}. 
+Given a video query and some candidate textual answers (5 on average), the task is to find the one that fits the query out of possible candidates. As shown in Table~\ref{tab:msrvttqa}, our method outperforms the counterparts with +2.7\% in terms of zero-shot accuracy and achieves 0.5\% improvements after finetuning, showing the superiority of our method.
+
+\paragraph{Action Segmentation.} This task assumes that each video is associated with various actions. The goal is to determine the specific action for each second, which requires fully exploring the temporal dependencies. We use the long video dataset COIN~\citep{coin} to evaluate the action segmentation performance of our method. COIN contains 11,827 videos (476 hours) in total where each video is labeled with 3.91 action segments on average, according to 778 candidate segment labels. Following~\cite{videoclip}, we apply a one-layer classification head on top of the visual encoder to classify the action label. We report the frame-wise accuracy using the evaluation protocol of~\cite{videoclip,milnce}. As shown in Table~\ref{tab:coin}, our method outperforms all baselines.
+
+\begin{table*}[t]
+\tablestyle{3pt}{0.9}
+\centering
+\caption{\textbf{Ablation experiments} evaluated on YouCookII, where ``Clip" is short for clip-caption retrieval, ``Video" for video-paragraph retrieval, ``B" for video backgrounds, and ``FNE" for faulty negative exploitation. We report the DTW measurement for video-paragraph retrieval.
+}
+\label{tab:ablations}
+\begin{tabular}{*l^c^c^c|^c^c|^c^c|^c^c}
+\toprule        
+ \multicolumn{4}{c|}{\bf Basic Setting }& 
+\multicolumn{2}{c|}{\bf Clip }
+& \multicolumn{2}{c|}{\bf Video (w/o B)}& \multicolumn{2}{c}{\bf Video (w B)}  \\
+\midrule
+Model &  FNE & Soft-max $\alpha$ & APB $p$ & R@1 & R@5 &\multicolumn{1}{c}{R@1}
+& \multicolumn{1}{c|}{R@5}& R@1 &R@5\\ \midrule
+VideoCLIP~\citep{videoclip} &  -- & --  & --  & 22.7  & 50.4  & 56.0   & 89.9   & 55.7 & 93.1   \\
+TempCLR~\citep{tempclr}	&--&-- & -- &  23.3 & 51.0   & 83.5  & 97.2  & 70.4   & 93.8     \\ 
+\midrule
+A (w/o $\mathcal{L}_{\text{video}}$)  &  & --  & -- &22.8 &50.1 &   56.7 & 89.0  & 56.4 &91.8   \\
+B (w/o $\mathcal{L}_{\text{video}}$)  &  \cmark & --  & -- &23.4 &50.8 &   63.3 & 93.3  & 65.1 &92.4   \\
+\midrule
+C   &  \cmark &  Mean average   &-- &  23.1 &50.1 & 84.2   & 97.3& 74.3& \textbf{94.7}  \\
+D   &  \cmark &  \citep{yao2021filip}   &-- &  23.5 &50.5 & 86.9   & 98.6& 74.1& 94.6  \\ 
+E &  \cmark & 0.1 & -- & 23.8& 51.7 & 88.1 & 98.6 & 74.2 & \textbf{94.7} \\
+F  &  \cmark &  0.2   & -- &\textbf{24.0} &\textbf{51.8}&88.2& 98.6 & 74.9& 94.4\\
+G  &  \cmark &  1  & --  & \textbf{24.0} & \textbf{51.8} &\textbf{88.4} &\textbf{98.8}   &\textbf{75.2}  & \textbf{94.7}   \\
+
+\midrule
+H &  \cmark & 1   & 10\% & \textbf{24.2}& 51.8& 88.4&\textbf{98.8} & 75.9&94.9 \\ 
+I  &  \cmark & 1   & 50\% & \textbf{24.2}&51.9 & 88.4&98.6 & 75.9& 94.9\\ 
+\rowcolor{gray!20} 
+J (Norton)&  \cmark & 1   & 30\% & \textbf{24.2}& \textbf{51.9}&\textbf{88.7}&\textbf{98.8} & \textbf{76.1}& \textbf{95.0}\\ 
+\bottomrule
+
+\end{tabular}
+\end{table*}
+
+\subsection{Ablation Study on the Proposed Methods}
+
+In this section, we investigate the effects of our design choices and discuss the results in Table~ \ref{tab:ablations}.
+
+\paragraph{Effect of Faulty Negative Exploitation.} 
+In model-\{A,B\}, we tackle the issue of faulty negatives in clip-caption contrastive learning through the correction of optimal transport. This strategy not only improves the performance of clip-caption retrieval but also enhances the temporal ability.
+
+\paragraph{Effect of OT in Temporal Learning.} 
+In model-C, we utilize vanilla optimal transport to measure the distance between sequences where the clip/caption representation is obtained by averaging the frame/word embeddings. As shown, model-C achieves comparable performance to TempCLR and even outperforms TempCLR in retrieval tasks involving backgrounds.
+
+\paragraph{Effect of Fine-grained Alignment.} In model-\{D,E,F,G\}, we investigate the effect of fine-grained alignment by varying the weight of the log-sum-exp approximation. We also compare our approach with~\cite{yao2021filip} which selects the most important token for fine-grained alignment. The comparison demonstrates that our strategy outperforms~\cite{yao2021filip}, supporting our claim that focusing on more crucial words/frames yields better fine-grained measurements in video understanding. When the weight $\alpha$ tends towards 0, the log-sum-exp approximation approximates the maximum, resulting in the selection of the most relevant words/frames. The comparison between model-\{E,F,G\} shows that a larger $\alpha$ leads to better performance, further validating our assumption that focusing on more important tokens would enhance performance.
+
+\paragraph{Effect of Alignable Prompt Bucket.} In model-\{H,I,J\}, we integrate the prompt bucket into the optimal transport framework and vary the value of $p$ to be the bottom 10\%, 30\%, and 50\% similarity between the original aligned clips and captions. We observe that the use of APB results in a clear performance improvement for video-paragraph retrieval with background, and setting the value of $p$ to the bottom 30\% similarity is an effective choice.
+
+\section{Conclusion}
+\label{sec:conclusion}
+
+Learning temporal correlations in long-form videos is prohibitively expensive in terms of the hardware required. To address this, we propose Norton, a noise robust temporal optimal transport to estimate the sequence distance that can be easily extended and scaled to larger datasets with minimal computational cost.
+Notably, our unified optimal transport solution resolves the noisy correspondence problem at both frame-word and clip-caption levels. Extensive experiments demonstrate that our method not only captures long-term temporal dependencies but also facilitates clip-level representation learning.
+In the future, we plan to extend our method to address noisy correspondence for more modalities as videos typically include visual, textual, and audio content. 
+
+\subsubsection*{Acknowledgments}
+
+This work was supported in part by NSFC under Grant U21B2040, 62176171; and in part by the Fundamental Research Funds for the Central Universities under Grant CJ202303.
+
+\newpage
+
+\end{document}

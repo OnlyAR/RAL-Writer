@@ -1,0 +1,206 @@
+\title{Long seq attention}
+
+\begin{document}
+
+\maketitle
+
+\newcommand{\cy}[1]{\textcolor{red}{ [{\em CY:} #1]}}
+\newcommand{\TODO}[1]{\todo[size=\tiny]{#1}}
+\newcommand{\todoInline}[1]{{\color{red}{\bf[TODO: #1]}}} 
+
+\todoInline{Metrics for  locality bias?}
+\todoInline{Difference between T5Rel and MLPRPE?}
+\section{Introduction}
+
+\begin{itemize}
+    \item Do we need to train on long seq data for Transformers to generalize?
+\item Can we prevent U-shaped dip in performance with position of relevant text in the prompt?
+\end{itemize}
+
+Position Interpolation (PI) has been proposed as an approach to let models generalize to longer sequence lenght inputs than that are seen during training~\citep{chen2023extending}. However this requires training the model further on longer sequence length data, albeit for much fewer steps than original training. Further PI also results in slight degradation of performance.
+
+\section{Attention for Long sequence lengths}
+Let $a_{12}$ denote attention between tokens $1$ and $2$ and let attention with rest of the tokens be some padding value $a_p$. With increasing sequence length attained by adding padding tokens, attention $a_{12}$ decays as follows.
+
+\begin{align*}
+    p_{12} = \frac{e^{a_{12}}}{e^{a_{12}} + e^{a_{21}} + (n-2)*e^{a_{p}}}
+\end{align*}
+This shows that attention decays as $1/n$ with sequence length $n$.
+
+One way to prevent this is by imposing a $top_k$ on attention logits before softmax.
+
+\section{RPE variants}
+\subsection{MLP RPE}
+We can use an MLP $f: \R\to \R^{N_H}$ to map relative distance to each heads. In particular, we use a 2/3-layer MLP with the activation function $\sigma$:\footnote{Bias terms of the linear mappings are omitted for brevity.}
+\begin{equation*}
+    f(x)=\mW_3\sigma(\mW_2 \sigma(\vw_1 x))\text{ (three layer), or }f(x)=\mW_3\sigma(\vw_1 x)\text{ (two layer)},
+\end{equation*}
+where $\mW_3\in\R^{N_H\times d}$, $\mW_2\in\R^{d\times d}$, $\vw_1\in\R^{d}$. The activation function $\sigma$ is $\mathrm{ReLU}$. The width $d$ is set to 32 unless specified otherwise.
+
+For attention from $i$-th token to $j$-th token, there are two choices for the input to MLPs:
+\begin{itemize}
+    \item \textbf{Normalized relative distance.} Feed $\frac{i-j}{i+1}$ as the input. Here the position is normalized by the length of current sequence, resulting in an input in $[0,1)$. This makes the input to MLP always fall in a fixed bounded domain, and can potentially generalize to unseen relative distance. 
+    \item \textbf{Normalized relative distance with $\log$ transform.} Feed $\frac{\log(c|i-j|+1)}{\log(ci+1)+1}$ as the input ($c$ is some hyper-parameter). The normalization again forces the input to be in $[0,1)$. The $\log$ transform is based on the intuition that nearby tokens require finer positional information, while exact distance for distant tokens are less important.
+\end{itemize}
+
+\cy{Several thoughts:
+\begin{itemize}
+    \item The function seems homogeneous (ie $f(kx) = kf(x)$) which may be problematic: the PE scales linearly with the distance $j - i$. Maybe sigmoid activation and/or adding bias term may fix it.
+    \item With the normalization $i+1$ the absolute distance information is missing. Maybe feed both $j-i$ and $i+1$ as two separate inputs to the network.
+    \item Instead of MLP, can also think of some ``whitebox'' architectures such as fitting a piecewise linear function (something like go/bidirectional-learnable-transform). Though this may only reduce computation but does not solve length generalization.
+    \item Once learned, we may read out the parameters from ckpt and plot $f$, to get a sense of what we've learned.
+\end{itemize}
+}
+
+Specifically, for attention from $i$-th token to $j$-th token, the MLP takes $\frac{j-i}{i+1}$ as the input. This will enforce the input to be in $[-1, 0)$, potentially lead to training stability and generalization ability.
+
+\subsection{Kronecker RPE}
+We can use Kronecker product to construct the $n \times n$ PE matrix. 
+
+Given $\mS\in\R^{n_1\times n_1}$ and $\mT\in\R^{n_2\times n_2}$ such that $n_1n_2=n$, we use $\mR = \mS\otimes \mT$ as the RPE matrix.
+
+\section{Existing length extrapolation RPE}
+Denote by $a_{ij}$ the $(i, j)$-th entry of the (unnormalized) attention matrix.
+
+ALiBi: $\lambda$ is a hyper-parameter that is set a piror for each head.
+\begin{equation*}
+    a_{ij} = \exp\left(\frac{\vq_i\vk_j^{\top}}{\sqrt{d}}-\lambda |i-j|\right).
+\end{equation*}
+
+KERPLE: $r_1$ and $r_2$ are trainable parameters.
+\begin{align*}
+    \text{(Power variant)} & \quad a_{ij} = \exp\left(\frac{\vq_i\vk_j^{\top}}{\sqrt{d}}-r_1 |i-j|^{r_2}\right). \\ 
+    \text{(Logarithmic variant)} & \quad a_{ij} = \exp\left(\frac{\vq_i\vk_j^{\top}}{\sqrt{d}}-r_1 \log(1+r_2|i-j|)\right). 
+\end{align*}
+
+Sandwich: $\vp_i$ denotes the sinusoidal positional encoding, i.e.
+\begin{equation*}
+    \vp_i = \begin{bmatrix}
+        \sin \frac{i}{10000^{2/d}}& \cos \frac{i}{10000^{2/d}} &\sin \frac{i}{10000^{4/d}}& \cos \frac{i}{10000^{4/d}} & \cdots & \cos \frac{i}{10000^{1}}
+    \end{bmatrix}
+\end{equation*}
+
+The attention is calculated as
+\begin{equation*}
+    a_{ij} = \exp\left(\frac{\vq_i\vk_j^{\top}}{\sqrt{d}}+\lambda\vp_i \vp_j^{\top}\right).
+\end{equation*}
+
+Limitations: ignore distant tokens.
+
+If we assume that $c<\vq_i\vk_j^{\top}<C$ for any $1\leq j\leq i$, and denote the RPE bias by $r_{i-j}$, then
+\begin{align*}
+    p_{ik} \sim \frac{\exp(a_{ik})}{\sum_{j=1}^i \exp(r_{i-j})}
+\end{align*}
+Token $i$ would be unable to attend to anything if $i$ is large and 
+$$
+    \lim_{i\to +\infty} \sum_{j=1}^i \exp(r_{i-j})=+\infty.
+$$
+
+\section{A Mathematical Formulation of Length Generalization Problem}
+
+Given a set of keys $\{\vk_i\}_{i=1}^T$ and values $\{\vv_i\}_{i=1}^T$ of sequence length $T$, recall that self-attention for a query $\vq$  computes the following
+\begin{equation}
+    \vv = \sum_{i = 1}^T\frac{\exp(\langle \vq, \vk_i \rangle + p_i) \cdot \vv_i}{ \sum_{j=1}^T \exp(\langle \vq, \vk_j \rangle + p_j)},
+\end{equation}
+where $\{p_i\}_{i=1}^T$ is an additive position embedding.
+
+To formulate the problem of length generalization, let us assume that $\{\vk_i\}_{i=1}^T$ and $\{\vv_i\}_{i=1}^T$ are drawn i.i.d. from two distributions $P_{\vk}$ and $P_{\vv}$, respectively. (To start with, we may simply assume $P_{\vk}$ and $P_{\vv}$ are uniform distribution on the unit sphere?)
+Then, $\vv$ has a probabilistic distribution that is a function of $\vq$, $P_{\vk}$ and $P_{\vv}$. 
+
+Now suppose that $T$ is the sequence length in training, but during serving we have a longer sequence length $T_\text{test} > T$. Here, the self-attention becomes
+\begin{equation}
+    \vv_\text{test} = \sum_{i = 1}^{T_\text{test}}\frac{\exp(\langle \vq, \vk_i \rangle + p_i) \cdot \vv_i}{ \sum_{j=1}^{T_\text{test}} \exp(\langle \vq, \vk_j \rangle + p_j)},
+\end{equation}
+It is reasonable to assume that the additional keys $\{\vk_i\}_{i=T+1}^{T_\text{test}}$ and values  $\{\vv_i\}_{i=T+1}^{T_\text{test}}$ coming from longer sequence length are drawn i.i.d. from $P_{\vk}$ and $P_{\vv}$ as well.
+Then the question for length generalization is, can we choose the additional position embedding $\{p_i\}_{i=T+1}^{T_\text{test}}$ such that $\vv$ and $\vv_\text{test}$ have the same distribution?
+It may be the case that the answer is no, in which case we may consider more powerful approaches as follows.
+
+\paragraph{A more powerful approach} The approach above assumes that $\{p_i\}_{i=1}^{T}$ during testing is set to be the same as those used during training, and only $\{p_i\}_{i=T+1}^{T_\text{test}}$ are up to design choice. A more general approach is to set position embedding not only as a function of relative position $i$ but also the sequence length $T$. In other words, during testing we compute
+\begin{equation}
+    \vv_\text{test} = \sum_{i = 1}^{T_\text{test}}\frac{\exp(\langle \vq, \vk_i \rangle + p_i(T_\text{test})) \cdot \vv_i}{ \sum_{j=1}^{T_\text{test}} \exp(\langle \vq, \vk_j \rangle + p_j(T_\text{test}))}.
+\end{equation}
+Then the question is whether there is a choice of the function $p_i(T_\text{test})$ such that $\vv$ and $\vv_\text{test}$ have the same distribution.
+This question connects to the question on the choice of distance normalizer in MLP-RPE studies.
+
+\paragraph{Even more powerful approaches}
+The approach above is still restricted to the vanilla self-attention computation with softmax. We may further consider something more powerful such as adding ReLU or Topk as in Srinadh's study. 
+
+\section{Math}
+Assume that we are given a sequence $\vx_1, \vx_2, \cdots$ sampled i.i.d. from some distribution $\gP_{\vx}$. We are interested in the distribution of the decoder self-attention with additive relative position embedding. The output at the $n$-th position is
+\begin{equation}
+    \vv_n=\sum_{i = 1}^n\frac{\exp(\vx_n^{\top}\mW^{Q\top}\mW^K\vx_i + b_{n-i}) \vx_i\mW^V}{\sum_{i = 1}^n \exp(\vx_n^{\top}\mW^{Q\top}\mW^K\vx_i + b_{n-i})}
+\end{equation}
+where $b_{n-i}$ is the additive relative positional encoding.
+
+To simplify, we consider the setting where the query $\vq$ is fixed and independent of the sequence. Linear transformations are omitted because $\mW^{Q\top}\mW^K$ can be absorbed by $\vq$ and $\mW^V$ only linearly transform the output.
+
+\begin{equation}
+    \vv_n=\sum_{i = 1}^n\frac{\exp(\vq^{\top} \vx_i + b_{n-i}) \vx_i}{\sum_{i = 1}^n \exp(\vq^{\top} \vx_i + b_{n-i})}
+\end{equation}
+
+\subsection{Asymptotic behavior}
+We first show that the output at the $n$-th position converges to a deterministic constant when $n\to +\infty$.
+
+As a warm up, we first consider the case where there is no positional encoding, i.e., $r_j=0$ for any $j$. In this case
+\begin{align}
+    \frac{1}{n}\sum_{i = 1}^n\exp(\vq^{\top} \vx_i ) \vx_i \overset{a.s.}{\to}& \E_{\vx\sim \gP_{\vx}}[\exp(\vq^{\top} \vx) \vx]\\
+    \frac{1}{n}\sum_{i = 1}^n\exp(\vq^{\top} \vx_i) \overset{a.s.}{\to} & \E_{\vx\sim \gP_{\vx}}[\exp(\vq^{\top} \vx)]\\
+    \Rightarrow \qquad \vv_n \overset{a.s.}{\to} & \frac{\E_{\vx\sim \gP_{\vx}}[\exp(\vq^{\top} \vx) \vx]}{\E_{\vx\sim \gP_{\vx}}[\exp(\vq^{\top} \vx)]}.
+\end{align}
+
+In the setting with positional encoding, averaging becomes weighted averaging. Assuming $\E[\|\exp(\vq^{\top} \vx) \vx\|_2^2]$ and $\E[\|\exp(\vq^{\top} \vx)\|_2^2]$ exist, and that
+\begin{equation}\label{eq:rpe-assumption}
+    \lim_{n\to+\infty}\frac{\sum_{i=0}^{n-1}\exp(2b_i)}{\left(\sum_{i=0}^{n-1}\exp(b_i)\right)^2}=0,
+\end{equation}
+one can show with Chebyshev Inequality
+\begin{align}
+    \frac{1}{\sum_{i=0}^{n-1}\exp(b_i)} \sum_{i = 1}^n \exp(b_{n-i})\exp(\vq^{\top} \vx_i ) \vx_i \overset{P}{\to}& \E_{\vx\sim \gP_{\vx}}[\exp(\vq^{\top} \vx) \vx]\\
+    \frac{1}{\sum_{i=0}^{n-1}\exp(b_i)}\sum_{i = 1}^n\exp(b_{n-i})\exp(\vq^{\top} \vx_i)  \overset{P}{\to} & \E_{\vx\sim \gP_{\vx}}[\exp(\vq^{\top} \vx)]\\
+    \Rightarrow \qquad \vv_n \overset{P}{\to} & \frac{\E_{\vx\sim \gP_{\vx}}[\exp(\vq^{\top} \vx) \vx]}{\E_{\vx\sim \gP_{\vx}}[\exp(\vq^{\top} \vx)]}.
+\end{align}
+
+The assumption in Eq. (\ref{eq:rpe-assumption}) is satisfied by T5 RPE and MLP RPE with the interpolation trick. Alibi does not satisfy this condition.
+
+\paragraph{Remark.} Without the simplification, we will have
+\begin{align}
+    &\frac{1}{n} \sum_{i = 1}^n \exp(\vx_n^{\top}\mW^{Q\top}\mW^K\vx_i) \vx_i\mW^V \\
+    = & \frac{1}{n} \exp(\vx_n^{\top}\mW^{Q\top}\mW^K\vx_n) \vx_n\mW^V +\frac{1}{n} \sum_{i = 1}^{n-1} \exp(\vx_n^{\top}\mW^{Q\top}\mW^K\vx_i) \vx_i\mW^V
+\end{align}
+Assuming $\E[\|\exp(\vx_n^{\top}\mW^{Q\top}\mW^K\vx_n) \vx_n\mW^V \|_1]<+\infty$, one can show the first term converges to 0. The second term seems tricky and one may show a convergence-in-law result (details not checked!)
+\begin{equation}
+    \frac{1}{n} \sum_{i = 1}^{n-1} \exp(\vx_n^{\top}\mW^{Q\top}\mW^K\vx_i) \vx_i\mW^V \overset{\gL}{\to} \E_{\vx\sim \gP_{\vx}}\left[ \exp(\vx_n^{\top}\mW^{Q\top}\mW^K\vx)\vx_i\mW^V | \vx_n\right] 
+\end{equation}
+
+\subsection{Non-asymptotic result}
+Characterizing the distribution of $\vv_n$ with \textit{finite} $n$ would be more relevant in practice. We can consider an over-simplified setting (and see if we can generalize it):
+
+Assume that $\mW^{Q\top}\mW^K=\mathbf{0}$ (i.e., $\vq=\mathbf{0}$) and $\gP_{\vx}=\gN(\mathbf{0}, \mI)$. Then
+\begin{equation}
+    \vv_n=\frac{\sum_{i = 1}^n\exp(b_{n-i}) \vx_i}{\sum_{i = 1}^n \exp(b_{n-i})}\sim \gN\left(\mathbf{0}, \frac{\sum_{i=0}^{n-1}\exp(2b_i)}{\left(\sum_{i=0}^{n-1}\exp(b_i)\right)^2}\mI\right).
+\end{equation}
+
+The variance of $\vv_n$ decrease as $n$ increases. 
+
+\section{Related Works}
+\label{app:related}
+In the main body of the paper, we cover the most relevant works to our paper (Sec. \ref{sec:pe-and-length-generalization}). In this section, we provide more discussions on related works.
+
+\paragraph{Length generalization.} Many existing works show the length
+generalization failure of standard Transformer models \citep{press2022train,anil2022exploring, deletang2023neural,liu2024exposing}. Recently, there have been growing interests in long-context applications such as multi-step reasoning~\citep{wei2022chain,dziri2023faith,zhao2023complex} and document/book understanding~\citep{kovcisky2018narrativeqa,ke2022continual,guo2022longt5,ainslie2023colt5,liu2023lost}. Designing length-generalizable Transformers is appealing for these applications. 
+\citet{dubois2020location,chowdhury2023monotonic} introduce location attention for length generalization on synthetic tasks. 
+\citet{bueno2022induced} show that generating step-by-step rationales and using marker tokens as positional guides helps length generalization. 
+Studying positional encoding approaches for length generalization is a main direction in this line of research. \citet{press2022train,chi2022kerple,chi2023dissecting} propose new relative positional encoding methods which emphasize recency bias and improve language modeling on longer sequences. \citet{chu2023conditional} propose Conditional Positional Encodings to enhance Vision Transformer length generalization. The most relevant to our work is a concurrent paper by \citet{chen2023extending}. It propose Position Interpolation (PI) for Rotary Positional Encoding (RoPE), which extends the context window of RoPE-based pretrained models given a downstream max sequence length. 
+However, this requires additional finetuning on longer sequence data, albeit for much fewer steps than original training. By contrast, our proposed FIRE does not require a pre-defined max sequence length, and can be directly applied to length generalization setting without tuning. We provide extensive experimental comparisons in Sec. \ref{sec:exp}. More recently, \citet{zhou2024transformers} show that standard Transformers can generalize to a sequence length that is 2.5$\times$ the training input length on integer addition using FIRE (and other techniques \citep{ruoss2023randomized, zhou2023algorithms}).
+
+\paragraph{Positional encoding in Transformers.} Positional encoding is a critical component of Transformers. \citet{vaswani2017attention} propose sinusoidal Absolute Positional Encoding (APE) to encode positional information in the sequential input. \citet{shaw2018self} are the first to propose Relative Positional Encoding (RPE) for Transformers, and many follow-up works explore different RPE strategies
+\citep{dai2019transformer,raffel2019exploring}. There are also many works that study positional encoding from different perspectives, including the disentanglement of positional and content information \citep{kitaev2018constituency, ke2021rethinking}, the representational power of attention modules and Transformers \citep{cordonnier2019relationship, chen2021simple, li2021can, luo2022your}, computational efficiency \citep{su2021roformer, liutkus2021relative, luo2021stable, choromanski2023learning}, and length generalization \citep{press2022train,chi2022kerple,chi2023dissecting,kazemnejad2023impact}. Our work is based on a unified formulation of existing additive relative positional encoding approaches, and proposes new RPE variant aimed at improving length generalization.
+
+\paragraph{Interpolation techniques in deep learning.} 
+
+Interpolation techniques are successfully applied to many deep learning applications, especially in computer vision. \citet{long2015fully} employ bilinear interpolation in up-sampling layers of convolutional neural networks for dense visual prediction.
+\citet{dong2015image, johnson2016perceptual} employ bicubic interpolation for image super-resolution. 
+\citet{radford2015unsupervised} probe generative models by interpolation in the latent space. 
+\citet{zhang2018mixup, han2022g} use interpolating between pairs of examples and their labels as an data augmentation method. 
+Recently, \citet{dosovitskiy2021an} propose to perform 2D interpolation of the pre-trained APE for Vision Transformer to apply the model to higher resolution images. In contrast, our interpretation is applied in the relative position encoding functions. Besides, we are focused on causal attention setting where ``global'' information such as the total sequence length is unknown, while \citet{dosovitskiy2021an} work on encoder-only Transformers with fixed input lengths.
+
+\end{document}

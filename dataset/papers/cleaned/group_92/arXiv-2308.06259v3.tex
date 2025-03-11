@@ -1,0 +1,355 @@
+\title{Self-Alignment with Instruction Backtranslation}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+We present a scalable method to build a high quality instruction following language model by automatically labelling human-written text with corresponding instructions. Our approach, named {\em instruction backtranslation}, starts with a language model finetuned on a small amount of seed data, and a given web corpus. The seed model is used to construct training examples by generating instruction prompts for web documents ({\em self-augmentation}), and then  selecting high quality examples from among these candidates ({\em self-curation}).  This data is then used to finetune a stronger model.  Finetuning LLaMa on two iterations of our approach yields a model that outperforms all other LLaMa-based models on the Alpaca leaderboard not relying on distillation data, demonstrating highly effective self-alignment.
+
+\end{abstract}
+
+\section{Introduction}
+
+Aligning large language models (LLMs) to perform instruction following typically requires finetuning on large amounts of human-annotated instructions or preferences~\citep{ouyang2022training,touvron2023llama, bai2022training}  or distilling outputs from more powerful models~\citep{wang2022self,honovich2022unnatural,alpaca,vicuna2023,peng2023instruction,xu2023wizardlm}.
+Recent work highlights the importance of human-annotation data quality~\citep{zhou2023lima,kopf2023openassistant}. However, annotating instruction following datasets with such quality is hard to scale. 
+
+\if 0
+Aligning large language models (LLMs) to perform generic instruction following typically requires finetuning on large amounts of human-annotated instructions or preferences~\citep{ouyang2022training,touvron2023llama, bai2022training} or using a stronger LLM in data creation (e.g. via knowledge distillation) or curation~\citep{wang2022self,honovich2022unnatural,alpaca,vicuna2023,peng2023instruction,xu2023wizardlm}.
+ 
+Recent work on instruction finetuning highlights the importance of data quality~\cite{zhou2023lima,kopf2023openassistant}. However, handcrafting instruction following datasets is hard to scale. 
+\fi
+
+In this work, we instead leverage large amounts of \emph{unlabelled} data to create a high quality instruction tuning dataset by developing an iterative self-training algorithm. The method uses the model itself to both augment  and curate
+high quality  training examples to improve its own performance. Our approach, named {\em instruction backtranslation}, is inspired by the classic {backtranslation} method from machine translation, in which human-written target sentences are automatically annotated with model-generated source sentences in another language \citep{sennrich2015improving}. 
+
+Our method starts with a seed instruction following model and a web corpus. The model is first used to \textit{self-augment} its training set: for each web document, it creates an instruction following training example by predicting a  prompt (instruction) that would be correctly answered by (a portion of) that document. Directly training on such data (similarly to \cite{koksal2023longform}) gives poor results in our experiments, 
+both because of the mixed quality of human written web text, and noise in the generated instructions. To remedy this, we show that the same seed model can be used to \textit{self-curate}
+the set of newly created augmentation data by predicting their quality, and  can then be  self-trained on only the highest quality (instruction, output) pairs. 
+The procedure is then iterated, using the improved model to better curate the instruction  data, and re-training to produce a better model.
+
+Our resulting model, {\em Humpback}, outperforms
+all other existing non-distilled models on the Alpaca leaderboard \citep{alpaca_eval}. 
+Overall, instruction backtranslation is a scalable method for enabling language models to improve their own ability to follow instructions.
+
+\if 0
+\begin{itemize}
+\item We propose a scalable approach to improve LLMs to follow instructions. At the core of our approach is to leverage an seed instruction following model to \textit{self-augment} and \textit{self-select} training data to perform self-training. Self-augmentation is performed by creating instruction following training examples from unlabeled data source such as a web corpus. The specific data augmentation steps include generating instructions given outputs, selecting high quality (instruction, output) pairs as self-training examples to improve the next iteration of intermediate instruction following models.
+
+\item Our method demonstrate more efficient data scaling compared to other hand-crafted and distilled instruction following datasets.
+
+\item Our method achieves high quality instruction following models evaluated on Alpaca leaderboard, outperforming all other models not relying on distillation data, and with the best data efficiency. 
+
+\item We compare to existing LM alignment approach, and discuss the strengths and weakness of our approach.
+\end{itemize}
+\fi \section{Method}
+\label{methods}
+
+Our self-training approach assumes access to a base language model, a small amount of seed data, and a collection of unlabelled examples, e.g. a web corpus. The unlabelled data is a large, diverse set of human-written documents which includes writing about all manner of topics humans are interested in -- but crucially is not paired with instructions. 
+A \textbf{first key assumption} is that there exists some subset of this very large human-written text that would be suitable as gold generations for some user instructions.
+A \textbf{second key assumption} is that we can predict  instructions for these candidate gold answers that can be used as high quality example pairs to train an instruction following model.
+
+Our overall process,  which we call instruction backtranslation, 
+ thus performs two core steps: 
+\begin{enumerate}[leftmargin=*]
+    \item {\em Self-augment}: Generate instructions for unlabelled data, i.e. the web corpus, to produce candidate training data of (instruction, output) pairs for instruction tuning. 
+    \item {\em Self-curate}: Self-select high quality demonstration examples as training data to finetune the base model to follow instructions. This approach is done iteratively where a better intermediate instruction-following model can improve on selecting data for finetuning in the next iteration.
+\end{enumerate}
+
+We describe these steps in more details below. An overview of the approach is illustrated in \autoref{fig:method}.
+\begin{figure}
+  \centering
+  \includegraphics[width=1.0\columnwidth]{figs/fuzzy_v3.pdf}
+  \caption{An overview of our {\bf instruction backtranslation} method. We start from a base language model, e.g. LLaMa, a small amount of seed examples of (instruction, output) pairs, and a collection of unlabelled documents which are considered candidate outputs for unknown instructions. \textbf{Self-augmentation}: the base model is finetuned with (output, instruction) pairs from the seed examples as an instruction prediction model
+  $M_{yx}$, which is used to generate candidate instructions for outputs from the unlabelled data. \textbf{Self-curation}: starting from an intermediate instruction-following model $M_0$ finetuned from seed examples only, it selects high-quality (instruction, output) pairs $\mathcal{A}_k^{(1)}$ from the candidates from the previous step, and uses them as finetuning data for the next intermediate model $M_1$, which is in turn used to select training data for obtaining $M_2$. }
+  \label{fig:method}
+\end{figure}
+\vspace{-3mm}
+
+\subsection{Initialization}
+\paragraph{Seed data.} We start with a seed set of human-annotated (instruction, output) examples that will be used to fine-tune language models to give initial predictions in both directions: predicting an output given an instruction, and an instruction given an output. 
+
+\paragraph{Unlabelled data.} We use a web corpus as a source of unlabelled data.
+For each document, we perform preprocessing to extract self-contained segments $\{ y_{i}\}$, which are portions of text following an HTML header. We further run deduplication, length filtering, and remove potential low quality segments with several heuristics such as the proportion of capitalized letters in the header. 
+
+\subsection{Self-Augmentation (generating instructions)}  \label{sec:self-augment}
+
+We finetune the base language model with (output, instruction) pairs $\{(y_{i}, x_{i})\}$ from the seed data to obtain a backward model $M_{yx}\coloneqq p(x|y)$. For each unlabelled example $y_i$, we run inference on the backward model to generate a candidate instruction $\hat{x_{i}}$ from which we  derive the  candidate augmented paired data $\mathcal{A} \coloneqq \{(\hat{x_{i}}, y_{i})\}$.
+As we will see in experiments, not all of these candidate pairs are of high quality, and in that case using them all for self-training may not be beneficial. We thus consider the important next step of curation of a high quality subset.
+
+\subsection{Self-Curation (selecting high-quality examples)} 
+
+We select high quality examples using the language model itself. 
+We start with a seed instruction model $M_{0}$ finetuned on (instruction, output) seed examples only. We then use $M_{0}$ to score each augmented example $\{(\hat{x}_{i}, y_{i})\}$ to derive a quality score $a_i$.  This is done using prompting, instructing the trained model to rate the quality of a candidate pair on a 5-point scale. The precise prompt we use is given in \autoref{table:rating_prompt}.
+We can then select a subset of the augmented examples with score $a_i \ge k$ to form a curated set $\mathcal{A}_k^{(1)}$.
+
+\paragraph{Iterative self-curation} 
+We further propose an iterative training method to produce higher quality predictions.
+On iteration $t$ we use the curated augmentation data $\mathcal{A}_k^{(t-1)}$ from the previous iteration, along with the seed data as training data to finetune an improved model $M_t$. This model in turn can be used to rescore the augmented examples for quality, resulting in an augmentation set $\mathcal{A}_k^{(t)}$. We perform two iterations of data selection and finetuning to get the final model $M_2$. 
+
+When combining both seed data and augmented data for finetuning, we use tagging to distinguish these two data sources. Specifically, we append an additional sentence to examples (called ``system prompt"). We use $S_a \coloneqq$ ``Answer in the style of an AI Assistant." for seed data, and $S_w \coloneqq$ ``Answer with knowledge from web search." for augmented data. This approach is similar to methods used to tag synthetic data for backtranslation in machine translation \citep{caswell2019tagged}.
+
+\section{Experiments}
+\label{results}
+
+\subsection{Experimental Setup}
+\label{subsec:exp_setup}
+
+\paragraph{Seed data.}  We use 3200 examples from the Open Assistant dataset~\citep{kopf2023openassistant} as human-annotated seed data to train our models. Each example is an (instruction, output) pair $\{(x_{i}, y_{i})\}$, chosen from the first turn of the conversation tree. We only sample English language responses that are high quality, based on their human annotated rank (rank 0). 
+
+\vspace{-2mm}
+\paragraph{Base model \& finetuning.} We use the pretrained LLaMA model \citep{touvron2023llama} with 7B, 33B and 65B parameters as the base models for finetuning. During training, we only optimize the loss on the output tokens, not the input tokens, thus deviating from the standard language modeling loss. We use the same hyperparameters as existing supervised finetuning (SFT) methods \citep{zhou2023lima,touvron2023llama} for most models:  learning rate $1e-5$ which linearly decays to $9e-6$ at the end of training, weight decay 0.1, batch size 32 (examples) and dropout 0.1. For finetuning with less than 3000 examples we use batch size 8 (more details in \autoref{tab:scaling_details}). We refer to our trained Llama-based  instruction backtranslation model as {\em Humpback}\footnote{Due to its relation to camel's backs, but also the large scale nature of whales ( 
+\includegraphics[width=3.3mm]{figs/1f40b.pdf}~{\footnotesize{$>$}}
+\includegraphics[width=2.7mm]{figs/1f42a.pdf}~).
+}. For generation, we use nucleus sampling \citep{holtzman2019curious} with temperature $T=0.7$, $p=0.9$.
+\vspace{-2mm}
+\paragraph{Unlabelled data.} We use the English portion of  the Clueweb corpus as the source of unlabelled data~\citep{overwijk2022clueweb22}.  Among those, we sampled 502k segments.
+
+\vspace{-2mm}
+
+\paragraph{Baselines.} The main baselines we compare to are the following  approaches: 
+\vspace{-2mm}
+\begin{itemize}[leftmargin=*]
+    \item text-davinci-003 \citep{ouyang2022training}: an instruction following model based on GPT-3 finetuned with instruction data from human-written instructions, human-written outputs, model responses and human preferences using reinforcement learning (RLHF).
+    \item LIMA~\citep{zhou2023lima}: LLaMA models finetuned with 1000 manually selected instruction examples from a mixture of community question \& answering (e.g. StackOverflow, WikiHow, etc.) and human expert-written instruction and responses. 
+    \item Guanaco \citep{dettmers2023qlora}: LLaMA models finetuned with 9000 examples from the OpenAssistant dataset. The difference from the 3200 seed examples used in this paper is that Guanaco includes (instruction, output) pairs from all turns while we only used the first-turn.
+\end{itemize}
+
+We additionally report comparisons to various other models, e.g. which use data distilled from larger and more powerful models such as GPT-4, but do not consider them as directly comparable to our LlaMa-based approach.
+
+\paragraph{Evaluation.} We evaluate on test prompts from several sources: Vicuna \citep{vicuna2023} (80 prompts), Self-instruct \citep{zhang2023self} (252 prompts), Open Assistant \citep{kopf2023openassistant} (188 prompts), Koala \citep{koala_blogpost_2023} (156 prompts), HH\_RLHF \citep{bai2022training} (129 prompts), LIMA \citep{zhou2023lima} (300 prompts), crowdsourced from authors (64 prompts). In total there are 1130 unique prompts, providing a good coverage on a variety of task categories, e.g. writing, coding, mathematical reasoning, information seeking, advice, roleplay, safety, etc. We sample 256 prompts from them excluding those in the AlpacaEval test set as a dev set. We ran both automatic evaluation using AlpacaEval \citep{alpaca_eval}, which computes the win rate against baseline models based on GPT-4 judgements, as well as human preference evaluation. 
+
+\subsection{Seed and Augmentation Data Statistics} 
+
+\paragraph{Data statistics.} In Table \ref{tab:train_data_stats} we provide the  statistics of the seed data as well as various versions of the augmented data. We can see that augmented data tends to have longer outputs compared to the seed data, and self-curated higher quality training data ($\mathcal{A}_4^{(2)}$ and $\mathcal{A}_5^{(2)}$) has both shorter instructions and outputs among all augmented data, closer to the length of the original seed instruction data.
+
+\begin{table}[t]
+    \caption{Statistics of seed, self-augmentation and self-curation finetuning data. Instruction and output lengths are given as the number of characters.
+  \label{tab:train_data_stats}
+    }
+  \centering
+  \small
+  \begin{tabular}{lccc}
+    \toprule
+        & \textbf{\# examples} & \textbf{Instruction Length}  &  \textbf{Output Length}   \\
+    \midrule
+
+  Seed data & 3200  &  148 $\pm$ 322 & 1072  $\pm$ 818   \\ 
+    \vspace{1mm}
+  Augmented data, $\mathcal{A}_{5}^{(2)}$  & 41821 & 115  $\pm$ 175 & 1663  $\pm$ 616  \\
+    \vspace{1mm}
+   Augmented data, 
+  $\mathcal{A}_{4}^{(2)}$  & 195043 & 206  $\pm$ 298 & 1985  $\pm$ 649  \\ 
+  Augmented data, all  & 502133  & 352  $\pm$ 134 & 1722  $\pm$ 653  \\  
+    \bottomrule
+  \end{tabular}
+  \vspace{1mm}
+\end{table}
+\paragraph{Generated Instructions.}  We conduct the task diversity analysis of the seed data and augmented data using the approach from \cite{wang2022self}. Figure \ref{fig:verb_noun_pie} visualizes the distribution of the verb-noun structure of instructions in the seed data and augmented data ($\mathcal{A}_5^{(2)}$ category) respectively. Similar to the seed data, there are a few head tasks related to writing, information seeking and advice, although the type of content from unlabeled data (article, recipe, description, release, etc.) complements those in the seed data (essay, script, code, story, etc.). The augmented data increases the task diversity especially in the long tail. 
+
+\subsection{Scaling Analysis} \label{sec:scaling_analysis}
+\paragraph{Data quality vs. data quantity.} In order to understand the importance of data quality vs. data quantity in learning to follow instructions, we compared finetuning on augmented data of different quality. Specifically, we compared finetuning on augmented data without quality-based selection (w/o curation), self-selected data in $\mathcal{A}_{4}^{(2)}$ (score $\geq 4$) and $\mathcal{A}_{5}^{(2)}$ (score $\geq 4.5$) categories. Results are shown  in Figure \ref{fig:data_quality_scaling}. We find that training on augmented data without self-curation does not improve instruction following performance despite scaling up data quantity. However,  training on the high quality portion of the augmented data leads to increasing instruction following performance, with steady improvement as we continue to scale up the amount of augmented data. Prior work proposed the ``superficial alignment hypothesis", that only a few thousands of high-quality instruction following examples are sufficient for aligning a pretrained base model to follow instructions \cite{zhou2023lima}. Our results provide a contrasting observation that increasing the quantity of high-quality data provides  further gains (whereas increased quantities of low-quality data does not). 
+
+\begin{figure}
+  \centering
+  \includegraphics[width=0.55\columnwidth]{figs/data_scaling_quality.pdf}
+  \caption{Evaluating self-augmented data of different data size and quality using self-curation. The y-axis is the win rate against text-davinci-003 when finetuning 7B LLaMa with the given data size and quality. We compare three augmentation datasets:  without self-curation,  $\mathcal{A}_{4}^{(2)}$ and  $\mathcal{A}_{5}^{(2)}$ that are progressively smaller augmentation sets but of higher data quality 
+  (see \autoref{tab:train_data_stats}
+  for statistics).
+  Similar to observations in LIMA using human-annotated data \citep{zhou2023lima}, improving the quality of the training data dramatically improves the quality of the model, despite the smaller dataset size. }
+  \label{fig:data_quality_scaling}
+\end{figure}
+
+\paragraph{Data scaling efficiency.} 
+We compare the performance of various instruction-following models as we alter the amount of instruction following finetune data they use. We measure the win rate of each model against text-davinci-003 when finetuning 7B LLaMa with the given finetune dataset.
+We also report an estimate of this efficiency using the data scaling coefficient $\alpha$, which is calculated by fitting empirical data with $w = \alpha \log N + C$, where $w$ is the win rate measuring generation quality of the model finetuned on $N$ examples.
+
+We compare our instruction backtranslation method
+(self-augmentation and self-curation with $k=5$, 2 iterations) to methods using instruction datasets created from different sources.
+
+\begin{table}[h]
+\caption{Scaling coefficient $\alpha$ of representive instruction datasets created using differnet methods and data sources.
+      \label{tab:scaling_alpha}
+    }
+  \centering
+  \begin{tabular}{lll}
+    \toprule
+     & \textbf{Source}     &  \textbf{$\alpha\uparrow$ } \\
+    \midrule
+
+Humpback (this work) & OA, self-augmented and self-curated & 6.95 \\
+WizardLLM\tablefootnote{The specific version of the data we used is \url{https://huggingface.co/datasets/WizardLM/WizardLM_evol_instruct_V2_196k/tree/main}.} \citep{xu2023wizardlm} & Distilled from ChatGPT, GPT-4 (June 2023) & 5.69 \\
+Alpaca-GPT4 \citep{peng2023instruction} & Distilled from GPT-4 (April 2023) & 5.40 \\
+Vicuna \citep{vicuna2023} & Distilled from ChatGPT, GPT-4 (June 2023) & 4.53 \\
+Open Assistant (OA) \citep{kopf2023openassistant} & Human Annotation & 4.43 \\
+LIMA \citep{zhou2023lima} & Human Annotation, Community QA & 2.86 \\
+Alpaca \citep{alpaca} & Distilled from ChatGPT (March 2023) & 1.99 \\
+FLAN v2 \citep{chung2022scaling} & Instruction data for NLP tasks & 0.22 \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+Results are  shown in Figure \ref{fig:data_scaling_all_7b}, with the estimated scaling coefficient $\alpha$ summarized in Table \ref{tab:scaling_alpha}. 
+We find that most distilled instruction datasets have better data efficiency than datasets created from other sources, e.g. NLP tasks (FLAN v2) or extracted from community Q\&A (LIMA). Both improving instruction diversity (e.g. WizardLLM vs. Vicuna) and response quality (e.g. Alpaca-GPT4 vs. Alpaca) seem to yield better data efficiency. Scaling up augmented data using the $\mathcal{A}_5$  data achieved both higher instruction following performance and more efficient data scaling. We provide further analysis on jointly scaling data and model size in Appendix \ref{appendix:additional_analysis}. 
+\begin{figure}
+  \centering
+  \includegraphics[width=0.75\columnwidth]{figs/data_scaling_all_7b.pdf}
+  \caption{Comparing data efficiency of different instruction tuning datasets. The y-axis is the win rate against text-davinci-003 when finetuning 7B LLaMa with the given instruction tuning dataset.
+  Dashed lines depict models that use distillation from more powerful models to construct data, and methods with solid lines do not.
+  }
+  \label{fig:data_scaling_all_7b}
+\end{figure}
+
+\subsection{Model Quality}
+\paragraph{AlpacaEval.} We use the automatic evaluation (using GPT-4) from AlpacaEval to evaluate generation quality on 805 prompts from the  Alpaca Leaderboard.  AlpacaEval compares the pairwise win rate against the reference model text-davinci-003. We compare our method's performance among three categories of instruction models: 
+\begin{itemize}[leftmargin=*]
+    \item \textbf{Non-distilled}: LLaMa models trained without relying on any external model (e.g. ChatGPT, GPT-4, etc.) for any form of supervision. Most models in this category heavily rely on human annotated data. 
+    \item \textbf{Distilled}: models trained with a more powerful external model in the loop, e.g. using data distilled from an external model.
+    \item \textbf{Proprietary}: models trained with proprietary data and techniques. 
+\end{itemize}
+
+Results are given in Table \ref{tab:alpaca_leaderb}. Our method is the top-performing model among non-distilled models at both 65B and 33B model scales. We note that Guanaco and OASST are trained on the same data source as our seed data, but with more annotated examples. We also evaluated Humpback based on LLaMa 2 \citep{touvron2023llama2} 70B to verify its performance further improves with stronger base model.
+
+\begin{table}[t]
+    \caption{
+    Results on the Alpaca leaderboard (win rate over text-davinci-003 evaluated by GPT-4). Humpback outperforms other non-distilled models by a wide margin with efficient data scaling beyond human annotated data. 
+  \label{tab:alpaca_leaderb}
+    }
+    \small
+  \centering
+  \begin{tabular}{cllll}
+    \toprule
+     &   & \textbf{Annotated Examples} & \textbf{Total Examples} & \textbf{Win Rate \%}  \\
+    
+    \midrule  
+  
+   \multirow{4}{4em}{Non-distilled} & Humpback 33B & 3k & 45k & \textbf{79.84} \\
+
+     & OASST RLHF 33B & 161k & 161k & 66.52 \\
+     & Guanaco 33B & 9k & 9k & 65.96 \\
+    & OASST SFT 33B & 161k & 161k & 54.97 \\
+     \midrule
+      \multirow{3}{4em}{Non-distilled} & Humpback 65B & 3k & 45k & \bf{83.71} \\
+   & Guanaco 65B & 9k & 9k & 71.80 \\
+    & LIMA 65B & 1k & 1k & 62.70  \\
+     \midrule  
+     \multirow{2}{4em}{Non-distilled} & Humpback 70B & 3k & 45k & 87.94 \\
+   & LLaMa2 Chat 70B & 1.4m & 5.7m & \bf{92.66} \\
+   \midrule
+   \multirow{4}{4em}{Distilled}  & Vicuna 33B & 140k & 140k & \bf{88.99} \\
+    & WizardLLM 13B & 190k & 190k & 86.32 \\
+    & airoboros 65B & 17k & 17k & 73.91 \\
+     & Falcon Instruct 40B & 100k & 100k & 45.71 \\
+   
+     \midrule
+  \multirow{3}{4em}{Proprietary} & GPT-4 & & & \bf{95.28} \\
+   & Claude 2 & & & 91.36 \\
+   & ChatGPT & &  & 89.37 \\ % re-eval in July
+   & Claude & & & 88.39 \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\paragraph{Human Evaluation.} We also conduct human evaluation on the general quality of the model responses on the combined test set described in Section \ref{subsec:exp_setup}, which covers several existing benchmarks. For each prompt, we present outputs from two models side-by-side, comparing our method to a given baseline model, and ask the human evaluator to choose from three options: 1) output from the first model is significantly better than the second model; 2) output from the second model is significantly better than the first model; 3) there is no significant difference between the two outputs. We randomize the order the models are presented in to avoid position bias. Figure \ref{fig:human_eval_pref} summarizes the comparison with both open source and proprietary models. We can see that the human preference distribution is roughly consistent with the preference distribution using GPT-4 as the judge from AlpacaEval, corroborating observations from \citet{alpaca_eval}, \citet{zhou2023lima} and \citet{zheng2023judging}.  
+
+\begin{figure}
+  \centering
+  \includegraphics[width=0.65\columnwidth]{figs/human_eval_pref.pdf}
+  \caption{Humpback is preferred to both open source (e.g. LIMA\citep{zhou2023lima} (65B), Guanaco \citep{dettmers2023qlora} (65B),Falcon-Instruct\citep{falcon40b}) (40B) and proprietary (e.g. davinci-003\citep{ouyang2022training} and Claude\citep{bai2022training}) instruction-tuned models in pairwise human preference judgements.}
+  \label{fig:human_eval_pref}
+  \vspace{-3mm}
+\end{figure}
+
+\paragraph{Commonsense Reasoning and MMLU.} We evaluate on five commonsense reasoning benchmarks, SIQA 
+\citep{sap2019socialiqa}, PIQA \citep{bisk2020piqa}, Arc-Easy \citep{clark2018think}, Arc-Challenge \citep{clark2018think}, and Openbook QA (OBQA) \citep{mihaylov2018can}, which measures reasoning ranging from social interactions to grade 3 to 9 science questions. We compute zero-shot accuracy based on perplexity of the correct answer following LLaMa\citep{touvron2023llama}. We also evaluate on the  massive multitask language understanding (MMLU) \citep{hendrycks2020measuring} benchmark. The results are summarized in \autoref{tab:commonsense_eval}. We found that compared to the base model, our model has improved zero-shot performance on social reasoning, challenging science problems which require more reasoning (Arc-C),  Openbook QA and MMLU. Detailed results by domains are included in Appendix \ref{appendix:additional_analysis}.
+
+\begin{table}[h]
+  \caption{Comparison on zero-shot commonsense reasoning and MMLU.
+  \label{tab:commonsense_eval}
+  }
+  \centering
+  \small
+  \begin{tabular}{lllllll}
+    \toprule
+        & \textbf{SIQA} & \textbf{PIQA}  & \textbf{Arc-E} & \textbf{Arc-C} & \textbf{OBQA} & \textbf{MMLU}  \\
+    \midrule
+    LLaMA 33B & 50.2  & 82.2 & 80.0 & 54.8 & 58.6 & 49.5 \\
+    Humpback 33B & 53.4  & 74.5 & 84.4 & 68.5  & 46.4 & 55.4 \\
+    LLaMA 65B & 52.3  & 82.8 & 78.9 & 56.0 & 60.2  & 54.8 \\
+    Humpback 65B & 60.4  & 78.9 & 88.7 &  73.0 & 64.0 & 59.0 \\
+    \bottomrule
+  \end{tabular}
+  \vspace{1mm}
+\end{table}
+
+\subsection{Ablations}
+We perform further ablation studies to understand the effectiveness of self-augmented data in our method. 
+
+\paragraph{Training on self-augmented data only.} As is shown in Figure \ref{fig:aug_data_only}, when training on self-augmented data alone (without seed data), and without self-curation, the quality of instruction following does not improve, or even  deteriorates with more data. However, training on the higher quality self-curated data brings improvements as training set size increases. While this self-curated data  does not outperform seed training data scaling alone, when joint training with both seed and self-augmented data we observe large improvements. This indicates that seed data and augmented data are complimentary, where the seed data has the same distribution as the target domain (AI assistant response), while the data from web corpus may enlarge the diversity of the instructions and outputs. In Appendix \ref{appendix:additional_analysis} provides further qualitative analysis to illustrate the improvement over training with seed data alone.
+
+\begin{figure}
+  \centering
+  \includegraphics[width=0.45\columnwidth]{figs/data_scaling_bt_only.pdf}
+  \caption{Combining self-curated data with seed data significantly outperforms using seed data alone. Using augmentation without self-curation performs poorly, showing that curation is critical. 
+  }
+  \label{fig:aug_data_only}
+\end{figure}
+
+\paragraph{System prompts.}
+In Table \ref{tab:abl_system_prompt}, we disentangle the effects of system prompts in joint finetuning and during inference. We found adding system prompts to distinguish augmented data from seed data is helpful. Interestingly, using a combined system prompt \{$S_a$, $S_w$\} at inference time, which concatenates the one for the seed data with the one for augmented data, is better than either no system prompt or using the seed data prompt, despite that the concatenation was not seen during training.  
+\begin{table}[t]
+\caption{Effect of system prompt. We report mean win rate and its standard error.
+\label{tab:abl_system_prompt}
+}
+  \centering
+  \begin{tabular}{llc}
+    \toprule
+     \textbf{Train} & \textbf{Inference}    &  \textbf{Win Rate (\%)}  \\
+    \midrule
+    $S_a$ for seed data, $S_w$ for augmented data  & \{$S_a$, $S_w$\}  & 
+66.47 $\pm$3.04 \\ 
+
+    \midrule
+   no system prompt  &  no system prompt & 59.96 $\pm$3.09   \\
+    $S_a$ for seed data, $S_w$ for augmented data  & $S_a$ &  62.69 $\pm$3.06   \\
+    $S_a$ for seed data, $S_w$ for augmented data   & no system prompt &   62.70 $\pm$3.07   \\
+    
+    \bottomrule
+  \end{tabular}
+
+\end{table}
+
+\section{Related Work}
+
+\paragraph{Instruction tuning for LLMs.} Our work shares the same goal as the broad category of efforts on finetuning large language models to follow instructions. Early work on instruction tuning mainly focused on NLP tasks, with the finding that finetuning with NLP datasets formatted as instruction-output pairs improves cross-task generalization \citep{wei2021finetuned,mishra2021cross,sanh2021multitask,wang2022super}. Recent work \citet{ouyang2022training} extends instruction tuning to a broader range of general tasks, especially incorporating instructions from users of language models.
+
+\vspace{-2mm}
+\paragraph{Instruction generation and curation.} A key challenge to enable LLMs to perform general instruction-following is gathering demonstration examples for finetuning. Existing high-quality instruction-following LLMs rely on human annotations in various steps, including writing instructions, writing model responses, providing preferences to indicate desired response, etc. Those instruction sets are often proprietary, one exception being the recent OpenAssistant datasets \citep{kopf2023openassistant}. Overall, the human annotation approach is difficult to scale since collecting annotations on a wide range of tasks is expensive, time consuming and requires expertise in different domains. 
+
+Several works have explored using LLMs to generate instructions. Unnatural instructions prompts GPT-3 to generate more instructions given a few in-context seed instructions \citep{honovich2022unnatural}. Self-instruct \citep{wang2022self} uses the same approach to generate instructions, as well as outputs for those instructions. They further perform manually engineered filtering rules to remove low-quality instruction-output pairs. \citet{xu2023wizardlm} generates more complex instructions by creating variants of user instructions sent to ChatGPT.  
+
+All these approaches use model-generated responses for training data. More similar to our method is the concurrent work  of \citet{koksal2023longform}, which takes human-written text as a natural response, and uses the LLM to generate the corresponding instruction conditioning on the response. A critical difference in our work is that we show that the self-curation step is vital to improve such a procedure.
+A further difference is that they use distillation via an instruction tuned LLM (InstructGPT) to generate instructions, while our approach does not rely on distilling from a more powerful model in the loop, and is instead an instance of self-alignment. 
+\vspace{-2mm}
+\paragraph{Self-alignment.} Our work is  an instance of the growing body of work on \textit{self-alignment}, i.e. utilizing the model to improve itself and  align its response with desired behaviors such as model-written feedback, critique, explanations, etc. Differently to our work, many of these works either construct training data in an unsupervised way
+\citep{sun2023principledriven,bai2022constitutional}, whereas we augment human-written web pages,
+or they use the model to generate additional context to condition on at inference time to improve the output \citep{saunders2022self, zhang2023self,madaan2023self}.
+
+\vspace{-2mm}
+
+\paragraph{Data quality.}
+
+Several approaches have shown that curating high-quality human-written data results in strong performance, for example PALMS \citep{solaiman2021process} and
+LIMA \citep{zhou2023lima}. Instead of manually curating high-quality data, our work focus on selecting high-quality using the model itself. In concurrent work, \cite{chen2023alpagasus} also provides an algorithmic approach to select high quality data. They differ from our work in that they prompt a stronger model (ChatGPT) to score the quality of model generated responses from distillation, while this work scores the quality of human-written data as a response to a self-generated instruction. 
+
+\paragraph{Distillation.} Most finetuned LLaMA models are based on knowledge distillation from ChatGPT or GPT-4, such as Alpaca \citep{alpaca}, Alpaca-GPT 4\citep{peng2023instruction}, Vicuna \citep{vicuna2023}, FalconInstruct \citep{falcon40b}, OpenChat \citep{openchat}, UltraChat \citep{ding2023enhancing}. 
+Hence, these approaches require that you already have a strong model, but do not provide a recipe for building a strong model from scratch.
+Drawbacks of these approaches are also discussed in \cite{gudibande2023false}.
+\section{Conclusion}
+We proposed a scalable approach to finetune large language models to follow instructions. Our method leverages large amounts of unlabeled data by developing an iterative self-training algorithm that we dub instruction backtranslation. Our method uses the model itself to both augment  and curate
+high quality training examples to improve its own performance. On the Alpaca leaderboard, our finetuned models outperform all other non-distilled instruction-following models, while using fewer human annotated examples.
+Future work should scale this method further by considering larger unlabeled corpora, which our analysis suggests should  yield further gains.\newpage
+
+\newpage
+
+\end{document}

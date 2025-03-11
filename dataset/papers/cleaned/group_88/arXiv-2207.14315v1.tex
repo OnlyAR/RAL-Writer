@@ -1,0 +1,347 @@
+\title{SPot-the-Difference Self-Supervised Pre-training for Anomaly Detection and Segmentation}
+
+\begin{document}
+
+\pagestyle{headings}
+\mainmatter
+\def\ECCVSubNumber{2149}  
+
+\title{SPot-the-Difference Self-Supervised Pre-training for Anomaly Detection and Segmentation}
+
+\titlerunning{SPot-the-Difference Representation Learning}
+\author{Yang Zou\inst{1}, Jongheon Jeong\inst{2}\thanks{~~work done during an Amazon internship}, Latha Pemula\inst{1} \\Dongqing Zhang\inst{1}, Onkar Dabeer\inst{1}}
+\authorrunning{Y. Zou et al.}
+\institute{$^1$AWS AI Labs ~~~~~ $^2$KAIST \\
+\email{\{yanzo,lppemula,zdongqin,onkardab\}@amazon.com, jongheonj@kaist.ac.kr}}
+\maketitle
+
+\begin{abstract}
+ Visual anomaly detection is commonly used in industrial quality inspection. In this paper, we present a new dataset as well as a new self-supervised learning method for ImageNet pre-training to improve anomaly detection and segmentation in 1-class and 2-class 5/10/high-shot training setups. We release the Visual Anomaly (VisA) Dataset consisting of 10,821 high-resolution color images (9,621 normal and 1,200 anomalous samples) covering 12 objects in 3 domains, making it the largest industrial anomaly detection dataset to date. Both image and pixel-level labels are provided. We also propose a new self-supervised framework - SPot-the-difference (SPD) - which can regularize contrastive self-supervised pre-training, such as SimSiam, MoCo and SimCLR, to be more suitable for anomaly detection tasks. Our experiments on VisA and MVTec-AD dataset show that SPD consistently improves these contrastive pre-training baselines and even the supervised pre-training. For example, SPD improves Area Under the Precision-Recall curve (AU-PR) for anomaly segmentation by 5.9\% and 6.8\% over SimSiam and supervised pre-training respectively in the 2-class high-shot regime.
+ We open-source the project at \url{http://github.com/amazon-research/spot-diff}.
+
+\keywords{Representation learning, pre-training, anomaly detection, anomaly segmentation, industrial anomaly dataset}
+\end{abstract}
+
+\section{Introduction}
+Visual surface anomaly detection and segmentation identify and localize defects in industrial manufacturing \cite{bergmann2021mvtec}. While anomaly detection and segmentation are instances of image classification and semantic segmentation problems, respectively, they have unique challenges. First, defects are rare, and it is hard to obtain a large number of anomalous images. Second, common types of anomalies, such as surface scratches and damages, are often small. Fig. ~\ref{fig:teaser} (a) gives an example. Third, manufacturing is a performance sensitive domain and usually requires highly accurate models. Fourth, inspection in manufacturing spans a wide range of domains and tasks, from detecting leakages in capsules to finding damaged millimeter-sized components on a complex circuit board. % \Onkar{the defect does not show low-contrast}.
+
+Upon the aforementioned challenges, previous surface anomaly detection models have been typically trained for a particular object and require re-training for different ones. For each object, there are only slight global differences in lighting and object pose/positions across images while the diversity in the defects on objects is large. 
+Moreover, due to the rarity of anomalous data, there has been a predominant focus on 1-class anomaly detection, which only requires normal images for model training \cite{caron2020unsupervised,cohen2020sub,defard2021padim,li2021cutpaste,Roth_2022_CVPR,yi2020patch}. In mature manufacturing domains, anomalous samples are also available and sometimes sufficient. In such cases, one can improve over 1-class methods with a standard 2-class 
+model \cite{cui2019class,feng2021few,gornitz2013toward,lin2017focal} by incorporating the anomalous data in training, which is in fact a well-established practice in % , as is the case in some 
+commercial visual inspection AI services \cite{LfV,VIAI}.
+For both setups, existing state-of-the-art methods for surface anomaly detection commonly leverage supervised representations pre-trained on ImageNet \cite{deng2009imagenet}, 
+either as feature extractors \cite{defard2021padim,Roth_2022_CVPR} or as initialization for fine-tuning on the target dataset \cite{li2021cutpaste,yi2020patch}.
+
+\begin{figure}[!t]
+  \centering
+  \includegraphics[width=0.95\linewidth]{figs/teaser.png}
+  \caption{(a) Normal and anomalous samples of VisA - PCB1 with real defect (molten metal), anomaly highlighted by red ellipse; (b) A pair of images for the spot-the-difference (SPD) puzzle \cite{jhamtani2018learning}; (c) An anchor image and its variant augmented by SmoothBlend for synthetic spot-the-difference; (d) GradCAM attention visualization for PCB1 - Anomaly image based on self-supervised ImageNet pre-training w/wo proposed SPD. With SPD, attention is more focused on the local defects.}
+  \label{fig:teaser}
+\end{figure}
+
+Meanwhile, recent advances in self-supervised learning (SSL) have shown that pre-trained representations learned without categorical labels might be a better choice for transfer learning compared to those from supervised in object detection and segmentation \cite{chen2020simple,chen2021exploring,he2020momentum}. However, their application to anomaly detection and segmentation is underdeveloped. SSL for surface anomaly detection was explored in CutPaste \cite{li2021cutpaste} to learn representation from downstream images for each specific object. However, such representations hardly generalize to different objects and can lead to overfitting in a practical setting where only 1-20 normal samples are available. Also, there are previous works focusing on SSL for high-level semantic anomaly detection such as cat among a distribution of dogs \cite{cook2020consult,davis2006relationship,saito2015precision}. However, as \cite{ruff2021unifying} pointed out, surface anomaly detection aims to spot the low-level textual anomalies such as scratch and crack which has challenges different from semantic anomaly detection. Until now, the universal self-supervised pre-trained representation with good generalization ability have not yet been attempted for surface anomaly detection and segmentation.
+
+Regarding the evaluation protocol, the community has been experiencing the lack of challenging benchmarks. The popular MVTec Anomaly Detection (AD) benchmark \cite{bergmann2021mvtec} is  saturating with the Area Under the Receiver Operating Characteristic (AU-ROC) approaching $\sim$95\% \cite{defard2021padim,li2021cutpaste}, and the benchmark is limited to the 1-class setup. But the anomaly detection problems in practice is still far from solved, demanding new datasets and metrics that better represent the real-world. In this paper, we introduce a new challenging Visual Anomaly (VisA) dataset. VisA is collected to present several new characteristics: objects with complex structures such as printed circuit board (PCB), multiple instances with different locations in a single view, 12 different objects spanning 3 domains, and multiple anomaly classes (up to 9) for each object. VisA contains 10,821 high-resolution color images - 9,621 normal and 1,200 anomalous - with both image and pixel-level labels. To our best knowledge, VisA is currently the largest and most challenging public dataset for anomaly classification and segmentation. Moreover, to cover different use cases in practice, we establish benchmarks not only in standard 1-class training setup but also 2-class training setups with 5/10/high-shot. For evaluation, we propose to use Area Under the Precision-Recall curve (AU-PR) in combination with standard AU-ROC. In the imbalanced defect dataset, AU-ROC might present inflated view of performances and AU-PR is more informative to measure anomaly detection performance \cite{cook2020consult,davis2006relationship,saito2015precision}.
+
+In addition to an improved dataset, we also explore self-supervision to improve anomaly detection. As we argue below, our hypothesis is that previous contrastive SSL methods \cite{chen2020simple,chen2021exploring,he2020momentum} are sub-optimal to transfer learning for anomaly detection. Specifically, SimCLR, MoCo and other methods regard globally augmented images of a given image as one class and other images in the same batch as negative classes. Transformations, such as cropping and color jittering, are applied globally to the anchor for positives generation. The InfoNCE or cosine similarity losses \cite{chen2020simple,chen2021exploring,he2020momentum} encourage invariance to these global deformations, and capturing semantic information instead of local details \cite{geirhos2020on}. However, anomaly detection relies on local textual details to spot defects. Thus the subtle and local intra-object (or intra-class) differences are important but not well modeled by previous methods. Figure \ref{fig:teaser} (d) illustrates the sub-optimality in one of the previous SSL methods using the GradCAM attention map \cite{selvaraju2017grad}. As far as we know, improving representations by self-supervision for better downstream anomaly detection/segmentation has not been studied before and we explore this angle. 
+
+Inspired by the spot-the-difference puzzle shown in Fig. \ref{fig:teaser} (b), we propose a contrastive SPot-the-Difference (SPD) training to promote the local sensitivity of previous SSL methods. In the puzzle, players need to be sensitive to the subtle differences between the two globally alike images, which is similar to anomaly detection. In the contrastive SPD training, as shown in Fig. \ref{fig:teaser} (c), a novel augmentation called SmoothBlend is proposed to produce the local perturbations on SPD negatives for synthetic spot-the-difference. The (locally) augmented images are regarded as negatives, which is different from regarding (globally) augmented images as positives in SimCLR/MoCo. Moreover, weak global augmentations, such as weak cropping and color jittering, are also applied to the SPD negatives as anomaly detection should spot defects under slight global changes in lighting and object pose/position. Additionally, to prevent models from using the slight global changes as shortcuts to differentiate negatives, SPD positives are generated by applying weak global augmentations on the anchor. Lastly, SPD training minimizes the feature similarities between SPD negative pairs while maximizing the similarities between SPD positives, which encourages models to be locally sensitive to anomalous patterns and invariant to slight global variations.
+
+Our main contributions are as follows:
+\begin{enumerate}
+    \item We propose a new VisA dataset, 2$\times$ larger than MVTec-AD, with both image and pixel-level annotations. It spans 12 objects across 3 domains, with challenging scenarios including complex structures in objects, multiple instances and object pose/location variations. Moreover, we establish both 1-class and 5/10/high-shot 2-class benchmarks to cover different use cases.
+    \item To promote the local sensitivity to anomalous patterns, a SPot-the-Difference (SPD) training is proposed to regularize self-supervised ImageNet pre-training, which benefits their transfer-learning ability for anomaly detection and localization. As far as we know, we are the first one to explore self-supervised pre-training on large-scale datasets for surface defect detection tasks. 
+    \item Compared to strong self-supervised pre-training baselines such as SimSiam, MoCo and SimCLR, extensive experiments show our proposed SPD learning improves them for better anomaly detection and segmentation. We also show the SPD improves over supervised ImageNet pre-training for both tasks. 
+\end{enumerate}
+\section{Related Works}
+\noindent\textbf{Unsupervised Anomaly Detection and Segmentation} use only normal samples to train models, which have drawn extensive attention. Many recent methods are proposed to detect low-level texture anomalies \cite{ruff2021unifying}, such as scratches and cracks, which are common cases in industrial visual inspection \cite{Deng_2022_CVPR,Ristea-CVPR-2022,RudWeh2022,yi2020patch}. SPADE \cite{defard2021padim} and PatchCore \cite{Roth_2022_CVPR} extract features at patch level and use nearest neighbor methods to classify patches and images as anomalies. PaDiM \cite{defard2021padim} learns a parametric distribution over patches for anomaly detection. CutPaste \cite{li2021cutpaste} learns a representation based on images augmented by cut-and-pasted patches. The supervised ImageNet models are used in these methods either as feature extractors or initialization for fine-tuning. However, self-supervised pre-training on large-scale datasets is an unexplored area for quality inspection applications. In addition, several works \cite{reiss2021mean,sohn2021learning,tack2020csi,pmlr-v80-ruff18a} focus on high-level semantic anomaly detection. As mentioned in \cite{ruff2021unifying}, semantic anomaly detection approaches can be less effective for texture anomaly detection as their challenges are different.
+
+\noindent\textbf{Self-Supervised Learning (SSL)} have gathered momentum in the last 5 years. Several surrogate tasks have been proposed for self-supervision, such as image colorization \cite{zhang2016colorful}, rotation prediction \cite{gidaris2018unsupervised}, jigsaw puzzles \cite{noroozi2016unsupervised}. Recently, multi-view based methods such as MoCo \cite{he2020momentum}, SimCLR \cite{chen2020simple}, SimSiam \cite{chen2021exploring} and BYOL \cite{grill2020bootstrap} present better or comparable performances than supervised pre-training in transfer learning tasks including image classification, object detection \cite{Yang_2021_CVPR} and semantic segmentation \cite{wang2021dense}. Moreover, to promote spatial details of representations for localization tasks, several approaches proposed to encourage the invariance of patch features to global augmentations \cite{wang2021dense,xie2021detco,liu2020self,chen2021multisiam}, although they may not lead to local sensitivity to tiny defects. As far as we know, none of these works explored their generalization ability to surface defect detection tasks. 
+
+\begin{figure}[!t]
+ \centering
+\includegraphics[width=.8\linewidth]{figs/ssl_comp.png}
+\caption{(a) Contrastive learning in SimCLR, MoCo and SimSiam; (b) Contrastive learning in SPD training. Local deformation in SPD negative is highlighted by circle.}
+\label{fig:ssl_comp}
+\end{figure}
+
+\section{SPot-the-Difference (SPD) Regularization}
+To promote local sensitivity of standard self-supervised contrastive learning, we propose a contrastive SPot-the-Difference (SPD) regularization. As mentioned earlier, SPD aims to increase model invariance to slight global changes by maximizing the feature similarity between an image and its weak global augmentation, while forcing dissimilarity for local perturbations, as shown in Fig. \ref{fig:ssl_comp} (b). In the following, we first present background in contrastive learning, and then the augmentations used in SPD followed by the learning with SPD.
+\subsection{Background on Self-supervised Contrastive Learning}
+\begin{figure}[!t]
+\centering
+\includegraphics[width=\linewidth]{figs/aug_comp.png}
+\caption{(a) Samples for synthetic spot-the-difference; (b) Augmentation comparison}
+\label{fig:aug_compare}
+\end{figure}
+
+Many self-supervised learning methods, such as SimCLR \cite{chen2020simple} and MoCo \cite{he2020momentum}, are based on contrastive learning. As shown in Fig. \ref{fig:ssl_comp} (a), given an image, these methods maximize the feature similarity between two strongly augmented samples $x_i$ and $\hat{x}_i$ while minimizing the similarities between the anchor $x_i$ and other images $x_j$'s in the same batch of size $N$. Strong global augmentations, such as grayscaling, large cropping and strong color jittering, are used to get positives. Typically, an encoder extracts features $h_i,\hat{h}_i$ and $h_j$'s which are inputs to a multilayer perceptron (MLP) head. The MLP head extracts the L2 normalized embeddings $z_i,\hat{z}_i$ and $z_j$'s to compute the InfoNCE loss defined as follows.
+\begin{equation}
+    \mathcal{L}_{\mathrm{NCE}}(x_i,\hat{x}_i)= -\log\frac{\exp{(z_i\cdot \hat{z}_i/\tau)}}{\exp{(z_i\cdot \hat{z}_i/\tau)}+\sum_{j=1}^{N}\mathbbm{1}_{j\neq i}\exp{(z_i,z_j}/\tau)}
+    \label{eqn:loss_nce}
+\end{equation}
+$\tau$ is a temperature scaling hyperparameter. In addition, SimSiam \cite{chen2021exploring} shows that self-supervised models can be trained even without negatives where only similarity modeling is implemented for positives.
+
+\noindent\textbf{Remark:} Images augmented by most strong global transformations in SSL, such as grayscaling and large cropping, share semantics with anchor but with different local details (a dog v.s. a dog head). Thus to maximize their similarity, the features are forced to be invariant about local details and capture the global semantics. This is even enforced by minimizing similarities between anchor and different images in a batch as they have different global structures \cite{chen2020simple,ericsson2021self}. This further motivates us to promote local sensitivity in SSL for anomaly detection.
+\subsection{Augmentations for SPD}
+\noindent\textbf{Local augmentation:} In SPD, the locally deformed images, rather than other images of a batch in standard contrastive training, are used as negatives. SmoothBlend is proposed to produce local deformations. The first column in Fig. \ref{fig:aug_compare} (b) presents the samples augmented by SmoothBlend. It is implemented by a smoothed alpha blending between an image and a small randomly cut patch of the same image. Specifically, color jittering is applied to a cut patch. Then an all-zero foreground layer $u$ is created with the patch pasted to a random location. An alpha mask $\alpha$ is created where the pixels corresponding to the pasted patch are set to $1$ otherwise $0$, followed by a Gaussian blur. Finally, the augmented sample is obtained by $\bar{x} = (1-\alpha) \odot x + \alpha \odot u$. $\odot$ is the element-wise product. 
+
+\noindent\textbf{Global augmentation:} To generate global variations for both SPD positives and negatives, we use weak global augmentation. Adding global variations to SPD is motivated by the potentially small global variations in realistic manufacturing environment, such as lighting, object positions, etc. To simulate such slight changes, we choose weak random cropping, Gaussian blurring, horizontal flipping and color jittering. Such weak global augmentations are different from strong transformations used in SimSiam, SimCLR and MoCo which is illustrated by last two columns in Fig. \ref{fig:aug_compare} (b). As we can see, there might be just $20\%$ overlap between the anchor and strongly augmented positive. If the network is designed to maximize the distance between negatives with only subtle changes while minimizing the distance between positives with largely global transformations, it is a confusing task which might harm representation learning for anomaly detection.
+
+\noindent\textbf{Remark:} SmoothBlend is a smoothed version of CutPaste augmentation proposed in \cite{li2021cutpaste}. Both of them can be used to generate structural local deformations, illustrated by the first two columns in Fig. \ref{fig:aug_compare} (b). Unlike the sharp edges of the CutPaste patches, the local and subtle perturbations with smooth edges from SmoothBlend provides a challenging puzzle for models. 
+\begin{figure}[!t]
+ \centering
+\includegraphics[width=\linewidth]{figs/spd_reg_v2.png}
+\caption{The contrastive spot-the-difference learning}
+\label{fig:spd_reg}
+\end{figure}
+\subsection{Training with SPD}
+Based on the above augmentations, we propose the SPD learning illustrated by Fig. \ref{fig:spd_reg} with Fig. \ref{fig:aug_compare} (a) presents more SPD training samples. For an anchor image $x_i$, a negative $\tilde{x}_i^-$ is generated by applying weak global augmentations followed by SmoothBlend. The positive $\tilde{x}_i^+$  is produced by weak global transformations only. Then a shared feature extractor $f(\cdot)$ extracts the representations $h_i, \tilde{h}_i^-, \tilde{h}_i^+$ ($h_i$'s are used for downstream anomaly detection tasks). They are further inputted into a shared multilayer perceptron (MLP) $g(\cdot)$ to get the projections $z_i, \tilde{z}_i^-,\tilde{z}_i^+$. The cosine similarity between $z_i, \tilde{z}_i^-$ is minimized while similarity between $z_i, \tilde{z}_i^+$ is maximized. In summary, the SPD learning minimizes the following SPD loss. 
+\begin{equation}
+    \mathcal{L}_{\mathrm{SPD}}(x_i,\tilde{x}_i^-,\tilde{x}_i^+)=
+\cos(z_i, \tilde{z}_i^-)-\cos(z_i, \tilde{z}_i^+).
+    \label{eqn:l_spd}
+\end{equation}
+
+\noindent\textbf{Standard contrastive SSL with SPD:} Regularizing SSL with SPD is simple. Taking SimCLR as an example baseline, for a given image, SimCLR generates the anchor $x_i$ and positive $\hat{x}_i$ via strong global augmentations with other images $x_j$'s in the same batch as negatives. Then SPD positives $\hat{x}_i^+$ and negatives $\hat{x}_i^-$ are generated by SmoothBlend and weak global augmentations. The shared encoder and MLP head in SimCLR are used to extract the image feature projections for loss computation. Finally the network is trained by the following combined loss.
+\begin{equation}
+    \mathcal{L}(x_i,\hat{x}_i,\tilde{x}_i^-,\tilde{x}_i^+) = \mathcal{L}_{\mathrm{NCE}}(x_i,\hat{x}_i) + \eta \cdot \mathcal{L}_{\mathrm{SPD}}(x_i,\tilde{x}_i^-,\tilde{x}_i^+)
+\end{equation}
+Similary, we can apply SPD to MoCo. For SimSiam, $\mathcal{L}_{\mathrm{NCE}}(x_i,\hat{x}_i)$ loss is replaced by a cosine distance loss for positive pairs without considering negatives \cite{chen2021exploring}.
+
+\noindent\textbf{Standard supervised pre-training with SPD:} With the class labels, standard supervised pre-trained features also capture global semantics to distinguish categories with less attention to local details, similar to SSL. Thus SPD could improve its local sensitivity. Specifically, on top of the last feature layer of the standard supervised model (ResNet-50 \cite{he2016deep}), an auxiliary classifier is added to classify if an augmented SPD image has a local perturbation or not, which is trained by cross-entropy loss. The backbone is shared to extract features.
+\section{Visual Anomaly (VisA) Dataset}
+\subsection{Dataset Description}
+\begin{wraptable}[11]{r}{0.55\textwidth}
+\setlength\abovecaptionskip{-1.8\baselineskip}
+\scriptsize
+\centering
+\caption{Overview of VisA dataset}
+\medskip
+\label{tab:ava_stat}
+\begin{adjustbox}{width=\linewidth}
+\begin{tabular}{c|c|c|c|c}
+\hline
+                                                                               & Object   & \# normal & \# anomaly & \# anomaly \\
+ &             & samples & samples & classes \\ \hline
+\multirow{4}{*}{\begin{tabular}[c]{@{}c@{}}Complex \\ structure\end{tabular}}  & PCB1     & 1,004     & 100        & 4          \\
+ & PCB2        & 1,001   & 100     & 4       \\
+ & PCB3        & 1,006   & 100     & 4       \\
+ & PCB4        & 1,005   & 100     & 7       \\ \hline
+\multirow{4}{*}{\begin{tabular}[c]{@{}c@{}}Multiple \\ instances\end{tabular}} & Capsules & 602       & 100        & 5          \\
+ & Candle      & 1,000   & 100     & 8       \\
+ & Macaroni1   & 1,000   & 100     & 7       \\
+ & Macaroni2   & 1,000   & 100     & 7       \\ \hline
+\multirow{4}{*}{\begin{tabular}[c]{@{}c@{}}Single\\  instance\end{tabular}}   & Cashew      & 500     & 100     & 9       \\
+ & Chewing gum & 503     & 100     & 6       \\ 
+ & Fryum    & 500       & 100        & 8          \\
+ & Pipe fryum  & 500     & 100     & 6       \\ \hline
+\end{tabular}
+\end{adjustbox}
+\end{wraptable}
+The VisA dataset contains 12 subsets corresponding to 12 different objects. Fig. \ref{fig:ava_samples} gives images in VisA. There are 10,821 images with 9,621 normal and 1,200 anomalous samples. Four subsets are different types of printed circuit boards (PCB) with relatively complex structures containing transistors, capacitors, chips, etc. For the case of multiple instances in a view, we collect four subsets: Capsules, Candles, Macaroni1 and Macaroni2. Instances in Capsules and Macaroni2 largely differ in locations and poses. Moreover, we collect four subsets including Cashew, Chewing gum, Fryum and Pipe fryum, where objects are roughly aligned. The anomalous images contain various flaws, including surface defects such as scratches, dents, color spots or crack, and structural defects like misplacement or missing parts. There are 5-20 images per defect type and an image may contain multiple defects. The defects were manually generated to produce realistic anomalies. All images were acquired using a $4,000\times6,000$ high-resolution RGB sensor. Both image and pixel-level annotations are provided. Table \ref{tab:ava_stat} gives the statistics of VisA dataset. 
+\begin{figure}[!t]
+ \centering
+\includegraphics[width=\linewidth]{figs/ava_dataset_uncropped.png}
+\caption{Samples of VisA datasets. First row: normal images; Second row: anomalous images; Third row: anomalies viewed by zooming in.}
+\label{fig:ava_samples}
+\end{figure}
+
+Fig. \ref{fig:ava_vs_mvtec} illustrates the differences between VisA and MVTec-AD. First, VisA considers more complex structures, comparing the VisA - PCB3 with multiple electronic components to a single one of MVTec - transistor as an example. Second, multiple objects can appear in VisA (Capsules) as opposed to a single object in MVTec-AD. Third, large variation in object locations is covered by VisA (Capsules) while almost all objects in MVTec-AD are roughly aligned. Lastly, MVTec-AD has $5,354$ images and VisA is 2$\times$ larger with $10,821$ images.
+\subsection{Evaluation Protocol and Metrics}
+We establish three evaluation protocols for each of 12 objects in VisA dataset. First, following MVTec-AD 1-class protocol, we establish VisA 1-class protocol by assigning $90\%$ normal images to train set while $10\%$ normal images and all anomalous samples are grouped as test set. Second, we establish 2-class high/low-shot evaluation protocols as proxies for realistic 2-class setups in commercial products \cite{LfV,VIAI}. In high-shot setup, for each object, $60\%$/$40\%$ normal and anomalous images are assigned to train/test set respectively. For low-shot benchmark, firstly, $20\%$/$80\%$ normal and anomalous images are grouped to train/test set respectively. Then the k-shot (k=5,10) setup randomly samples k images from both classes in train set for training. The averaged performances over 5 random runs will be reported. Note that for both 1-class and 2-class training setups, test sets have samples from both classes. In addition, we report model performances averaged over all subsets of VisA and MVTec-AD in Sec. \ref{sec:exp}. The model performances for each subset are reported in Sec. \textcolor{red}{D} of supplementary.
+
+\begin{figure}[!t]
+ \centering
+\includegraphics[width=.95\linewidth]{figs/ava_vs_mvtec2.png}
+\caption{Comparing VisA and MVTec-AD. VisA is more challenging due to the complex object structures, multiple instances, large variations of objects and scale.}
+\label{fig:ava_vs_mvtec}
+\end{figure}
+
+For metrics, we report Area Under Precision-Recall curve (AU-PR) in combination with the Area Under Receiver Operator Characteristic curve (AU-ROC). AU-ROC is the most widely used metric for anomaly detection tasks \cite{defard2021padim,Roth_2022_CVPR,yi2020patch}. But as pointed out in \cite{cook2020consult,davis2006relationship,saito2015precision}, in imbalanced dataset where performance of minor class is more important, AU-ROC might provide an inflated view of performance which may cause challenges in measuring models' true capabilities. This is true for anomaly detection where anomalies are often rare. In \cite{bergmann2021mvtec}, the best method is Student-Teacher \cite{bergmann2020uninformed} with $92.2\%$ AU-ROC which seems to be close to perfection. However, it only gets $59.9\%$ AU-PR which is far-from satisfactory. The imbalance issue is more extreme in anomaly segmentation where normal pixels (negatives) can be tens/hundreds times more than anomalous pixels (positives). Even for a bad model, the false positive rate can be small due to numerous negatives, leading to a high AU-ROC. Thus we argue AU-PR is a better performance measurement. Our experiments also demonstrate this point.
+
+\section{Experiments}\label{sec:exp}
+
+\noindent\textbf{Datasets:} For self-supervised as well as supervised pre-training, we use ImageNet 2012 classification dataset \cite{deng2009imagenet}. ImageNet consists $1,000$ classes with $1.28$ million training images. For downstream tasks, in addition to our VisA dataset, we use MVTec-AD dataset \cite{bergmann2019mvtec} as a 1-class training benchmark. MVTec-AD contains $15$ sub-datasets with a total of $5,354$ images.
+
+\noindent\textbf{Anomaly detection and segmentation algorithms:} To evaluate the transfer learning performances of different pre-training, we adopt the following algorithms for anomaly detection and segmentation. 
+
+\noindent\emph{1-class anomaly classification/segmentation:} We leverage PaDiM \cite{defard2021padim} which is one of the top performing 1-class anomaly detection/localization methods. 
+
+\noindent\emph{2-class anomaly classification/segmentation:} We train a standard binary ResNet \cite{he2016deep} as the supervised model for classification. A U-Net \cite{ronneberger2015u} is used as segmentation model. The focal loss \cite{lin2017focal} is used to overcome the data imbalance. 
+
+\noindent\textbf{Implementation details:} Unless otherwise noted, we choose ResNet-50 as the major backbone. We adopt exactly the same hyperparameters in SimSiam, MoCo, SimCLR and supervised learning for pre-training. More implementation details are in the supplementary.
+
+\subsection{SPD in high-shot 1-class/2-class Regimes}
+\begin{figure}[!t]
+\centering
+\includegraphics[width=0.45\textwidth]{figs/scatter_plot/ava_1class_aupr.png}
+\includegraphics[width=0.45\textwidth]{figs/scatter_plot/mvtec_1class_aupr.png}\\
+ \caption{Scatter plots for various ImageNet pre-training models in 1-class setup.}
+ \label{fig:scatter}
+\end{figure}
+
+\begin{table*}[!t]
+	\centering
+    \caption{1-class performance evaluation of various ImageNet pre-training options on VisA and MVTec-AD with PaDiM. Bold numbers refers to the highest score. In the brackets are the gaps to the ImageNet supervised/self-supervised pre-training counterpart. In green are the gaps of at least \textcolor{forestgreen}{+0.5} point.} 
+    \label{tab:1cls}
+	\setlength{\tabcolsep}{7pt}
+	\resizebox{\linewidth}{!}{
+	\centering
+    \begin{tabular}{c|c|llll||llll}
+    \hline
+    \multicolumn{1}{l|}{\multirow{2}{*}{}} &
+      \multirow{2}{*}{\begin{tabular}[c]{@{}c@{}}ImageNet\\ labels\end{tabular}} &
+      \multicolumn{4}{c||}{VisA (1-class)} &
+      \multicolumn{4}{c}{MVTec-AD (1-class)} \\ \cline{3-10} 
+    \multicolumn{1}{l|}{} &
+       &
+      \multicolumn{2}{c|}{Classification} &
+      \multicolumn{2}{c||}{Segmentation} &
+      \multicolumn{2}{c|}{Classification} &
+      \multicolumn{2}{c}{Segmentation} \\ \hline
+                         &  & AU-PR & \multicolumn{1}{l|}{AU-ROC} & AU-PR & AU-ROC & AU-PR & \multicolumn{1}{l|}{AU-ROC} & AU-PR & AU-ROC \\ \hline
+    Sup. pre-train       & \cmark & 88.2 & \multicolumn{1}{l|}{87.8}   & 11.4 & 93.1   & 97.4  & \multicolumn{1}{l|}{94.5}  & 35.2 & 94.4  \\ \hline\hline
+    SimSiam              & \xmark & 80.2 & \multicolumn{1}{l|}{78.1}   & 9.1  & 93.1  & 92.6 & \multicolumn{1}{l|}{83.9}  & 29.7 & 92.1  \\
+    +SPD                 & \xmark & 82.8 \textcolor{forestgreen}{(+2.6)} & \multicolumn{1}{c|}{81.2 \textcolor{forestgreen}{(+3.1)}}  & 9.4 (+0.3) & 92.7 (-0.4) & 94.1 \textcolor{forestgreen}{(+1.5)} & \multicolumn{1}{l|}{88.0 \textcolor{forestgreen}{(+4.1)}}  & 32.0 \textcolor{forestgreen}{(+2.3)} & 92.2 (+0.1) \\ \hline
+    MoCo                 & \xmark & 83.6 & \multicolumn{1}{l|}{83.4}  & 10.5 & 93.4  & 95.0 & \multicolumn{1}{l|}{90.4}  & 33.2 & 93.4  \\
+    +SPD                 & \xmark & 84.1 \textcolor{forestgreen}{(+0.5)} & \multicolumn{1}{l|}{83.0 (-0.4)}  & 11.0 \textcolor{forestgreen}{(+0.5)} & 93.5 (+0.1) & 95.6 \textcolor{forestgreen}{(+0.6)} & \multicolumn{1}{l|}{90.5 (+0.1)}  & 33.5 (+0.3) & 93.5 (+0.1) \\ \hline
+    SimCLR               & \xmark & 82.7 & \multicolumn{1}{l|}{81.6}  & 8.8  & 89.7   & 94.7 & \multicolumn{1}{l|}{90.7}  & 29.8 & 92.1  \\
+    +SPD                 & \xmark & 83.9 \textcolor{forestgreen}{(+0.8)} & \multicolumn{1}{l|}{82.6 \textcolor{forestgreen}{(+1.0)}}  & 8.7 (-0.1) & 89.9 (+0.2) & 96.8 \textcolor{forestgreen}{(+2.1)} & \multicolumn{1}{l|}{93.8 \textcolor{forestgreen}{(+3.1)}}  & 31.7 \textcolor{forestgreen}{(+1.9)} & 92.9 \textcolor{forestgreen}{(+0.8)} \\ \hline
+    Sup. pre-train+SPD & \cmark & \textbf{88.6} (+0.4) & \multicolumn{1}{l|}{\textbf{87.8} (+0.0)}  & \textbf{12.0} \textcolor{forestgreen}{(+0.6)} & \textbf{93.8} \textcolor{forestgreen}{(+0.7)}  & \textbf{97.5} (+0.1) & \multicolumn{1}{l|}{\textbf{94.6} (+0.1)}  & \textbf{36.3} \textcolor{forestgreen}{(+1.1)} & \textbf{94.6} (+0.2) \\ \hline 
+    \end{tabular}
+	}
+\end{table*}
+
+For the 1-class setting, the results of PaDiM with various pre-training options w/wo SPD are shown in Table \ref{tab:1cls}. The results are also visualized as scatter plots in Fig. \ref{fig:scatter}. We have several key observations. First, SPD improves performances of both anomaly detection and segmentation across almost all pre-training baselines on both VisA and MVTec-AD. While we report both AU-PR and AU-ROC, the former metric is more relevant to the application and we see that self-supervised methods are improved up to AU-PR of $2.6\%$. Note both metrics are averaged over the 12 objects in VisA. For different objects, the gains differ and are given in Sec. \textcolor{red}{D} of the supplementary. Second, the gap between self-supervised pre-training with SimSiam, SimCLR, MoCo, and supervised pre-training is large. SPD reduces this gap, but no combination of SSL and SPD beats supervised pre-training. This is in contrast to the low-shot regime in Section \ref{sect:few-shot-results}, where self-supervision has advantages in some cases. Third, PaDiM is one of the SOTA methods with $>97\%$ AU-ROC in MVTec. But it just achieves $<90\%$ AU-PR and AU-ROC in VisA - classification. For VisA - segmentation, PaDiM only achieves about $10\%$ AU-PR. This shows the difficulty of the VisA 1-class benchmark. Moreover, the gap between low AU-PR and high AU-ROC for both VisA/MVTec segmentation justifies the inflated performance view of AU-ROC, in favor of AU-PR as a more suitable metric in imbalanced datasets. In addition, even in terms of AU-ROC, the SPD consistently improves almost all baselines. 
+
+\begin{table*}[!t]
+	\centering
+    \caption{2-class fine-tuning with different pre-training on VisA high-shot setup.}
+    \label{tab:ava_2cls_high}
+	\setlength{\tabcolsep}{7pt}
+	\resizebox{0.75\linewidth}{!}{
+	\centering
+    \begin{tabular}{c|c|llll}
+    \hline
+    \multirow{2}{*}{} & \multirow{2}{*}{\begin{tabular}[c]{@{}c@{}}ImageNet\\ labels\end{tabular}} & \multicolumn{4}{c}{VisA (2-class, high-shot)} \\ \cline{3-6} 
+                       &  & \multicolumn{2}{c|}{Classification} & \multicolumn{2}{c}{Segmentation} \\ \hline
+                       &  & AU-PR & \multicolumn{1}{c|}{AU-ROC} & AU-PR          & AU-ROC          \\ \hline
+    Sup. pre-train     & \cmark & 97.5  & \multicolumn{1}{l|}{99.5}  & 65.1           & 97.3            \\ \hline \hline
+    SimSiam            & \xmark & 88.7  & \multicolumn{1}{l|}{97.9}   & 53.8           & 97.3            \\
+    +SPD               & \xmark & 93.2 \textcolor{forestgreen}{(+4.5)} & \multicolumn{1}{l|}{98.7 \textcolor{forestgreen}{(+0.8)}}  & 59.7 \textcolor{forestgreen}{(+5.9)}          & 98.1 \textcolor{forestgreen}{(+0.8)}           \\ \hline
+    MoCo               & \xmark & 93.9  & \multicolumn{1}{l|}{98.8}   & 62.4           & 98.0            \\
+    +SPD               & \xmark & 94.2 (+0.3) & \multicolumn{1}{l|}{98.8 (+0.0)}   & 64.4 \textcolor{forestgreen}{(+2.0)}          & 97.9 (-0.1)           \\ \hline
+    SimCLR             & \xmark & 93.4  & \multicolumn{1}{l|}{98.5}   & 67.7           & 95.3            \\
+    +SPD               & \xmark & 92.7 (-0.7) & \multicolumn{1}{l|}{98.6 (+0.1)}   & 68.2 \textcolor{forestgreen}{(+0.5)}          & 95.7 (+0.4)           \\ \hline
+    Sup. pre-train+SPD & \cmark & \textbf{98.3} \textcolor{forestgreen}{(+0.8)} & \multicolumn{1}{l|}{\textbf{99.7} (+0.2)}   & \textbf{71.9} \textcolor{forestgreen}{(+6.8)}          & \textbf{98.5} \textcolor{forestgreen}{(+1.2)}           \\ \hline
+    \end{tabular}%
+    }
+\end{table*}
+
+In Table \ref{tab:ava_2cls_high}, we show the results for the 2-class high-shot regime on the VisA and observe similar trends as above. However, the AU-PR gains from SPD on top of SimSiam and supervised pre-training are higher at 5.9\% and 6.8\% respectively for segmentation. Another key point to note here is that the AU-ROC metrics are saturating even though AU-PR metrics show room for improvement, particularly for segmentation. This another data point for preferring AU-PR metric. 
+Comparing Tables \ref{tab:1cls} and \ref{tab:ava_2cls_high}, there is a significant gap between 1-class and 2-class performance on VisA. As anomalies are harder to obtain compared to normal images, bridging the gap is an open challenge to the research community.
+
+\subsection{SPD in Low-shot 2-class Regime}\label{sect:few-shot-results}
+
+\begin{table*}[!t]
+	\centering
+	\caption{Low-shot anomaly detection and segmentation on VisA.}
+    \label{tab:low_shot}
+	\setlength{\tabcolsep}{7pt}
+	\resizebox{\linewidth}{!}{
+	\centering
+    \begin{tabular}{c|c|llll||llll}
+    \hline
+    \multirow{2}{*}{}  & \multirow{2}{*}{\begin{tabular}[c]{@{}c@{}}ImageNet\\ labels\end{tabular}} & \multicolumn{4}{c||}{Classification (2-class, low-shot)}                                & \multicolumn{4}{c}{Segmentation (2-class, low-shot)}                                  \\ \cline{3-10} 
+                       &                                                                            & \multicolumn{2}{c|}{5-shot}                    & \multicolumn{2}{c||}{10-shot} & \multicolumn{2}{c|}{5-shot}                    & \multicolumn{2}{c}{10-shot} \\ \hline
+                       &                                                                            & AU-PR       & \multicolumn{1}{c|}{AU-ROC}      & AU-PR         & AU-ROC       & AU-PR       & \multicolumn{1}{c|}{AU-ROC}      & AU-PR        & AU-ROC       \\ \hline
+    Sup. pre-train     &   \cmark                                                                         & 59.2        & \multicolumn{1}{l|}{85.5}        & 70.4          & 91.7         & 17.8        & \multicolumn{1}{l|}{74.6}        & 28.3         & 81.8         \\ \hline\hline
+    SimSiam            &   \xmark                                                                          & 51.9        & \multicolumn{1}{l|}{82.3}        & 65.0          & 89.4         & 17.3        & \multicolumn{1}{l|}{75.2}        & 28.5         & 81.6         \\
+    +SPD               &   \xmark                                                                        & 56.1 \textcolor{forestgreen}{(+4.2)} & \multicolumn{1}{c|}{84.0 \textcolor{forestgreen}{(+1.7)}} & 67.6 \textcolor{forestgreen}{(+2.6)}   & 90.8 \textcolor{forestgreen}{(+1.4)}  & 18.2 \textcolor{forestgreen}{(+0.9)} & \multicolumn{1}{l|}{\textbf{76.0} \textcolor{forestgreen}{(+0.8)}} & 29.7 \textcolor{forestgreen}{(+1.2)}  & 83.2 \textcolor{forestgreen}{(+1.6)}  \\ \hline
+    MoCo               &   \xmark                                                                         & 56.1        & \multicolumn{1}{l|}{83.8}        & 68.7          & 90.6         & 21.5        & \multicolumn{1}{l|}{80.5}        & 32.3         & \textbf{85.7}         \\
+    +SPD               &   \xmark                                                                         & 56.4 (+0.3) & \multicolumn{1}{l|}{83.9 (+0.1)} & 68.0 (-0.7)   & 90.1 (-0.5)  & \textbf{22.1} \textcolor{forestgreen}{(+0.6)} & \multicolumn{1}{l|}{78.5 (-2.0)} & \textbf{32.8} \textcolor{forestgreen}{(+0.5)}  & 84.9 (-0.8)  \\ \hline 
+    SimCLR             &  \xmark                                                                          & 48.4        & \multicolumn{1}{l|}{79.6}        & 58.2          & 86.0         & 18.4        & \multicolumn{1}{l|}{71.2}        & 23.0         & 75.1         \\
+    +SPD               &  \xmark                                                                         & 47.4 (-1.0) & \multicolumn{1}{l|}{79.9 (+0.3)} & 59.0 \textcolor{forestgreen}{(+0.8)}   & 86.1 (+0.1)  & 18.9 \textcolor{forestgreen}{(+0.5)} & \multicolumn{1}{c|}{74.5 \textcolor{forestgreen}{(+3.3)}} & 25.1 \textcolor{forestgreen}{(+2.1)}  & 78.2 \textcolor{forestgreen}{(+3.1)}  \\ \hline
+    Sup. pre-train+SPD &  \cmark                                                                          &    \textbf{59.8} \textcolor{forestgreen}{(+0.6)}         & \multicolumn{1}{l|}{\textbf{85.9} (+0.4)}            &         \textbf{71.2} \textcolor{forestgreen}{(+0.8)}      &   \textbf{92.1} (+0.4)          & 18.7 \textcolor{forestgreen}{(+0.9)} & \multicolumn{1}{c|}{75.9 \textcolor{forestgreen}{(+1.3)}} & 30.6 \textcolor{forestgreen}{(+2.3)}  & 81.8 (+0.0)  \\ \hline
+    \end{tabular}%
+    }
+\end{table*}
+
+\noindent\textbf{Low-shot anomaly segmentation:} With different ImageNet pre-training as initialization, a 2-class U-Net with ResNet-50 encoder is trained for each 5/10-shot segmentation setup. From Table \ref{tab:low_shot}, SPD again improves all baselines in both 5-shot and 10-shot evaluation, with AU-PR gain up to $2.3\%$. One departure from the high-shot regime is that for few-shot anomaly segmentation, MoCo+SPD is the best method, even outperforming supervised pre-training.   
+
+\noindent\textbf{Low-shot anomaly detection:} Initialized with different ImageNet pre-training, a 2-class ResNet-50 is trained in 5/10-shot setups for anomaly detection. From Table \ref{tab:low_shot}, overall the supervised pre-training with SPD outperforms both supervised pre-training only and other SSL's. Moreover, SPD significantly improves SimSiam with $4.2\%$ AU-PR in 5-shot and $2.6\%$ AU-PR in 10-shot, although it's still inferior to supervised pre-training.
+\subsection{Ablation Study}
+
+\begin{table*}[!t]
+	\centering
+	\caption{Ablation study}
+	\label{tab:ablation}
+	\setlength{\tabcolsep}{7pt}
+	\resizebox{\linewidth}{!}{
+	\centering
+	\begin{tabular}{c|cccc|cccc}
+    \hline
+    \multirow{2}{*}{} & \multicolumn{4}{c|}{VisA (1-class)}                             & \multicolumn{4}{c}{MVTec-AD (1-class)}                         \\ \cline{2-9} 
+     & \multicolumn{2}{c|}{Classification} & \multicolumn{2}{c|}{Segmentation} & \multicolumn{2}{c|}{Classification} & \multicolumn{2}{c}{Segmentation} \\ \hline
+                      & AU-PR & \multicolumn{1}{c|}{AU-ROC} & AU-PR & AU-ROC & AU-PR & \multicolumn{1}{c|}{AU-ROC} & AU-PR & AU-ROC \\ \hline
+    SimSiam w/ Res50     & 80.2 & \multicolumn{1}{c|}{78.1}   & 9.1  & 93.1  & 92.6 & \multicolumn{1}{c|}{83.9}  & 29.7 & 92.1  \\ \hline\hline
+    +SPD $(\eta=0.1)$         & 82.8 & \multicolumn{1}{c|}{81.2}  & 9.4  & 92.7  & 94.1 & \multicolumn{1}{c|}{88.0}  & 32.0 & 92.2  \\ 
+    +SPD $(\eta=0.5)$         & 80.5 & \multicolumn{1}{c|}{79.3}  & 8.7  & 93.0  & 93.3 & \multicolumn{1}{c|}{84.9}  & 30.1 & 91.9  \\
+    +SPD $(\eta=1.0)$           & 81.5 & \multicolumn{1}{c|}{79.8}  & 9.4  & 92.8  & 93.4 & \multicolumn{1}{c|}{85.8}  & 30.0 & 92.0  \\ \hline
+    +SPD w/ CutPaste    & 78.8 & \multicolumn{1}{c|}{77.0}  & 9.7  & 93.1  & 93.5 & \multicolumn{1}{c|}{85.2}  & 28.2 & 91.3  \\
+    +SPD w/ Xent        & 71.4 & \multicolumn{1}{c|}{66.6}  & 2.7  & 84.8  & 86.3 & \multicolumn{1}{c|}{71.0}  & 15.2  & 82.6  \\ \hline
+    SimSiam w/ WideRes50 & 80.3 & \multicolumn{1}{c|}{77.7}  & 9.9  & 93.6  & 93.0 & \multicolumn{1}{c|}{84.7}  & 31.3 & 92.2  \\
+    +SPD              & 81.9 & \multicolumn{1}{c|}{80.4}  & 10.5  & 93.7  & 93.4 & \multicolumn{1}{c|}{85.4}  & 32.5 & 92.8  \\ \hline
+    \end{tabular}
+    }
+
+\end{table*}
+\begin{table*}[!t]
+	\centering
+    \caption{1-class performance evaluation on VisA and MVTec-AD with PatchCore.}
+    \label{tab:1cls_patchcore}
+	\setlength{\tabcolsep}{7pt}
+	\resizebox{\linewidth}{!}{
+	\centering
+    \begin{tabular}{c|cccc|cccc}
+    \hline
+    \multirow{2}{*}{\begin{tabular}[c]{@{}c@{}}Backbone:\\ Wide ResNet50\end{tabular}} & \multicolumn{4}{c|}{VisA (1-class)}                                     & \multicolumn{4}{c}{MVTec-AD (1-class)}                                 \\ \cline{2-9} 
+                                                                                   & \multicolumn{2}{c|}{Classification} & \multicolumn{2}{c|}{Segmentation} & \multicolumn{2}{c|}{Classification} & \multicolumn{2}{c}{Segmentation} \\ \hline
+                          & AU-PR & \multicolumn{1}{c|}{AU-ROC} & AU-PR           & AU-ROC          & AU-PR & \multicolumn{1}{c|}{AU-ROC} & AU-PR          & AU-ROC          \\ \hline
+    Sup. pre-train        & 93.3  & \multicolumn{1}{c|}{92.4}   & 38.4            & 98.4            & 99.2  & \multicolumn{1}{c|}{99.8}   & 48.8           & 97.6            \\
+    Sup. pre-train+SPD    & 93.8 \textcolor{forestgreen}{(+0.5)} & \multicolumn{1}{c|}{92.5 (+0.1)}   & 39.3 \textcolor{forestgreen}{(+0.9)}           & 98.1 (-0.3)           & 99.0 (-0.2) & \multicolumn{1}{c|}{99.7 (-0.1)}   & 49.3 \textcolor{forestgreen}{(+0.5)}          & 97.5 (-0.1)           \\ \hline
+    \end{tabular}%
+	}
+\end{table*}
+
+We conduct extensive ablation studies based on ImageNet SimSiam pre-training and PaDiM as the anomaly detection and segmentation algorithms trained in the 1-class setups of VisA and MVTec-AD. Results are shown in Table \ref{tab:ablation}.
+
+\noindent\textbf{Sensitivity analysis on SPD loss weight $\eta$:} From Table \ref{tab:ablation}, we see consistent improvement for $\eta=0.1,0.5,1.0$ in at least one task for both datasets. SPD loss with $\eta=0.1$ gives us the best performances in both datasets, which is chosen as the default SPD loss weight for all pre-training with SPD. So the SimSiam+SPD ($\eta=0.1$) is regarded as SimSiam+SPD for better clarity.
+
+\noindent\textbf{Comparison between SPD and CutPaste \cite{li2021cutpaste}:} CutPaste and cross-entropy loss used in \cite{li2021cutpaste} for anomaly detection training can also be used in ImageNet pre-training. An ablation study is done to demonstrate the superiority of the proposed SmoothBlend and SPD loss. With $\mathcal{L}_{\mathrm{SPD}}$, SmoothBlend is arguably better than CutPaste by $4.0\%$ and $3.8\%$ AU-PR improvement in VisA - classification and MVTec - segmentation (+SPD v.s. +SPD w/ CutPaste). With the SmoothBlend, the SPD loss significantly outperforms cross-entropy loss (+SPD v.s. +SPD w/ Xent). Such results demonstrate the validity of proposed methods.
+
+\noindent\textbf{SPD with different backbones:} ResNet-50 is adopted as the backbone for all major experiments in this paper. We demonstrate the SPD can generalize to different network architectures by experiments of SimSiam w/wo SPD on wide ResNet-50 \cite{zagoruyko2016wide}. As in Table \ref{tab:ablation}, SPD still improves the baseline.
+
+\noindent\textbf{Results with PatchCore: }
+In addition to PaDiM, we also evaluate supervised pre-trained models based on another state-of-the-art 1-class method PatchCore \cite{Roth_2022_CVPR}. Wide ResNet-50 is chosen as the backbone network. As in Table \ref{tab:1cls_patchcore}, on VisA, SPD improves supervised pre-trained model by $0.5\%$ and $0.9\%$ AU-PR for both classification and segmentation. On MVTec-AD, SPD improves by $0.5\%$ AU-PR for segmentation with slightly performance decreased in classification.
+
+\noindent\textbf{Extending SPD to other tasks:} Besides improvement on defect detection and segmentation, SPD also improves ImageNet supervised classification accuracy:  $69.8\%\rightarrow70.2\%$ for ResNet-18 and $76.1\%\rightarrow76.4\%$ for ResNet-50.
+Pre-trained models with better ImageNet accuracy are expected to benefit downstream tasks more. Thus we speculate that SPD will work well for object recognition and detection, especially on fine-grained classification and small object detection as SPD promotes local sensitivity. In addition, we will leverage the proposed SPD training as a 1-class anomaly detection model to be trained by downstream data.
+
+\noindent\textbf{Qualitative results:} To qualitatively demonstrate the effectiveness of SPD regularization, we represent attention maps and anomaly segmentation in Sec. \textcolor{red}{E} of the supplementary due to page limits.
+
+\section{Conclusions}
+In this work, we present a spot-the-difference (SPD) training to regularize pre-trained models' local sensitivity to anomalous patterns. We also present a novel Visual Anomaly (VisA) dataset which is the largest industrial anomaly detection dataset. Extensive experiments demonstrate the benefits of SPD for various contrastive self-supervised and supervised pre-training for anomaly detection and segmentation. Compared to standard supervised pre-training, SimSiam with SPD obtains superior or competitive performances in low-shot regime while supervised learning with SPD presents better performances in various setups. 
+
+\section*{Acknowledgments}
+The authors would like to thank Fanyi Xiao, Erhan Bas, Aditya Deshpande and Joachim Stahl for idea brainstorming
+and providing insightful comments on the manuscript.
+
+\clearpage
+
+\section*{Appendix}
+In this appendix, we present the additional details and
+results that are not covered by the main paper.
+
+\end{document}

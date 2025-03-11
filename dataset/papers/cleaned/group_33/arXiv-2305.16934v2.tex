@@ -1,0 +1,337 @@
+\title{On Evaluating Adversarial Robustness of\\Large Vision-Language Models}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+Large vision-language models (VLMs) such as GPT-4 have achieved unprecedented performance in response generation, especially with visual inputs, enabling more creative and adaptable interaction than large language models such as ChatGPT. Nonetheless, multimodal generation exacerbates safety concerns, since adversaries may successfully evade the entire system by subtly manipulating the most vulnerable modality (e.g., vision). To this end, we propose evaluating the robustness of open-source large VLMs in the most realistic and high-risk setting, where adversaries have only \emph{black-box} system access and seek to deceive the model into returning the \emph{targeted} responses. In particular, we first craft targeted adversarial examples against pretrained models such as CLIP and BLIP, and then transfer these adversarial examples to other VLMs such as MiniGPT-4, LLaVA, UniDiffuser, BLIP-2, and Img2Prompt. In addition, we observe that black-box queries on these VLMs can further improve the effectiveness of targeted evasion, resulting in a surprisingly high success rate for generating targeted responses. Our findings provide a quantitative understanding regarding the adversarial vulnerability of large VLMs and call for a more thorough examination of their potential security flaws before deployment in practice.
+Our project page: {\color{RubineRed} \href{https://yunqing-me.github.io/AttackVLM/}{yunqing-me.github.io/AttackVLM/}}.
+\end{abstract}
+
+\section{Introduction}
+Large vision-language models (VLMs) have enjoyed tremendous success and demonstrated promising capabilities in text-to-image generation~\citep{nichol2021glide,ramesh2022hierarchical,rombach2022high}, image-grounded text generation (e.g., image captioning or visual question-answering)~\citep{alayrac2022flamingo,chen2022visualgpt,li2023blip,tsimpoukelli2021multimodal}, and joint generation~\citep{bao2022one,hu2022unified,xu2022versatile} due to an increase in the amount of data, computational resources, and number of model parameters. Notably, after being finetuned with instructions and aligned with human feedback, GPT-4~\citep{gpt4} is capable of conversing with human users and, in particular, supports visual inputs.
+
+Along the trend of multimodal learning, an increasing number of large VLMs are made publicly available, enabling the exponential expansion of downstream applications. However, this poses significant safety challenges. It is widely acknowledged, for instance, that text-to-image models could be exploited to generate fake content~\citep{ricker2022towards,sha2022fake} or edit images maliciously~\citep{salman2023raising}. A silver lining is that adversaries must manipulate \emph{textual inputs} to achieve their evasion goals, necessitating extensive search and engineering to determine the adversarial prompts. Moreover, text-to-image models that are accessible to the public typically include a safety checker to filter sensitive concepts and an invisible watermarking module to help identify fake content~\citep{rando2022red,rombach2022high,zhao2023recipe}.
+
+Image-grounded text generation such as GPT-4 is more interactive with human users and can produce commands to execute codes~\citep{copilot} or control robots~\citep{vemprala2023chatgpt}, as opposed to text-to-image generation which only returns an image. Accordingly, potential adversaries may be able to evade an image-grounded text generative model by manipulating its \emph{visual inputs}, as it is well-known that the vision modality is extremely vulnerable to human-imperceptible adversarial perturbations~\citep{biggio2013evasion,Dong2017,Goodfellow2014,Szegedy2013}. This raises even more serious safety concerns, as image-grounded text generation may be utilized in considerably complex and safety-critical environments~\citep{park2023generative}.\footnote{Note that GPT-4 delays the release of its visual inputs due to safety concerns~\citep{delaygpt4}.} Adversaries may mislead large VLMs deployed as plugins, for example, to bypass their safety/privacy checkers, inject malicious code, or access APIs and manipulate robots/devices without authorization.
+
+In this work, we empirically evaluate the adversarial robustness of state-of-the-art \emph{large} VLMs, particularly against those that accept visual inputs (e.g., image-grounded text generation or joint generation). To ensure reproducibility, our evaluations are all based on open-source large models. We examine the most realistic and high-risk scenario, in which adversaries have only \emph{black-box} system access and seek to deceive the model into returning the \emph{targeted} responses. Specifically, we first use pretrained CLIP~\citep{radford2021learning,sun2023eva} and BLIP~\citep{li2022blip} as surrogate models to craft targeted adversarial examples, either by matching textual embeddings or image embeddings, and then we transfer the adversarial examples to other large VLMs, including MiniGPT-4~\citep{zhu2023minigpt}, LLaVA~\citep{liu2023llava}, UniDiffuser~\citep{bao2022one}, BLIP-2~\citep{li2023blip}, and Img2Prompt~\citep{guoimages}. Surprisingly, these transfer-based attacks can already induce targeted responses with a high success rate. In addition, we discover that query-based attacks employing transfer-based priors can further improve the efficacy of targeted evasion against these VLMs, as shown in Figure~\ref{fig:demo-blip} (BLIP-2), Figure~\ref{fig:demo-unidiffuser} (UniDiffuser), and Figure~\ref{fig:demo-minigpt4} (MiniGPT-4).
+
+Our findings provide a quantitative understanding regarding the adversarial vulnerability of large VLMs and advocate for a more comprehensive examination of their potential security defects prior to deployment, as discussed in Sec.~\ref{sec:discussion}. Regarding more general multimodal systems, our findings indicate that the robustness of systems is highly dependent on their most vulnerable input modality.
+
+\begin{figure*}[t]
+\vspace{-0.cm}
+    \centering
+    \includegraphics[width=\textwidth]{figure_main/demo_blip.pdf}
+    \caption{\textbf{Image captioning task implemented by BLIP-2.} Given an original text description (e.g., \texttt{an armchair in the shape of an avocado}), DALL-E~\citep{ramesh2021zero} is used to generate corresponding clean images. BLIP-2 accurately returns captioning text (e.g., \texttt{a stuffed chair in the shape of an avocado}) that analogous to the original text description on the clean image. After the clean image is maliciously perturbed by targeted adversarial noises, the adversarial image can mislead BLIP-2 to return a caption (e.g., \texttt{a pencil drawing of sports car is shown}) that semantically resembles the predefined targeted response (e.g., \texttt{a hand drawn sketch of a Porsche 911}). More examples such as attacking real-world image-text pairs are provided in our Appendix.\looseness=-1
+    }
+    \label{fig:demo-blip}
+    \vspace{-0.1cm}
+\end{figure*}
+
+\begin{figure*}[t]
+\vspace{-0.cm}
+    \centering
+    \includegraphics[width=\textwidth]{figure_main/demo_unidiffuser.pdf}
+    \caption{
+    \textbf{Joint generation task implemented by UniDiffuser.} There are generative VLMs such as UniDiffuser that model the joint distribution of image-text pairs and are capable of both image-to-text and text-to-image generation. Consequently, given an original text description (e.g., \texttt{A Van Gogh style painting of an American football player}), the text-to-image direction of UniDiffuser is used to generate the corresponding clean image, and its image-to-text direction can recover a text response (e.g., \texttt{A painting of Packers quarterback football player on a blue background}) similar to the original text description. The recovering between image and text modalities can be performed consistently on clean images. When a targeted adversarial perturbation is added to a clean image, however, the image-to-text direction of UniDiffuser will return a text (e.g., \texttt{A man in an astronaut suit riding a horse on the moon}) that semantically resembles the predefined targeted description (e.g., \texttt{A photo of an astronaut riding a horse on the moon}), thereby affecting the subsequent chains of recovering processes.   
+    }
+    \label{fig:demo-unidiffuser}
+    \vspace{-0.cm}
+\end{figure*}
+
+\vspace{-0.15cm}
+\section{Related work}
+\vspace{-0.15cm}
+\textbf{Language models (LMs) and their robustness.} The seminal works of BERT~\citep{devlin2018bert}, GPT-2~\citep{radford2019language}, and T5~\citep{raffel2020exploring} laid the foundations of large LMs, upon which numerous other large LMs have been developed and demonstrated significant advancements across various language benchmarks~\citep{brown2020language,chowdhery2022palm,hoffmann2022training,scao2022bloom,smith2022using,zhang2022opt}. More recently, ChatGPT~\citep{chatgpt,ouyang2022training} and several open-source models~\citep{chiang2023vicuna,taori2023stanford,xu2023baize} tuned based on LLaMA~\citep{touvron2023llama} enable conversational interaction with human users and can respond to diverse and complex questions. Nevertheless, \citet{alzantot2018generating} first construct adversarial examples on sentiment analysis and textual entailment tasks, while \citet{jin2020bert} report that BERT can be evaded through natural language attacks. Later, various flexible (e.g., beyond word replacement) and semantically preserving methods are proposed to produce natural language adversarial examples~\citep{branch2022evaluating,maheshwary2021generating,meng2020geometry,moradi2021evaluating,morris2020reevaluating,ren2020generating,shi2022promptattack,yuan2020transferability,zhang2019fluent,zhuo2023robustness}, as well as benchmarks and datasets to more thoroughly evaluate the adversarial robustness of LMs~\citep{nie2020adversarial,wang2021adversarial,wang2023robustness,wang2021textflint}. There are also red-teaming initiatives that use human-in-the-loop or automated frameworks to identify problematic language model outputs~\citep{ganguli2022red,perez2022red,xu2021bot}.
+
+\textbf{Vision-language models (VLMs) and their robustness.} The knowledge contained within these powerful LMs is used to facilitate vision-language tasks~\citep{driess2023palm,huang2023language,tiong2022plug,wu2023visual,yang2023mm}. Inspired by the adversarial vulnerability observed in vision tasks, early efforts are devoted to investigating adversarial attacks against visual question answering~\citep{bartolo2021improving,cao2022tasa,kaushik2021efficacy,kovatchev2022longhorns,li2021adversarial,sheng2021human,wallace2019trick,xu2018fooling,zhang2022towards} and image caption~\citep{aafaq2021controlled,chen2017attacking,xu2019exact}, with the majority of these efforts focusing on conventional CNN-RNN-based models, assuming white-box access or untargeted adversarial goals, and requiring human interaction. Our research, on the other hand, examines the adversarial robustness of advanced large VLMs, assuming black-box access and targeted adversarial goals, and providing quantitative evaluations free of human labor.
+
+\begin{figure*}[t]
+\vspace{-0.cm}
+    \centering
+    \includegraphics[width=\textwidth]{figure_main/demo_minigpt4.pdf}
+    \vspace{3mm}
+    \includegraphics[width=\textwidth]{figure_main/demo_minigpt4_2.pdf}
+    \vspace{-0.7cm}
+    \caption{
+    \textbf{Visual question-answering (VQA) task implemented by MiniGPT-4.} MiniGPT-4 has capabilities for vision-language understanding and performs comparably to GPT-4 on tasks such as multi-round VQA by leveraging the knowledge of large LMs. We select images with refined details generated by Midjourney~\citep{Midjourney} and feed questions (e.g., \texttt{Can you tell me what is the interesting point of this image?}) into MiniGPT-4. 
+    As expected, MiniGPT-4 can return descriptions that are intuitively reasonable, and when we ask additional questions (e.g., \texttt{But is this a common scene in the normal life?}), MiniGPT-4 demonstrates the capacity for accurate multi-round conversation. Nevertheless, after being fed targeted adversarial images, MiniGPT-4 will return answers related to the targeted description (e.g., \texttt{A robot is playing in the field}). This adversarial effect can even affect multi-round conversations when we ask additional questions. More examples of attacking MiniGPT-4 or LLaVA on VQA are provided in our Appendix.
+    }
+    \label{fig:demo-minigpt4}
+    \vspace{-0.05cm}
+\end{figure*}
+
+\section{Methodology}
+In this section, we will first introduce the fundamental preliminary, and then describe the transfer-based and query-based attacking strategies against image-grounded text generation, respectively.
+
+\subsection{Preliminary}
+We denote $p_{\theta}(\boldsymbol{x};\boldsymbol{c}_{\text{in}})\mapsto \boldsymbol{c}_{\text{out}}$ as an image-grounded text generative model parameterized by $\theta$, where $\boldsymbol{x}$ is the input image, $\boldsymbol{c}_{\text{in}}$ is the input text, and $\boldsymbol{c}_{\text{out}}$ is the output text. In image captioning tasks, for instance, $\boldsymbol{c}_{\text{in}}$ is a placeholder $\emptyset$ and $\boldsymbol{c}_{\text{out}}$ is the caption; in visual question answering tasks, $\boldsymbol{c}_{\text{in}}$ is the question and $\boldsymbol{c}_{\text{out}}$ is the answer. Note that here we slightly abuse the notations since the mapping between $p_{\theta}(\boldsymbol{x};\boldsymbol{c}_{\text{in}})$ and $\boldsymbol{c}_{\text{out}}$ could be probabilistic or non-deterministic~\citep{bao2022one,xu2022versatile}.
+
+\textbf{Threat models.} We overview threat models that specify adversarial conditions~\citep{carlini2019evaluating} and adapt them to generative paradigms: (\romannumeral 1) \emph{adversary knowledge} describes  what knowledge the adversary is assumed to have, typically either white-box access with full knowledge of $p_{\theta}$ including model architecture and weights, or varying degrees of black-box access, e.g., only able to obtain the output text $\boldsymbol{c}_{\text{out}}$ from an API; (\romannumeral 2) \emph{adversary goals} describe the malicious purpose that the adversary seeks to achieve, including untargeted goals that simply cause $\boldsymbol{c}_{\text{out}}$ to be a wrong caption or answer, and targeted goals that cause $\boldsymbol{c}_{\text{out}}$ to match a predefined targeted response $\boldsymbol{c}_{\text{tar}}$ (measured via text-matching metrics); (\romannumeral 3) \emph{adversary capabilities} describe the constraints on what the adversary can manipulate to cause harm, with the most commonly used constraint being imposed by the $\ell_{p}$ budget, namely, the $\ell_{p}$ distance between the clean image $\boldsymbol{x}_{\text{cle}}$ and the adversarial image $\boldsymbol{x}_{\text{adv}}$ is less than a budget $\epsilon$ as $\|\boldsymbol{x}_{\text{cle}}-\boldsymbol{x}_{\text{adv}}\|_{p}\leq \epsilon$.
+
+\textbf{Remark.} Our work investigates the most realistic and challenging threat model, where the adversary has black-box access to the victim models $p_{\theta}$, a targeted goal, a small perturbation budget $\epsilon$ on the input image $\boldsymbol{x}$ to ensure human imperceptibility, and is forbidden to manipulate the input text $\boldsymbol{c}_{\text{in}}$.
+
+\begin{figure*}[t]
+\vspace{-0.cm}
+    \centering
+    \includegraphics[width=\textwidth]{figure_main/method.pdf}
+    \caption{
+    \textbf{Pipelines of our attacking strategies.} In the \emph{upper-left} panel, we illustrate our transfer-based strategy for matching image-image features (MF-ii) as formulated in Eq.~\eqref{equ2}. We select a targeted text $\boldsymbol{c}_{\text{tar}}$ (e.g., \texttt{A sea otter with a pearl earring}) and then use a pretrained text-to-image generator $h_{\xi}$ to produce a targeted image $h_{\xi}(\boldsymbol{c}_{\text{tar}})$. The targeted image is then fed to the image encoder $f_{\phi}$ to obtain the embedding $f_{\phi}(h_{\xi}(\boldsymbol{c}_{\text{tar}}))$. Here we refer to adversarial examples generated by transfer-based strategies as $\boldsymbol{x}_{\text{trans}}=\boldsymbol{x}_{\text{cle}}+\Delta$, while adversarial noise is denoted by $\Delta$. We feed $\boldsymbol{x}_{\text{trans}}$ into the image encoder to obtain the adversarial embedding $f_{\phi}(\boldsymbol{x}_{\text{trans}})$, and then we optimize the adversarial noise $\Delta$ to maximize the similarity metric $f_{\phi}(\boldsymbol{x}_{\text{trans}})^{\top}f_{\phi}(h_{\xi}(\boldsymbol{c}_{\text{tar}}))$. In the \emph{upper-right} panel, we demonstrate our query-based strategy for matching text-text features (MF-tt), as defined by Eq.~\eqref{equ3}. We apply the resulted transfer-based adversarial example $\boldsymbol{x}_{\text{trans}}$ to initialize $\boldsymbol{x}_{\text{adv}}$, then sample $N$ random perturbations and add them to $\boldsymbol{x}_{\text{adv}}$ to build $\{\boldsymbol{x}_{\text{adv}}+\boldsymbol{\delta}_{n}\}_{n=1}^{N}$. These randomly perturbed adversarial examples are fed into the victim model $p_{\theta}$ (with the input text $\boldsymbol{c}_{\text{in}}$ unchanged) and the RGF method described in Eq.~\eqref{equ4} is used to estimate the gradients $\nabla_{\boldsymbol{x}_\text{adv}}{g_{\psi}}({p_\theta}(\boldsymbol{x}_\text{adv};\boldsymbol{c}_{\text{in}}))^{\top}{g_{\psi}}(\boldsymbol{c}_{\text{tar}})$. In the \emph{bottom}, we present the final results of our method's (MF-ii + MF-tt) targeted response generation.
+    }
+    \label{fig:method}
+\end{figure*}
+
+\subsection{Transfer-based attacking strategy}
+Since we assume black-box access to the \emph{victim} models, a common attacking strategy is transfer-based~\citep{Dong2017,dong2019evading,liu2016delving,Papernot20162,xie2019improving,yang2022boosting}, which relies on \emph{surrogate} models (e.g., a publicly accessible CLIP model) to which the adversary has white-box access and crafts adversarial examples against them, then feeds the adversarial examples into the victim models (e.g., GPT-4 that the adversary seeks to fool). Due to the fact that the victim models are vision-and-language, we select an image encoder $f_{\phi}(\boldsymbol{x})$ and a text encoder $g_{\psi}(\boldsymbol{c})$ as surrogate models, and we denote $\boldsymbol{c}_{\text{tar}}$ as the targeted response that the adversary expects the victim models to return. Two approaches of designing transfer-based adversarial objectives are described in the following.
+
+\textbf{Matching image-text features (MF-it).}
+Since the adversary expects the victim models to return the targeted response $\boldsymbol{c}_{\text{tar}}$ when the adversarial image $\boldsymbol{x}_{\text{adv}}$ is the input, it is natural to match the features of $\boldsymbol{c}_{\text{tar}}$ and $\boldsymbol{x}_{\text{adv}}$ on surrogate models, where $\boldsymbol{x}_{\text{adv}}$ should satisfy\footnote{We slightly abuse the notations by using $\boldsymbol{x}_{\text{adv}}$ to represent both the variable and the optimal solution.}
+\begin{equation}
+    \argmax_{\|\boldsymbol{x}_{\text{cle}}-\boldsymbol{x}_{\text{adv}}\|_{p}\leq \epsilon} {\color{blue}f_{\phi}}(\boldsymbol{x}_{\text{adv}})^{\top}{\color{blue}g_{\psi}}(\boldsymbol{c}_{\text{tar}})\textrm{.}
+    \label{equ1}
+\end{equation}
+Here, we use {\color{blue}blue} color to highlight white-box accessibility (i.e., can directly obtain gradients of $f_{\phi}$ and $g_{\psi}$ through backpropagation), the image and text encoders are chosen to have the same output dimension, and their inner product indicates the cross-modality similarity of $\boldsymbol{c}_{\text{tar}}$ and $\boldsymbol{x}_{\text{adv}}$. The constrained optimization problem in Eq.~\eqref{equ1} can be solved by projected gradient descent (PGD)~\citep{madry2018towards}.
+
+\textbf{Matching image-image features (MF-ii).} While aligned image and text encoders have been shown to perform well on vision-language tasks~\citep{radford2021learning}, recent research suggests that VLMs may behave like bags-of-words~\citep{yuksekgonul2023when} and therefore may not be dependable for optimizing cross-modality similarity. Given this, an alternative approach is to use a public text-to-image generative model $h_{\xi}$ (e.g., Stable Diffusion~\citep{rombach2022high}) and generate a targeted image corresponding to $\boldsymbol{c}_{\text{tar}}$ as $h_{\xi}(\boldsymbol{c}_{\text{tar}})$. Then, we match the image-image features of $\boldsymbol{x}_{\text{adv}}$ and $h_{\xi}(\boldsymbol{c}_{\text{tar}})$ as
+\begin{equation}
+    \argmax_{\|\boldsymbol{x}_{\text{cle}}-\boldsymbol{x}_{\text{adv}}\|_{p}\leq \epsilon} {\color{blue}f_{\phi}}(\boldsymbol{x}_{\text{adv}})^{\top}{\color{blue}f_{\phi}}({\color{orange}h_{\xi}}(\boldsymbol{c}_{\text{tar}}))\textrm{,}
+    \label{equ2}
+\end{equation}
+where {\color{orange}orange} color is used to emphasize that only black-box accessibility is required for $h_{\xi}$, as gradient information of $h_{\xi}$ is not required when optimizing the adversarial image $\boldsymbol{x}_{\text{adv}}$. 
+Consequently, we can also implement $h_{\xi}$ using advanced APIs such as Midjourney~\citep{Midjourney}.
+
+\setlength{\tabcolsep}{1.5 mm}
+\renewcommand{\arraystretch}{1.25}
+\begin{table}[t]
+\vspace{-0.cm}
+    \centering
+    \caption{
+    \textbf{White-box attacks against surrogate models.}
+    We craft adversarial images $\boldsymbol{x}_{\text{adv}}$ using MF-it in Eq.~\eqref{equ1} or MF-ii in Eq.~\eqref{equ2}, and report the CLIP score ($\uparrow$) between the images and the predefined targeted text $\boldsymbol{c}_{\text{tar}}$ (randomly chosen sentences). Here the clean images consist of real-world $\boldsymbol{x}_{\text{cle}}$ that is irrelevant to the chosen targeted text and $h_{\xi}(\boldsymbol{c}_{\text{tar}})$ generated by a text-to-image model (e.g., Stable Diffusion \cite{rombach2022high}) conditioned on the targeted text $\boldsymbol{c}_\text{tar}$.
+    We observe that MF-ii induces a similar CLIP score compared to the generated image $h_{\xi}(\boldsymbol{c}_{\text{tar}})$, while MF-it induces a even higher CLIP score by directly matching cross-modality features.
+    Furthermore, we note that the attack is time-efficient, and we provide the average time (in seconds) for each strategy to craft a single $\boldsymbol{x}_{\text{adv}}$. The results in this table validate the effectiveness of white-box attacks against surrogate models, whereas Table~\ref{table:2} investigates the transferability of crafted $\boldsymbol{x}_{\text{adv}}$ to evade large VLMs (e.g., MiniGPT-4).
+    }
+    \vspace{0.1cm}
+    \centering
+    \small 
+    \begin{tabular}{ l | cc ccc | ccc ccccc }
+    \toprule[1.5pt]
+         \multirow{2}{*}{Model} & \multicolumn{2}{c}{{Clean image}} & &  \multicolumn{2}{c|}{{Adversarial image}} & \multicolumn{3}{c}{{Time to obtain a single $\boldsymbol{x}_{\text{adv}}$}}
+         \\ 
+         & {$\boldsymbol{x}_{\text{cle}}$} & {$h_{\xi}(\boldsymbol{c}_{\text{tar}})$} & & {MF-ii} & {MF-it} && {MF-ii} & {MF-it} \\
+         \midrule[0.8pt]
+         CLIP (RN50) \cite{radford2021learning} & 0.094 & 0.261 & & 0.239 & \textbf{0.576} && {0.543} & {0.532}
+         \\
+         CLIP (ViT-B/32) \cite{radford2021learning} & 0.142 & 0.313 & & 0.302 & \textbf{0.570} && {0.592} & {0.588}
+         \\
+         BLIP (ViT) \cite{li2022blip} & 0.138 & 0.286 & & 0.277 & \textbf{0.679} && {0.641} & {0.634}
+         \\
+         BLIP-2 (ViT) \cite{li2023blip} & 0.037 & 0.302 & & 0.294 & \textbf{0.502} && {0.855} & {0.852}
+         \\
+         ALBEF (ViT) \cite{ALBEF} & 0.063 & 0.098 & & 0.091 & \textbf{0.451} && {0.750} & {0.749}
+         \\
+    \bottomrule[1.5pt]
+    \end{tabular}
+    \label{table:1}
+\end{table}%
+
+\setlength{\tabcolsep}{1 mm}
+\renewcommand{\arraystretch}{1.25}
+\begin{table}[t]
+\vspace{-0.cm}
+    \centering
+    \caption{
+    \textbf{Black-box attacks against victim models.} We sample clean images $\boldsymbol{x}_\text{cle}$ from the ImageNet-1K validation set and randomly select a target text $\boldsymbol{c}_\text{tar}$ from MS-COCO captions for each clean image. We report the CLIP score ($\uparrow$) between the generated responses of input images (i.e., clean images $\boldsymbol{x}_\text{cle}$ or $\boldsymbol{x}_\text{adv}$ crafted by our attacking methods MF-it, MF-ii, and the combination of MF-ii + MF-tt) and predefined targeted texts $\boldsymbol{c}_\text{tar}$, as computed by various CLIP text encoders and their ensemble/average. 
+    The default textual input $\boldsymbol{c}_\text{in}$ is fixed to be ``what is the content of this image?''. 
+    Pretrained image/text encoders such as CLIP are used as surrogate models for MF-it and MF-ii. For reference, we also report other information such as the number of parameters and input resolution of victim models.
+    }
+    \vspace{0.1cm}
+    \begin{adjustbox}{width=\textwidth}
+    \begin{tabular}{ ll | cccccc | cc }
+    \toprule[1.5pt]
+         \multirow{2}{*}{VLM model} & \multirow{2}{*}{Attacking method} & \multicolumn{6}{c|}{Text encoder (pretrained) for evaluation} & \multicolumn{2}{c}{Other info.} \\
+         & & RN50 & RN101 & ViT-B/16 & ViT-B/32 & ViT-L/14 & Ensemble & {\small \#} Param. & Res. \\ 
+         \hline
+         \multirow{4}{*}{BLIP~\citep{li2022blip}}
+         & {Clean image} & 0.472 & 0.456 & 0.479 & 0.499 & 0.344 & 0.450 & \multirow{4}{*}{224M} & \multirow{4}{*}{384} \\
+         & {MF-it} & 0.492 & 0.474 & 0.520 & 0.546 & 0.384 & 0.483
+         \\
+         & {MF-ii} & 0.766 & 0.753 & 0.774 & 0.786 & 0.696 & 0.755 & & \\
+         & {MF-ii + MF-tt} & \textbf{0.855} & \textbf{0.841} & \textbf{0.861} & \textbf{0.868} & \textbf{0.803} & \textbf{0.846} \\
+         \midrule
+         \multirow{4}{*}{UniDiffuser~\citep{bao2022one}}
+         & {Clean image} & 0.417 & 0.415 & 0.429 & 0.446 & 0.305 & 0.402 & \multirow{4}{*}{1.4B} & \multirow{4}{*}{224} \\
+         & {MF-it} & 0.655 & 0.639 & 0.678 & 0.698 & 0.611 & 0.656
+         \\
+         & {MF-ii} & 0.709 & 0.695 & 0.721 & 0.733 & 0.637 & 0.700 & & \\
+         & {MF-ii + MF-tt} & \textbf{0.754} & \textbf{0.736} & \textbf{0.761} & \textbf{0.777} & \textbf{0.689} & \textbf{0.743} \\
+         \midrule
+         \multirow{4}{*}{Img2Prompt~\citep{guoimages}}
+         & {Clean image} & 0.487 & 0.464 & 0.493 & 0.515 & 0.350 & 0.461 & \multirow{4}{*}{1.7B} & \multirow{4}{*}{384} \\
+         & {MF-it} & 0.499 & 0.472 & 0.501 & 0.525 & 0.355 & 0.470
+         \\
+         & {MF-ii} & 0.502 & 0.479 & 0.505 & 0.529 & 0.366 & 0.476  \\
+         & {MF-ii + MF-tt} & \textbf{0.803} & \textbf{0.783} & \textbf{0.809} & \textbf{0.828} & \textbf{0.733} & \textbf{0.791} \\
+         \midrule
+         \multirow{4}{*}{BLIP-2~\citep{li2023blip}}
+         & {Clean image} & 0.473 & 0.454 & 0.483 & 0.503 & 0.349 & 0.452 & \multirow{4}{*}{3.7B} & \multirow{4}{*}{224} \\
+         & {MF-it} & 0.492 & 0.474 & 0.520 & 0.546 & 0.384 & 0.483
+         \\
+         & {MF-ii} & 0.562 & 0.541 & 0.571 & 0.592 & 0.449 & 0.543 & & \\
+         & {MF-ii + MF-tt} & \textbf{0.656} & \textbf{0.633} & \textbf{0.665} & \textbf{0.681} & \textbf{0.555} & \textbf{0.638} \\
+         \midrule
+         \multirow{4}{*}{LLaVA~\citep{liu2023llava}}
+         & {Clean image} & 0.383 & 0.436 & 0.402 & 0.437 & 0.281 & 0.388 & \multirow{4}{*}{13.3B} & \multirow{4}{*}{224} \\
+         & {MF-it} & 0.389 & 0.441 & 0.417 & 0.452 & 0.288 & 0.397
+         \\
+         & {MF-ii} & 0.396 & 0.440 & 0.421 & 0.450 & 0.292 & 0.400 \\
+         & {MF-ii + MF-tt} & \textbf{0.548} & \textbf{0.559} & \textbf{0.563} & \textbf{0.590} & \textbf{0.448} & \textbf{0.542}\\
+         \midrule
+         \multirow{4}{*}{MiniGPT-4~\citep{zhu2023minigpt}}
+         & {Clean image} & 0.422 & 0.431 & 0.436 & 0.470 & 0.326 & 0.417 & \multirow{4}{*}{14.1B} & \multirow{4}{*}{224}\\
+         & {MF-it} & 0.472 & 0.450 & 0.461 & 0.484 & 0.349 & 0.443
+         \\
+         & {MF-ii} & 0.525 & 0.541 & 0.542 & 0.572 & 0.430 & 0.522 \\
+         & {MF-ii + MF-tt} & \textbf{0.633} & \textbf{0.611} & \textbf{0.631} & \textbf{0.668} & \textbf{0.528} & \textbf{0.614} \\
+    \bottomrule[1.5pt]
+    \end{tabular}
+    \end{adjustbox}
+    \label{table:2}
+\end{table}%
+
+\subsection{Query-based attacking strategy}
+Transfer-based attacks are effective, but their efficacy is heavily dependent on the similarity between the victim and surrogate models. When we are allowed to repeatedly query victim models, such as by providing image inputs and obtaining text outputs, the adversary can employ a query-based attacking strategy to estimate gradients or execute natural evolution algorithms~\citep{bhagoji2018practical,chen2017zoo,ilyas2018black}. 
+
+\textbf{Matching text-text features (MF-tt).} Recall that the adversary goal is to cause the victim models to return a targeted response, namely, matching $p_{\theta}(\boldsymbol{x}_{\text{adv}};\boldsymbol{c}_{\text{in}})$ with $\boldsymbol{c}_{\text{tar}}$. Thus, it is straightforward to maximize the textual similarity between $p_{\theta}(\boldsymbol{x}_{\text{adv}};\boldsymbol{c}_{\text{in}})$ and $\boldsymbol{c}_{\text{tar}}$ as
+\begin{equation}
+    \argmax_{\|\boldsymbol{x}_{\text{cle}}-\boldsymbol{x}_{\text{adv}}\|_{p}\leq \epsilon} {\color{blue}g_{\psi}}({\color{orange}p_\theta}(\boldsymbol{x}_\text{adv};\boldsymbol{c}_{\text{in}}))^{\top}{\color{blue}g_{\psi}}(\boldsymbol{c}_{\text{tar}})\textrm{.}
+    \label{equ3}
+\end{equation}
+Note that we cannot directly compute gradients for optimization in Eq.~\eqref{equ3} because we assume black-box access to the victim models $p_\theta$ and cannot perform backpropagation. To estimate the gradients, we employ the random gradient-free (RGF) method~\citep{nesterov2017random}. First, we rewrite a gradient as the expectation of direction derivatives, i.e., $\nabla_{\boldsymbol{x}}F(\boldsymbol{x})=\mathbb{E}\left[\boldsymbol{\delta}^{\top}\nabla_{\boldsymbol{x}} F(\boldsymbol{x})\cdot \boldsymbol{\delta}\right]$, where $F(\boldsymbol{x})$ represents any differentiable function and $\boldsymbol{\delta}\sim P(\boldsymbol{\delta})$ is a random variable satisfying that $\mathbb{E}[\boldsymbol{\delta}\boldsymbol{\delta}^{\top}]=\mathbf{I}$ (e.g., $\boldsymbol{\delta}$ can be uniformly sampled from a hypersphere). Then by zero-order optimization~\citep{chen2017zoo}, we know that
+\begin{equation}
+    \begin{split}
+        &\nabla_{\boldsymbol{x}_\text{adv}}{\color{blue}g_{\psi}}({\color{orange}p_\theta}(\boldsymbol{x}_\text{adv};\boldsymbol{c}_{\text{in}}))^{\top}{\color{blue}g_{\psi}}(\boldsymbol{c}_{\text{tar}})\\
+        \approx& \frac{1}{N\sigma}\sum_{n=1}^{N}\left[{\color{blue}g_{\psi}}({\color{orange}p_\theta}(\boldsymbol{x}_\text{adv}+\sigma \boldsymbol{\delta}_{n};\boldsymbol{c}_{\text{in}}))^{\top}{\color{blue}g_{\psi}}(\boldsymbol{c}_{\text{tar}})-{\color{blue}g_{\psi}}({\color{orange}p_\theta}(\boldsymbol{x}_\text{adv};\boldsymbol{c}_{\text{in}}))^{\top}{\color{blue}g_{\psi}}(\boldsymbol{c}_{\text{tar}})\right]\cdot \boldsymbol{\delta}_{n}\textrm{,}
+    \end{split}
+    \label{equ4}
+\end{equation}
+where $\boldsymbol{\delta}_{n}\sim P(\boldsymbol{\delta})$, $\sigma$ is a hyperparameter controls the sampling variance, and $N$ is the number of queries. The approximation in Eq.~\eqref{equ4} becomes an unbiased equation when $\sigma\rightarrow 0$ and $N\rightarrow \infty$.
+
+\textbf{Remark.} Previous research demonstrates that transfer-based and query-based attacking strategies can work in tandem to improve black-box evasion effectiveness~\citep{cheng2019improving,dong2021query}. In light of this, we also consider the adversarial examples generated by transfer-based methods to be an initialization (or prior-guided) and use the information obtained from query-based methods to strengthen the adversarial effects. This combination is effective, as empirically verified in Sec.~\ref{sec:experiment} and intuitively illustrated in Figure~\ref{fig:method}.
+
+\section{Experiment}
+\label{sec:experiment}
+In this section, we demonstrate the effectiveness of our techniques for crafting adversarial examples against open-source, large VLMs. More results are provided in the Appendix.
+
+\subsection{Implementation details}
+
+In this paper, we evaluate open-source (to ensure reproducibility) and advanced large VLMs, such as \textbf{UniDiffuser}~\citep{bao2022one}, which uses a diffusion-based framework to jointly model the distribution of image-text pairs and can perform both image-to-text and text-to-image generation; \textbf{BLIP}~\citep{li2022blip} is a unified vision-language pretraining framework for learning from noisy image-text pairs; \textbf{BLIP-2}~\citep{li2023blip} adds a querying transformer~\citep{vaswani2017attention} and a large LM (T5~\citep{raffel2020exploring}) to improve the image-grounded text generation; \textbf{Img2Prompt}~\citep{guoimages} proposes a plug-and-play, LM-agnostic module that provides large LM prompts to enable zero-shot VQA tasks; \textbf{MiniGPT-4}~\citep{zhu2023minigpt} and \textbf{LLaVA}~\citep{liu2023llava} have recently scaled up the capacity of large LMs and leveraged Vicuna-13B~\citep{chiang2023vicuna} for image-grounded text generation tasks. We note that MiniGPT-4 also exploits a high-quality, well-aligned dataset to further finetune the model with a conversation template, resulting in performance comparable to GPT-4~\citep{gpt4}.
+
+\textbf{Datasets.} 
+We use the validation images from ImageNet-1K~\citep{deng2009imagenet} as clean images, from which adversarial examples are crafted, to quantitatively evaluate the adversarial robustness of large VLMs. 
+From MS-COCO captions~\citep{lin2014microsoft}, we randomly select a text description (usually a complete sentence, as shown in our Appendix) as the adversarially targeted text for each clean image. Because we cannot easily find a corresponding image of a given, predefined text, we use Stable Diffusion~\citep{rombach2022high} for the text-to-image generation to obtain the targeted images of each text description, in order to simulate the real-world scenario. 
+Midjourney \citep{Midjourney} and DALL-E \citep{ramesh2021zero,ramesh2022hierarchical} are also used in our experiments to generate the targeted images for demonstration.
+
+\textbf{Basic setups.} For fair comparison, we strictly adhere to previous works~\citep{bao2022one, guoimages,li2022blip, li2023blip,liu2023llava, zhu2023minigpt} in the selection of pretrained weights for image-grounded text generation, including large LMs (e.g., T5 \citep{raffel2020exploring} and Vicuna-13B \citep{chiang2023vicuna} checkpoints). We experiment on the original clean images of various resolutions (see Table~\ref{table:2}). We set $\epsilon=8$ and use $\ell_{\infty}$ constraint by default as ${\|\boldsymbol{x}_{\text{cle}}-\boldsymbol{x}_{\text{adv}}\|_{\infty}\leq}8$, which is the most commonly used setting in the adversarial literature~\citep{carlini2019evaluating}, to ensure that the adversarial perturbations are visually imperceptible where the pixel values are in the range $[0,255]$. We use 100-step PGD to optimize transfer-based attacks (the objectives in Eq.~\eqref{equ1} and Eq.~\eqref{equ2}). In each step of query-based attacks, we set query times $N=100$ in Eq.~\eqref{equ4} and update the adversarial images by 8-steps PGD using the estimated gradient. Every experiment is run on a single NVIDIA-A100 GPU.
+
+\begin{figure*}[t]
+    \centering
+    \includegraphics[width=\textwidth]{figure_main/difference.pdf}
+    \caption{
+    Adversarial perturbations $\Delta$ are obtained by computing $\boldsymbol{x}_{\text{adv}}-\boldsymbol{x}_{\text{cle}}$ (pixel values are amplified $\times$10 for visualization) and their corresponding captions are generated below. Here DALL-E acts as $h_{\xi}$ to generate targeted images $h_{\xi}(\boldsymbol{c}_\text{tar})$ for reference. We note that adversarial perturbations are not only visually hard to perceive, but also not detectable using state-of-the-art image captioning models (we use UniDiffuser for captioning, while similar conclusions hold when using other models).
+    }
+    \label{fig:difference}
+\end{figure*}
+
+\begin{figure*}[t]
+    \centering
+    \vspace{-0.cm}
+    \includegraphics[width=\textwidth]{figure_main/eps.pdf}
+    \caption{
+    We experiment with different values of $\epsilon$ in Eq.~\eqref{equ3} to obtain different levels of ${\boldsymbol{x}_{\text{adv}}}$. As seen, the quality of ${\boldsymbol{x}_{\text{adv}}}$ degrades (measured by the LPIPS distance between ${\boldsymbol{x}_{\text{cle}}}$ and ${\boldsymbol{x}_{\text{adv}}}$), while the effect of targeted response generation saturates (in this case, we evaluate UniDiffuser). Thus, a proper perturbation budget (e.g., $\epsilon=8$) is necessary to balance image quality and generation performance.
+    }
+    \label{fig:eps}
+\end{figure*}
+
+\subsection{Empirical studies}
+
+We evaluate large VLMs and freeze their parameters to make them act like image-to-text generative APIs. In particular, in Figure~\ref{fig:demo-blip}, we show that our crafted adversarial image consistently deceives BLIP-2 and that the generated response has the same semantics as the targeted text. In Figure~\ref{fig:demo-unidiffuser}, we evaluate UniDiffuser, which is capable of bidirectional joint generation, to generate text-to-image and then image-to-text using the crafted $\boldsymbol{x}_{\text{adv}}$. It should be noted that such a chain of generation will result in completely different content than the original text description. We simply use ``what is the content of this image?'' as the prompt to answer generation for models that require text instructions as input (query)~\citep{guoimages}. However, for MiniGPT-4, we use a more flexible approach in conversation, as shown in Figure~\ref{fig:demo-minigpt4}. In contrast to the clean images on which MiniGPT-4 has concrete and correct understanding and descriptions, our crafted adversarial counterparts mislead MiniGPT-4 into producing targeted responses and creating more unexpected descriptions that are not shown in the targeted text.
+
+\begin{figure}[t]
+\vspace{-0.4cm}
+    \centering
+    \includegraphics[width=\textwidth]{figure_main/ablation.pdf}
+    \caption{
+    {\bf Performance of our attack method under a fixed perturbation budget $\epsilon=8$.} 
+    We interpolate between the sole use of transfer-based attack and the sole use of query-based attack strategy. 
+    We demonstrate the effectiveness of our method via CLIP score ($\uparrow$) between the generated texts on adversarial images and the target texts, with different types of CLIP text encoders. The $x$-axis in a ``t$\epsilon_{t}$-q$\epsilon_{q}$'' format denotes we assign $\epsilon_{t}$ to transfer-based attack and $\epsilon_{q}$ to query-based attack.
+    ``t+q=8'' indicates we use transfer-based attack ($\epsilon_{t}=8$) as initialization, and conduct query-based attack for further 8 steps ($\epsilon_{q}=8$), such that the resulting perturbation satisfies $\epsilon=8$.
+    As a result, We show that a proper combination of transfer/query based attack strategy achieves the best performance.
+    }
+    \label{fig:fixed_budget}
+\end{figure}
+
+In Table~\ref{table:1}, we examines the effectiveness of MF-it and MF-ii in crafting white-box adversarial images against surrogate models such as CLIP~\citep{radford2019language}, BLIP~\citep{li2022blip} and ALBEF~\citep{ALBEF}. 
+We take 50K clean images $\boldsymbol{x}_\text{cle}$ from the ImageNet-1K validation set and randomly select a targeted text $\boldsymbol{c}_\text{tar}$ from MS-COCO captions for each clean image. 
+We also generate targeted images $h_\xi(\boldsymbol{c}_\text{tar})$ as reference and craft adversarial images $\boldsymbol{x}_\text{adv}$ by MF-ii or MF-it. 
+As observed, both MF-ii and MF-it are able to increase the similarity between the adversarial image and the targeted text (as measured by CLIP score) in the white-box setting, laying the foundation for black-box transferability. 
+Specifically, as seen in Table~\ref{table:2}, we first transfer the adversarial examples crafted by MF-ii or MF-it in order to evade large VLMs and mislead them into generating targeted responses. 
+We calculate the similarity between the generated response ${p_\theta}(\boldsymbol{x}_\text{adv};\boldsymbol{c}_{\text{in}})$ and the targeted text $\boldsymbol{c}_{\text{tar}}$ using various types of CLIP text encoders. 
+As mentioned previously, the default textual input $\boldsymbol{c}_\text{in}$ is fixed to be ``what is the content of this image?''. Surprisingly, we find that MF-it performs worse than MF-ii, which suggests overfitting when optimizing directly on the cross-modality similarity. 
+In addition, when we use the transfer-based adversarial image crafted by MF-ii as an initialization and then apply query-based MF-tt to tune the adversarial image, the generated response becomes significantly more similar to the targeted text, indicating the vulnerability of advanced large VLMs.
+
+ 
+
+\vspace{-0.cm}
+\subsection{Further analyses}
+\vspace{-0.0cm}
+\label{sec:analysis}
+
+\textbf{Does VLM adversarial perturbations induce semantic meanings?} 
+Previous research has demonstrated that adversarial perturbations crafted against robust models will exhibit semantic or perceptually-aligned characteristics~\citep{ilyas2019adversarial,pang22score,tao2018attacks}. This motivates us to figure out whether adversarial perturbations $\Delta\!=\!\boldsymbol{x}_{\text{adv}}\!-\!\boldsymbol{x}_{\text{cle}}$ crafted against large VLMs possess a similar level of semantic information. In Figure~\ref{fig:difference}, we visualize $\Delta$ that results in a successful targeted evasion over a real image and report the generated text responses. Nevertheless, we observe no semantic information associated with the targeted text in adversarial perturbations or their captions, indicating that large VLMs are inherently vulnerable.\looseness=-1
+
+\textbf{The influence of perturbation budget $\epsilon$.} 
+We use $\epsilon=8$ as the default value in our experiments, meaning that the pixel-wise perturbation is up to $\pm 8$ in the range $[0,255]$. In Figure \ref{fig:eps}, we examine the effect of setting $\epsilon$ to different values of $\{2,4,8,16,64\}$ and compute the perceptual distance between the clean image $\boldsymbol{x}_{\text{cle}}$ and its adversarial counterpart $\boldsymbol{x}_{\text{adv}}$ using LPIPS ($\downarrow$)~\citep{zhang2018lpips}. We highlight (in red color) the generated responses that most closely resemble the targeted text. As observed, there is a trade-off between image quality/fidelity and successfully eliciting the targeted response; therefore, it is essential to choose an appropriate perturbation budget value.
+
+\begin{figure*}[t]
+    \centering
+    \includegraphics[width=\textwidth]{figure_main/cam.pdf}
+    \caption{
+    \textbf{Visually interpreting our attacking mechanism.}
+    To better comprehend the mechanism by which our adversarial examples deceive large VLMs (here we evaluate Img2Prompt), we employ interpretable visualization with GradCAM~\citep{Selvaraju_2017_ICCV}. \textbf{(a)} An example of $\boldsymbol{x}_{\text{cle}}$, $\boldsymbol{x}_{\text{adv}}$, and $h_{\xi}(\boldsymbol{c}_{\text{tar}})$, along with the responses they generate. We select the targeted text as \texttt{a beautiful bird with a black and white color in snow}. \textbf{(b)} GradCAM visualization when the input question is: \texttt{what is the teddy bear playing in the middle of the road?} As seen, GradCAM can effectively highlight the skateboard for $\boldsymbol{x}_{\text{cle}}$, whereas GradCAM highlights irrelevant backgrounds for $\boldsymbol{x}_{\text{adv}}$. \textbf{(c)} If we feed the targeted text as the question, GradCAM will highlight similar regions of $\boldsymbol{x}_{\text{adv}}$ and $h_{\xi}(\boldsymbol{c}_{\text{tar}})$.\looseness=-1
+    }
+    \label{fig:cam}
+\end{figure*}
+
+\textbf{Performance of attack with a fixed perturbation budget.}
+To understand the separate benefit from transfer-based attack and query-based attack, we conduct a study to assign different perturbation budget for transfer ($\epsilon_{t}$) and query based attack strategy ($\epsilon_{q}$), under the constraint $\epsilon_{t}+\epsilon_{q}=8$.
+Unidiffuser is the victim model in our experiment. The results are in Figure \ref{fig:fixed_budget}. We demonstrate that, a proper combination of transfer and query based attack achieves the best performance.
+
+\textbf{Interpreting the mechanism of attacking large VLMs.} To understand how our targeted adversarial example influences response generation, we compute the relevancy score of image patches related to the input question using GradCAM~\citep{Selvaraju_2017_ICCV} to obtain a visual explanation for both clean and adversarial images. As shown in Figure \ref{fig:cam}, our adversarial image $\boldsymbol{x}_\text{adv}$ successfully suppresses the relevancy to the original text description (panel~\textbf{(b)}) and mimics the attention map of the targeted image $h_{\xi}(\boldsymbol{c}_\text{tar})$ (panel~\textbf{(c)}). 
+Nonetheless, we emphasize that the use of GradCAM as a feature attribution method has some known limitations~\citep{chattopadhay2018grad}. 
+Additional interpretable examples are provided in the Appendix.
+
+\vspace{-0.1cm}
+\section{Discussion}
+\vspace{-0.05cm}
+\label{sec:discussion}
+
+It is widely accepted that developing large multimodal models will be an irresistible trend. Prior to deploying these large models in practice, however, it is essential to understand their worst-case performance through techniques such as red teaming or adversarial attacks~\citep{dong2023robust}. In contrast to manipulating textual inputs, which may require human-in-the-loop prompt engineering, our results demonstrate that manipulating visual inputs can be automated, thereby effectively fooling the entire large vision-language systems. The resulting adversarial effect is deeply rooted and can even affect multi-round interaction, as shown in Figure~\ref{fig:demo-minigpt4}. While multimodal security issues have been cautiously treated by models such as GPT-4, which delays the release of visual inputs~\citep{delaygpt4}, there are an increasing number of open-source multimodal models, such as MiniGPT-4~\citep{zhu2023minigpt} and LLaVA~\citep{liu2023llava,liu2023improved}, whose worst-case behaviors have not been thoroughly examined. The use of these open-source, but adversarially unchecked, large multimodal models as product plugins could pose potential risks.
+
+\textbf{Broader impacts.} While the primary goal of our research is to evaluate and quantify adversarial robustness of large vision-language models, it is possible that the developed attacking strategies could be misused to evade practically deployed systems and cause potential negative societal impacts. Specifically, our threat model assumes black-box access and targeted responses, which involves manipulating existing APIs such as GPT-4 (with visual inputs) and/or Midjourney on purpose, thereby increasing the risk if these vision-language APIs are implemented as plugins in other products.
+
+\textbf{Limitations.} Our work focuses primarily on the digital world, with the assumption that input images feed directly into the models. In the future, however, vision-language models are more likely to be deployed in complex scenarios such as controlling robots or automatic driving, in which case input images may be obtained from the interaction with physical environments and captured in real-time by cameras. Consequently, performing adversarial attacks in the physical world would be one of the future directions for evaluating the security of vision-language models.
+
+\section*{Acknowledgements}
+
+This research work is supported by the Agency for Science, Technology and Research (A*STAR) under its MTC Programmatic Funds (Grant No. M23L7b0021). 
+This material is based on the research/work support in part by the Changi General Hospital and Singapore University of Technology and Design, under the HealthTech Innovation Fund (HTIF Award No. CGH-SUTD-2021-004). 
+C.\ Li was sponsored by Beijing Nova Program (No.\ 20220484044).
+We thank Siqi Fu for providing beautiful pictures generated by Midjourney, 
+and anonymous reviewers for their insightful comments.
+
+\clearpage
+
+\end{document}

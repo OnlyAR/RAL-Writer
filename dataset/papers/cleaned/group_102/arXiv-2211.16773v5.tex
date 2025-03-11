@@ -1,0 +1,714 @@
+\title{KRLS: Improving End-to-End Response Generation in Task Oriented Dialog with Reinforced Keywords Learning}
+
+\begin{document}
+
+\maketitle
+\begin{abstract}
+In task-oriented dialogs (TOD), reinforcement learning (RL) algorithms train a model to directly optimize response for task-related metrics.
+However, RL needs to perform exploration, which can be time-consuming due to the slow auto-regressive sequence generation process. 
+We investigate an approach to create a more efficient RL-based algorithm to improve TOD performance in an offline setting.
+First, we use a faster generation procedure that samples from independent next-word distributions after training the language model (LM) with supervised learning.
+We then introduce a fine-grained reward function to help the model focus on learning key information in a dialog, by measuring the importance and semantic closeness of each generated token.
+Experiments on the MultiWoZ dataset show our new training algorithm, \textbf{K}eywords \textbf{R}einforcement \textbf{L}earning with Next-word \textbf{S}ampling (KRLS), achieves state-of-the-art performance on the end-to-end response generation task, with a 15\% training time reduction compared to a standard RL algorithm using auto-regressive generation\footnote{Code availale at \href{https://github.com/jasonyux/KRLS}{https://github.com/jasonyux/KRLS}}.
+\end{abstract}
+
+\section{Introduction}
+
+Task-oriented dialog systems help users complete pre-defined tasks such as booking a hotel or reserving a table in a restaurant.
+With advances in large-scale pre-trained generative models \cite{GPT3,T5,dialoGPT,godel}, many recent approaches \cite{DBLP:journals/corr/abs-1910-03756,NEURIPS2020_e9462095,ubar,mttod,galaxy} handle TOD as a holistic task of end-to-end (E2E) generation, as opposed to the traditional modular approach. 
+\begin{figure}[!h]
+  \centering
+  \includegraphics[width=1.0\linewidth]{./images/offline_RL_overview.pdf}
+  \caption{Overview of episodic training in KRLS. Each turn is treated as a separate episode, and the RL task is to only generate/explore a response at the end. The gold system resp. are also used in our reward computations.}
+  \label{fig:offline_RL_overview}
+\end{figure}
+
+In this E2E setting, the dialog history is often used as input, and reinforcement learning (RL) algorithms can train a model to generate a response that directly optimizes for task-related metrics, such as the task success rate \cite{multiwoz}.
+However, training RL-based dialog models often requires a good user simulator \cite{user-simulator}, and the training process could be time-consuming as RL often needs to explore and auto-regressively generate many new responses per given input \cite{rl4lm}.
+For example, in our experiment, we found that this generation process alone takes 172 minutes/epoch out of the total 362 minutes/epoch during training. 
+\begin{figure*}[!ht]
+    \centering
+    \includegraphics[scale=0.57]{./images/RLM_algo.pdf}
+    \caption{Overview of the KRLS algorithm. During traditional supervised training, the language model learns/imitates the gold response. During offline RL training, the fine-tuned model generates sequences by sampling from next-word distributions conditioned on the gold response and receives a per-token reward.}
+    \label{fig:KRLS_algo}
+\end{figure*}
+
+In this work, we aim to create a more efficient RL procedure for TOD, which does not need a user simulator nor use auto-regressive generation during exploration. We propose a new training algorithm, \textbf{K}eywords \textbf{R}einforcement \textbf{L}earning with Next-word \textbf{S}ampling (KRLS), which combines a faster sequence generation procedure and a fine-grained per-token reward in an offline setting \cite{way-off-policy, GOLD}. 
+First, we treat each turn in a dialog as a separate episode and consider an offline RL task to generate a response only at the end of each episode (see \Cref{fig:offline_RL_overview}). 
+Since this procedure only explores/generates system responses at the last turn, no interactive environment (e.g., a user simulator) is needed.
+During this RL process, KRLS generates new sequences by directly sampling from independent next-word distributions, after training a language model with the traditional supervised learning (SL) technique (see \autoref{fig:KRLS_algo}). %TODO
+This generation procedure is much faster than the traditional auto-regressive approach, as it only requires a single forward pass. 
+Next, KRLS uses a fine-grained per-token reward to help the model focus on learning key information in a dialog, by measuring the importance and semantic closeness of each generated token.
+Experiments on the MultiWoZ dataset show that KRLS achieves state-of-the-art performance on the E2E response generation task, with a 15\% training time reduction compared to the standard RL approach using auto-regressive generation.
+
+This paper makes the following contributions:
+\begin{itemize}
+  \item We propose an efficient offline RL algorithm that approximates auto-regressive generation by sampling from independent next-word distributions conditioned on the gold response. 
+	\item We introduce a per-token reward function, which can be used in our offline RL algorithm to promote keyword learning or to incorporate domain knowledge.
+	\item We show that our proposed KRLS algorithm can achieve state-of-the-art performance on E2E response generation on MultiWoZ \cite{multiwoz,multiwoz2.1,multiwoz2.2}.
+\end{itemize}
+
+\begin{figure*}[!ht]
+  \centering
+  \includegraphics[scale=0.75]{./images/RLM_reward.pdf}
+  \caption{KRLS reward function. Immediate reward measures the semantic closeness of the generated token and the gold token, scaled by its importance $\mu$. Return for each sampled token is a combination of individual immediate reward and future rewards. Future rewards will help propagate final overall scores, such as overall task performance. Key tokens in a response are bolded and italicized.}
+  \label{fig:KRLS_reward}
+\end{figure*}
+
+\section{Background}
+\label{sec:Background}
+
+To introduce RL in NLP tasks, we begin by formulating the response generation process as an MDP. Given a supervised dataset $\mathcal{D} = \{ (\mathbf{c}^{i}, \mathbf{x}^{i}) \}$ where $\mathbf{c}^{(i)}$ is the context and $\mathbf{x}^{(i)}$ is a response, the probability of generating $\mathbf{x}^{(i)}$ can be modeled as:
+\[
+p(\mathbf{x}^{(i)}|\mathbf{c}^{(i)}) = \prod_{t=1}^{T-1} p(x^{(i)}_{t+1}|x^{(i)}_{1:t},\mathbf{c}^{(i)}),
+\] 
+where $x_t^{(i)}$ is the $t$-th token in the $i$-th response, and $T$ is the length of the response. As mentioned in \citet{rl4lm,lava}, this generation can be formulated as a MDP problem $\langle \mathcal{S}, \mathcal{A}, \mathcal{R}, \mathcal{P}, \gamma \rangle$. The input context $\mathbf{c}^{(i)}$ would be the initial state $s_{0} \in \mathcal{S}$, and the response $\mathbf{x}^{(i)}$ would represent the sequence of actions $\mathbf{a}^{(i)} = \{a_1^{(i)}, a_2^{(i)}, \dots, a_{T-1}^{(i)}\}$ in an episode, where $a_t^{(i)} \in \mathcal{A}$ is the $t$-th token in the $i$-th response. The reward function $\mathcal{R}$ would represent the ``utility'' of each action contributing towards the overall performance, such as task success in TOD. Typically, this is modeled by using $\mathcal{R}(s,a)=0$ for non-terminal states, and $\mathcal{R}(s_T,a)$ for terminal states which can be computed by combining scores such as task success and BLEU \cite{rl4lm, director}. The transition function $\mathcal{P}: \mathcal{S}\times \mathcal{A}\to \mathcal{S}$ would deterministically append the action $a_t$ to the current state $s_t$ so that $s_{t+1} = (c_0, \dots, c_m, a_0, \dots, a_{t})$. Finally, $\gamma \in [0,1)$ is the discount factor.
+
+\section{Approach}
+In the MulitiWoZ dataset \cite{multiwoz,multiwoz2.1, multiwoz2.2}, we observe that key information, such as restaurant ``phone number'' and ``address'', needs to be \emph{generated} correctly in a response to achieve a high task success/inform rate.
+However, traditional SL uses a negative log-likelihood loss, which asks the language model to uniformly learn all correct tokens $x^{\mathrm{gold}}$ given input context $c$, without explicitly focusing on achieving task-related objectives:
+\begin{equation}\label{eq:lm_loss}
+  \begin{split}
+    \mathcal{L}_{\mathrm{SL}}(\theta)
+    &= - \sum\limits_{x} p(x|c) \log p_\theta(x|c) \\
+    &= -\log p_\theta(x^{\mathrm{gold}}|c)
+  \end{split}
+\end{equation}
+where the probability of $p(x|c)=0$ if $x \neq x^{{\mathrm{gold}}}$. We will refer to models fine-tuned with this objective as "$\mathcal{L}_{\mathrm{SL}}$-finetuned".
+
+We hypothesize that it can be beneficial to use RL and a fine-grained per-token reward function to help promote keyword learning and improve TOD performance. 
+First, in \Cref{sec:RL with Next-word Sampling} we propose a fast sequence generation procedure that can be used during RL training/exploration, and utilize policy-gradient based methods \cite{policy-gradient,REINFORCE, PPO} to optimize response generation for task-related metrics. Then, in \Cref{sec:Per-Token Reward Function} we design a fine-grained reward function $\mathcal{R}(x|c)$ according to \emph{how important} each generated token is, but also \emph{how close} it is from the gold token, so that the model can focus more on learning key information once it can generate non-key tokens semantically close to the reference. Finally, we describe our KRLS algorithm in \Cref{sec:KRLS Training Algorithm} and \Cref{algo:krls_algorithm}, which utilizes RL combined with our proposed generation method and reward function.
+
+\subsection{RL with Next-word Sampling}
+\label{sec:RL with Next-word Sampling}
+To avoid the slow auto-regressive sequence generation process during RL training, we propose an alternative sequence generation mechanism that can be used for RL exploration.
+First, we assume that there is a model $p_\theta$ that generates sequences similar to the gold responses in the \emph{training set}. 
+Then, under this assumption, we can approximate the MDP process of auto-regressive sequence generation by sampling from the next-word distributions conditioned on the gold response.
+This is because if previously generated tokens are similar to the gold context (e.g., after $\mathcal{L}_{\mathrm{SL}}$ training), then conditioning on those generated tokens is similar to conditioning on the gold tokens.
+In this setting, the next-word sampling process could approximate auto-regressive generation used during RL, but it is much faster as each token is generated in parallel.
+
+Specifically, we first perform a forward pass to obtain the next-word distributions for $x_{t}^{\mathrm{gen}}$ given the context and the gold response up to $t-1$:
+\begin{equation}\label{eq:next-word-dist}
+  \left\{ p_\theta(x^{\mathrm{gen}}_{1}|\mathbf{c}^{(i)}), \dots, p_\theta(x^{\mathrm{gen}}_{T}|x^{(i)}_{1:T-1},\mathbf{c}^{(i)}) \right\}
+\end{equation}
+Then, we generate each next-token $a_{t}=x^{\mathrm{gen}}_t$ by sampling from $p_\theta(X=x|x^{(i)}_{1:t-1},\mathbf{c}^{(i)};\tau)$ with temperature $\tau$. Finally, given some suitable reward function $\mathcal{R}(s_t, a_t)\in [-1,1]$ (see \Cref{sec:Per-Token Reward Function} for details), we can use policy gradient methods \cite{policy-gradient, REINFORCE} to perform a ``weighted learning'' on each generated token: 
+\begin{equation}\label{eq:real_policy_gradient}
+  \nabla \mathcal{L}(\theta) = -G_t \nabla \log p_\theta(x_t|c)
+\end{equation}
+
+Note that this procedure is much faster than auto-regressive generation as it only requires one forward pass. Moreover, it is suitable for training a model to focus on generating key information, because we can use the gold response as an oracle to locate those key positions and penalize each generated token in the reward function accordingly. 
+
+\subsection{Per-Token Reward Function}
+\label{sec:Per-Token Reward Function}
+
+To improve a model's keyword generation ability, we design a reward function that measures the \emph{importance} and \emph{semantic closeness} of each generated token.
+This reward aims to prioritize accurate generation of key tokens, and also contextually evaluate how far-off is each generated token from the ground truth.
+We draw inspiration from BERTScore \cite{BERTScore}, which uses a separate neural network to compute a contextual semantic score of the generated sequence by comparing it against the gold reference. 
+However, we found that directly adapting BERTScore to a per-token reward function is sub-optimal in our setting, as our generated sequence is ``sampled'' from the gold response. Therefore, we consider a simpler approach, utilizing the fact that our generation procedure provided a one-to-one mapping between each generated token and the gold token. 
+
+First, we use a $\mathcal{L}_{\mathrm{SL}}$-finetuned decoder network $\mathrm{Decoder}(\phi)$ to compute the probability $p_\phi(X_t=x|x^{(i)}_{1:t-1},\mathbf{c}^{(i)})$ of generating any token $x$ at time $t$, which can be done in a single forward pass. Then, we index into this probability distribution to find $p_\phi(X=x^{\mathrm{gen}}_t|x^{(i)}_{1:t-1},\mathbf{c}^{(i)})$ of our generated tokens, as a measure of the \emph{semantic appropriateness} of $x^{\mathrm{gen}}_t$ in the given context. 
+To ensure that $\mathcal{R}$ correctly reflects the gold tokens as the optimal choice, we manually set this semantic closeness score to $1$ for \emph{any token} that is correctly generated $x^{\mathrm{gen}}_t = x_t^{\mathrm{gold}}$.
+To emphasize keyword learning, we also strictly set this closeness score to $-1$ if a \emph{key token} is incorrectly generated. Otherwise, we use the probability $p_\phi$ produced by the decoder network as the closeness score.
+Finally, we adjust the reward for key tokens by an \emph{importance} scale $\mu>1$, which is a hyper-parameter for specifying the relative importance between keywords and non-keywords. This gives our per-token reward:
+\begin{equation}\label{eq:reward}
+  \mathcal{R}(s_t,a_t) = \mathrm{closeness}(x^{\mathrm{gen}}_t, x^{\mathrm{gold}}_t, \mathbf{\bar{c}}) \cdot \mu
+\end{equation}
+We standardize $\mathcal{R}$ to $[-1,1]$ to be later compared with other related reward functions in \Cref{sec:Per-Token Reward Function Ablation}.
+\begin{algorithm}
+	\caption{KRLS Training Algorithm}\label{algo:krls_algorithm}
+	\begin{algorithmic}[1]
+  \Require generative network $p_\theta$
+  \Require semantic scoring network $p_\phi$
+  \Require supervised language dataset $\mathcal{D}$
+  \Require empty buffer $B_{\mathrm{L}}, B_{\mathrm{S}}$
+  \State Repeat for $n$ epochs:
+	\For{batch $b_{i}$ in $\mathcal{D}=\{ b_{1}, \dots, b_{m} \}$}
+    \State Perform sup. learning on $b_{i}$ (\autoref{eq:lm_loss})
+    \State Update generative network $p_\theta$
+    \State Append $b_{i}$ to buffer $B_{\mathrm{L}}$
+    \If{$i$\% $\kappa == 0$}
+    \For{each batched episode $b_{j}$ in $B_{\mathrm{L}}$}
+    \State Collect $k$ samples per episode \\ \label{lst:line:}
+      \qquad\qquad\qquad by sampling from \autoref{eq:next-word-dist}
+    \State Calculate per-token reward \\
+      \qquad\qquad\qquad using $p_\phi$ and \autoref{eq:reward}
+    \State Calculate per-token returns $G_t$
+    \State Append all to replay buffer $B_{\mathrm{R}}$ \label{lst:line:replay_buf}
+    \EndFor
+    \State Perform RL on $B_{\mathrm{R}}$ 
+    (e.g., PPO)
+    \State Update generative network $p_\theta$
+    \State Clear $B_{\mathrm{L}}$ and $B_{\mathrm{R}}$
+    \EndIf
+	\EndFor
+	\end{algorithmic}
+\end{algorithm}
+\subsection{KRLS Training Algorithm}
+\label{sec:KRLS Training Algorithm}
+\Cref{algo:krls_algorithm} describes our KRLS training algorithm. Given a supervised dataset $\mathcal{D}=\{\mathbf{c}_{i}, \mathbf{x}_i^{\mathrm{gold}}\}_{i=1}^N$ consisting of the dialog context $\mathbf{c}_{i}$ and the gold response $\mathbf{x}_i^{\mathrm{gold}}$ at each turn, we train a neural network $p_\theta$ to generate a response that satisfies the user's need given by $\mathbf{c}_{i}$. A separate neural network $p_\phi$ is used to compute the reward function during RL phase (see \Cref{sec:Per-Token Reward Function}).
+
+For each epoch, we first perform SL over several batches of training examples and update our network $p_\theta$. This is because our generation procedure is based on the assumption stated in \Cref{sec:RL with Next-word Sampling}, so we periodically train $p_\theta$ with the $\mathcal{L}_{\mathrm{SL}}$ objective to imitate the gold responses before passing over to RL (see \Cref{sec:KRLS Sampled Response Examples} for generated sequences). Then, we store those SL-trained batches into a buffer $B_L$, and perform RL on this learned buffer. During this RL training, we first generate $k$ responses per trained episode by next-word sampling (see \Cref{sec:RL with Next-word Sampling}), calculate their rewards and returns using a scoring network $p_\phi$, and append them to a replay buffer $B_R$. Then, we utilize the clipped policy gradient objective from Proximal Policy Optimization \cite{PPO} to learn from $B_R$ and update the generative policy model $p_\theta$ (see \Cref{sec:KRLS RL Details} and \Cref{sec:KRLS PPO v.s. PG}).
+
+Note that \Cref{algo:krls_algorithm} only additionally requires prior definitions of keywords to compute the reward. This means that such an approach can be generic to many task-oriented dialogues where keywords can be easily defined (e.g., using entities from a database). For instance, in movie recommendation \cite{movielens}, correctly generating key information such as ``movie\_ratings'' and ``movie\_genres'' could be helpful to improve the system's response. Additionally, we believe that for other dialogue tasks such as QA/social chat, keywords can often be automatically processed and defined, such as using the entities mentioned in WikiQA answers \cite{yang-etal-2015-wikiqa} and the intent keywords in ESConv \cite{liu2021emotional}.
+\begin{table*}[!t]
+  \centering
+  \scalebox{0.85}{
+  \begin{tabular}{l c c c c c} 
+     \toprule
+     \multirow{2}{*}{{{Model}}} & \multirow{2}{*}{{{Backbone}}} & \multicolumn{4}{c}{{Response Generation}} \\
+      & & {{Inform}} & {{Success}} & {BLEU} & {Combined}\\
+     \midrule
+SOLOIST \cite{peng2021soloist} & GPT-2     & 82.3 & 72.4 & 13.6 & 90.9   \\
+DoTS \cite{jeon2021domain} & BERT-base    & 80.4 & 68.7 & 16.8 & 91.4   \\
+UBAR \cite{yang2021ubar} & DistilGPT-2  & 83.4 & 70.3 & 17.6 & 94.4   \\
+PPTOD \cite{su2021multitask} & T5-base     & 83.1 & 72.7 & 18.2 & 96.1   \\
+BORT \cite{sun-etal-2022-bort} & T5-small     & 85.5 & 77.4 & 17.9 & 99.4   \\
+MTTOD \cite{mttod} & T5-base     & 85.9 & 76.5 & 19.0 & 100.2  \\
+GALAXY \cite{galaxy} & UniLM-base & 85.4 & 75.7 & 19.0 & 100.2  \\
+Mars-G$^{\dagger}$ \cite{mars} & T5-small & {88.9} & 78.0 & \textbf{19.9} & {103.4}  \\
+\addlinespace[0.25em]
+\hdashline
+\addlinespace[0.25em]
+Baseline (MTTOD)& GODEL-base & 86.0 & 77.4 & 18.9 & 100.6  \\
+KRLS           & GODEL-base 
+  &{87.3} (\small 87.2$\pm$0.3\par) & 78.3 (\small 78.2$\pm$0.5\par)
+  &19.2 (\small 19.1$\pm$0.3\par) & 102.0 (\small 101.9$\pm$0.5\par)\\
+finetune+KRLS  & GODEL-base 
+  &\textbf{89.2} (\small 89.2$\pm$0.3\par)& \textbf{80.3} (\small 80.0$\pm$0.4\par)
+  &{19.0} (\small 19.0$\pm$0.2\par) & \textbf{103.8} (\small 103.5$\pm$0.4\par)  \\
+\bottomrule
+  \end{tabular}
+  }
+  \caption{MultiWoZ 2.2 end-to-end response generation evaluation. Results are ``$\text{best run}\ (\mu, \sigma)$'' over three runs. The results of previous works are from the official leaderboard of MultiWOZ. $^{\dagger}$ indicates concurrent work.}
+  \label{tbl:multiwoz_results}
+  \vspace{5pt}
+\end{table*}
+\begin{table}[]
+  \centering
+  \scalebox{0.85}{
+  \begin{tabular}{l c c} 
+     \toprule
+     {Algo} & {Generation Time} & {Training Time}\\
+     \midrule
+     KRLS& \phantom{0}48 min/epoch & \space 306 min/epoch \\
+     std. RL  & 172 min/epoch & 362 min/epoch \\
+     \bottomrule
+  \end{tabular}
+  }
+  \caption{Training speed comparison between KRLS and RL. In standard RL (\algo{std. RL}), auto-regressive sequence generation is used for experience collection.}
+  \label{tbl:training_time}
+\end{table}
+\section{Experiments}
+\label{sec:Experiments}
+
+\subsection{Dataset and Preprocessing}
+\label{sec:Dataset and Preprocessing}
+We evaluate our algorithm on the MultiWoZ dataset \cite{multiwoz}. MultiWoZ is a large-scale multi-domain TOD dataset consisting of 8438, 1000, and 1000 dialogs for training, validation, and test sets respectively. The dataset consists of seven domains: attraction, hotel, hospital, police, restaurant, taxi, and train. Each dialog consists of a sequence of user utterances and system responses, all annotated with the corresponding dialog state and system action.
+
+We follow the preprocessing procedure from \citet{multiwoz-preprocess} to delexicalize slot values for each system response, and use the standardized evaluation script released by \citet{multiwoz-eval}, which has also been adopted by the official MultiWoZ dataset.
+
+\subsection{Evaluation Metrics}
+\label{sec:Evaluation Metrics}
+In our experiments, we primarily consider the task of end-to-end response generation. In MultiWoZ, response generation performance is evaluated by a combination of three metrics: \textbf{Inform rate} measures whether the system has provided an appropriate entity; \textbf{Success rate} measures whether the system has answered all the requested attributes; \textbf{BLEU} measures the fluency as compared to the references, which are also delexicalized. Finally, the \textbf{Combined} score is calculated as $(\mathrm{Inform}+\mathrm{Success}) \times 0.5 +\mathrm{BLEU}$.
+\subsection{Model Architecture and Baseline}
+\label{sec:Model Architecture and Baseline}
+In this work, we use GODEL-base \cite{godel} as a backbone, which is a T5-base model \cite{T5} pretrained on both texts and dialog datasets (except MultiWoZ).
+
+\textbf{Baseline} We use MTTOD \cite{mttod}, which achieves previous state-of-the-art performance in response generation by performing SL with additional multi-task training. We re-train MTTOD with GODEL-base \cite{godel} as the backbone, and report this as \emph{Baseline (MTTOD)}.
+
+\textbf{KRLS} Since KRLS targets at improving response generation, we replace the SL objective during response training in MTTOD with the KRLS algorithm, which involves both SL and RL training. We report this result as \emph{KRLS}.
+
+\textbf{finetune+KRLS} 
+As the generation procedure in KRLS is based on the assumption stated in \Cref{sec:RL with Next-word Sampling}, we first initialize the model with an $\mathcal{L}_{\mathrm{SL}}$-finetuned checkpoint, and then perform the same KRLS training procedure as used in \emph{KRLS}. 
+We report this result as \emph{finetune+KRLS}.
+
+More details in training/hyperparameters can be found in \Cref{sec:Implementation and Training Details}.
+
+\subsection{Main Results}
+\label{subsec:Main Results}
+\autoref{tbl:multiwoz_results} summarizes the results of end-to-end response generation performance on MultiWoZ. As shown in \autoref{tbl:multiwoz_results}, when trained with KRLS directly from backbone (\algo{KRLS} in \Cref{tbl:multiwoz_results}) we achieve an improvement of 1.4 in Combined Score compared to the baseline, which mostly comes from increased inform and success rate. 
+Since inform/success rate evaluates how often informable/requestable slot values (i.e. keywords) are generated correctly, this suggests that KRLS can help reinforce a model's ability to generate key tokens (see \Cref{subsec:Keyword Learning}).
+
+When trained from an $\mathcal{L}_{\mathrm{SL}}$-finetuned checkpoint (\algo{finetune+KRLS}), KRLS further improves to a combined score of 103.8, with major improvements again in the success and inform rate. We believe this is because, as the model has already been finetuned on the entire training dataset, the assumption mentioned in \Cref{sec:RL with Next-word Sampling} is better satisfied (see \Cref{sec:KRLS Sampled Response Examples} for examples). 
+Then, KRLS can better improve a model's keyword generation ability as compared to the case when trained from backbone.
+
+\Cref{tbl:training_time} compares the training speed of the KRLS algorithm with standard RL training which uses auto-regressive generation.
+During standard RL training, we removed the SL step in \Cref{algo:krls_algorithm}, and only use a terminal reward during RL as newly generated sequences no longer have a one-to-one mapping to the tokens in gold response (more details in \Cref{sec:RL with Auto-Regressive Gen. Setup}).
+We then measure the total wall-clock time per epoch spent by each algorithm during training and separately during experience collection (line 7-14 in \Cref{algo:krls_algorithm}).
+While additionally initializing KRLS with a $\mathcal{L}_{\mathrm{SL}}$-finetuned checkpoint (\emph{finetune+KRLS}) achieves a better performance, we note that the same procedure is often used for RL training in NLP \cite{rl4lm}. Due to the large exploration space for language models, RL algorithms may require many more epochs to train without initializing from a finetuned checkpoint (see \Cref{sec:Training KRLS from Scratch}). Therefore, we focus our comparison solely on running the KRLS algorithm and the standard RL algorithm.
+
+As shown in \Cref{tbl:training_time}, the experience collection time (\emph{Generation Time}) for KRLS is much shorter than RL using auto-regressive generation, as in KRLS only a single forward pass is needed for sequence generation. However, since KRLS additionally includes SL (68 min/epoch) and a per-token reward computation, the total training time per epoch becomes 306 min/epoch, though still 15\% faster than the 362 min/epoch with standard RL, which only includes experience collection and PPO training (190 min/epoch).
+\begin{table}[!t]
+  \centering
+  \scalebox{0.75}{
+  \begin{tabular}{lccc} 
+      \toprule
+     {Metric} & {ft+KRLS Win}  & {MTTOD Win} & {Tie} \\
+     \midrule
+     Fluency & 34.7\% & \textbf{48.0\%} & 17.3\% \\
+     Appropriateness & \textbf{55.3\%*} & 30.7\% & 14.0\% \\
+     Informativeness & \textbf{60.7\%*} & 26.7\% & 12.7\% \\
+     Overall& \textbf{59.3\%*} & 29.3\% & 11.3\% \\
+  \bottomrule
+  \end{tabular}
+  }
+  \caption{Human evaluation on the generated responses. * indicates $p<0.01$. Fluency result has no statistical significance due to large variances among annotators.}
+  \vspace{-5pt}
+  \label{tbl:human_eval}
+\end{table}
+
+\subsection{Human Evaluation}
+\label{subsec:Human Evaluation}
+We consider the possibility that automatic metrics from MultiWoZ may not correlate well with human judgements \cite{liu2016not, lubis-etal-2022-dialogue}. 
+Thus, we ask crowd-workers on Amazon Mechanical Turk to compare responses generated by baseline (\emph{MTTOD}) and finetune+KRLS (\emph{ft+KRLS}). The responses are rated in terms of their 1) \emph{appropriateness}\footnote{For \emph{appropriateness} and \emph{fluency}, we followed the definitions from prior work \cite{zhang2020task, ramachandran2021causal, gptcritic, feng2023fantastic}.}, 
+2) \emph{fluency}, 
+3) \emph{informativeness}, and 4) \emph{overall} quality given a dialogue context.
+We randomly picked 50 turns in the test set, and provided the generated responses without delexicalization and the dialogue history up to that turn. For each metric, the crowd-workers were to choose which response is better, or if it is a tie. 
+We collected preference from 3 crowd-workers per sampled turn. 
+
+\Cref{tbl:human_eval} summarizes the human evaluation results. 
+Our method has been rated more appropriate, informative, and overall more preferred by Turkers.
+We believe this coincides with the results in \Cref{tbl:multiwoz_results} that our method performs better in inform and success rate, by providing more relevant key information. 
+There is no statistical significance in the fluency result (p > 0.05), which is expected given both models' comparable BLEU scores. Specifically, only 16\% of the dialogues have more than one annotator rating {MTTOD} as more fluent. We believe this is because many pre-trained LMs can already generate fluent texts, and it is often challenging for humans to notice the difference.
+
+\begin{table*}[!t]
+  \centering
+  \scalebox{0.725}{
+  \begin{tabular}{l*{12}{c}} % Simplified this for readability; adjust if you add/remove columns.
+     \toprule
+     \multirow{2}{*}{{Model}} & \multicolumn{4}{c}{{5\%}} & \multicolumn{4}{c}{{10\%}} & \multicolumn{4}{c}{{20\%}}\\
+     \cmidrule(lr){2-5} \cmidrule(lr){6-9} \cmidrule(lr){10-13}
+     & {Inform}& {Success} & {BLEU} & {Combined} & {Inform}& {Success} & {BLEU} & {Combined} & {Inform}& {Success} & {BLEU} & {Combined}\\
+     \midrule
+     MTTOD & 51.1 & 20.7 & 9.5 & 46.6 & 63.1 & 44.4 & 13.8 & 67.7 & 75.0 & 61.0 & 16.8 & 84.8\\
+     ft+KRLS & \textbf{55.0} & \textbf{22.7} & \textbf{11.5} & \textbf{50.3} & \textbf{64.8} & \textbf{47.4} & \textbf{15.4} & \textbf{71.9} & \textbf{78.9} & \textbf{65.0} & \textbf{17.2} & \textbf{89.2}\\
+     \bottomrule
+  \end{tabular}
+  }
+  \caption{MultiWoZ end-to-end response generation performance using 5\%, 10\%, and 20\% of training data. ``ft+KRLS'' refers to \emph{finetune+KRLS}. Both models use GODEL-base as backbone. Results are shown as mean values over three runs.}
+  \label{tbl:multiwoz_low_resource_full}
+\end{table*}
+\subsection{Low Resource Experiment}
+\label{sec:Low Resource Experiment}
+Since large and well-annotated dialogue datasets such as MultiWoZ \cite{multiwoz} is not easy to create in practice, we also investigate KRLS's performance under a low-resource regime. We use 5\%, 10\%, and 20\% of training data to train both baseline (\emph{MTTOD}) and \emph{finetune+KRLS}, and report their performance in \Cref{tbl:multiwoz_low_resource_full}. In \Cref{tbl:multiwoz_low_resource_full} we find our method outperforms the baseline in all settings. We also find large contributions often from improving inform and success scores, which indicates the effectiveness of KRLS at key token learning without abundant training data.
+
+\section{Ablation Studies}
+\label{sec:Ablation Study}
+\subsection{KRLS Algorithm Ablation}
+\label{subsec:KRLS Algorithm Ablation}
+Since KRLS effectively combines SL and RL, we illustrate the contribution of each component in \Cref{tbl:rl_cmp}. During \algo{SL Only} and \algo{RL Only}, we remove the RL training and SL training in KRLS, respectively. In \emph{SL+GOLD}, we replace our RL procedure with GOLD \cite{GOLD}, which is an offline and off-policy RL algorithm that learns from the gold demonstrations without any generation (see \Cref{sec:Ablation Study Setup: GOLD} for more details), so that we can also isolate the impact of additionally generating a sequence in our approach. Since GOLD uses Policy Gradient \cite{policy-gradient} without clipping, we do the same with KRLS here (denoted \algo{KRLS(PG)}).
+
+As shown in \Cref{tbl:rl_cmp}, using \algo{SL+GOLD} only achieved a similar performance as compared to \algo{SL Only}. We believe that this is because \algo{GOLD} only intends to learn from the gold responses, while KRLS(PG) also attempts to explore other sequences/tokens to reinforce its keyword learning. Additionally, if the SL objective is removed from KRLS when directly trained from backbone, the performance degrades as the assumption mentioned in \Cref{sec:RL with Next-word Sampling} becomes harder to satisfy (c.f. KRLS in \Cref{tbl:multiwoz_results}, and discussions in \Cref{sec:Training KRLS from Scratch}).\footnote{In our prior study, we also experimented with a simple alternative of only using weighted SL on key tokens, removing RL entirely. However, weighted SL only yields a minor improvement compared to the baselines, reaching a score of 101.2. KRLS using a similar reward function (\emph{Error}, see \Cref{sec:Per-Token Reward Function Ablation}) already achieves 102.5. We believe this is because KRLS rewards/penalizes generated tokens sampled from the model's distribution using RL, while SL only uses the gold tokens. This finding motivates KRLS to use RL with a reward function emphasizing on keyword learning.}
+
+\begin{table}[t]
+  \centering
+  \scalebox{0.85}{
+  \begin{tabular}{lcccc}
+    \toprule % Instead of \hline
+    {Algo} & {Inform} & {Success} & {Bleu} & {Total}\\
+    \midrule % Instead of \hline
+    SL Only & 86.0 & 77.4 & 18.9 & 100.6  \\
+    RL Only & 84.2 & 72.2 & 17.5 & 95.7 \\
+    \addlinespace[0.25em]
+    \hdashline
+    \addlinespace[0.25em]
+    SL+GOLD & 86.1 & 77.1 & 18.8 & 100.4 \\
+    KRLS(PG) & \textbf{88.7} & \textbf{78.7} & \textbf{19.1} & \textbf{102.8} \\
+    \bottomrule % Instead of \hline
+  \end{tabular}
+  }
+  \caption{KRLS Ablation Study. The first two are trained directly from the backbone, and the latter two are trained from a $\mathcal{L}_{\mathrm{SL}}$-finetuned checkpoint (see more details in \Cref{sec:Ablation Study Setup: GOLD}).}
+  \label{tbl:rl_cmp}
+\end{table}
+
+\subsection{Reward Function Ablation}
+\label{sec:Per-Token Reward Function Ablation}
+In \Cref{tbl:token_level_semantic_score_finetuned}, we empirically compare our proposed reward with 4 different reward functions and show that: a) providing a per-token reward in addition to providing a terminal reward for the entire sequence is helpful, and b) a fine-grained, context-aware reward that correctly factors in our generation procedure can further improve performance.
+
+In this experiment, we replace our proposed reward in \Cref{sec:Per-Token Reward Function} (denoted as \algo{Prob.} in \Cref{tbl:token_level_semantic_score_finetuned}) with the following alternatives: \algo{Zero}, which assigns a zero score to all generated tokens, hence only uses the terminal reward for training; 
+\algo{Error}, which assigns a hard penalty of $\pm \mu$ whenever the generated token is correct/incorrect; 
+\algo{BERTS.}, which uses the core mechanism in BERTScore \cite{BERTScore} to measure the semantic similarity between the generated tokens and the gold tokens (see \Cref{sec:BERTScore for KRLS} for more details); 
+\algo{Static.}, which takes the static, context-\emph{unaware} token embeddings from the embedding layer of GODEL-base and compute their cosine similarity as reward. In all cases, the same set of hyperparameters is used to make results more comparable.
+\begin{table}[t]
+  \centering
+  \scalebox{0.9}{
+  \begin{tabular}{l c c c c} 
+     \toprule
+     \multicolumn{5}{c}{{Finetune+KRLS}}\\
+     {Reward} & {Inform} & {Success} & {BLEU} & {Total}\\
+     \midrule
+     \emph{None} & 86.0 & 77.4 & 18.9 & 100.6  \\
+     Zero & 88.3 & 77.9 & {18.9} & 102.0\\
+     Error & 88.8 & 78.5 & 18.8 & 102.5\\
+     Static. & 88.7 & 78.4 & 18.8 & 102.4\\
+     BERTS. & 88.5 & 78.7 & {18.9} & 102.5\\
+     Prob.  & \textbf{89.2} & \textbf{80.3} & \textbf{19.0} & \textbf{103.8} \\
+     \bottomrule
+  \end{tabular}
+  }
+  \caption{KRLS using different per-token reward when trained from a finetuned checkpoint. \emph{None} refers to the baseline of training only with supervised learning.}
+  \label{tbl:token_level_semantic_score_finetuned}
+\end{table}
+
+As shown in \Cref{tbl:token_level_semantic_score_finetuned}, our proposed token-level reward (\algo{Prob.}) outperforms all other alternatives. Interestingly, all reward functions that specified a per-token reward (i.e. \algo{Error}, \algo{BERTS.}, \algo{Static.}, \algo{Prob.}) achieved improvements over \algo{Zero}, which only relies on the terminal reward. This indicates that a more fine-grained per-token reward function is helpful. Additionally, \algo{Prob.} improves upon \algo{Error}, \algo{BERTS.}, and \algo{Static.}, because it additionally factors in our generation procedure that the generated sequence is conditioned on the gold response. Therefore, it can also correctly capture the contextual relationship of the generated tokens.
+\section{Analysis}
+\label{sec:Analysis}
+\subsection{Keyword Learning}
+\label{subsec:Keyword Learning}
+Since KRLS aims to improve the model's ability to generate key information correctly, we track the model's accuracy in generating key tokens during training and validation. 
+In this experiment, we feed in the gold contexts up to the key tokens, and the model is tasked to generate the next token. 
+We then calculate the accuracy by measuring how often the generated token matches the gold key token.
+
+As shown in \Cref{fig:keyword_learning}, only performing SL (\algo{baseline}) leads to a slow increase in keyword generation accuracy during early training, as the model focuses on learning other non-key tokens due to their abundance. On the other hand, KRLS periodically uses RL to help the model focus on learning key tokens, which leads to a higher keyword generation accuracy throughout both training and validation (more details in \Cref{sec:Additional Keyword Learning Curves}).
+\begin{figure}[t!]
+  \centering
+  \includegraphics[scale=0.4]{./images/keyword_validation.png}%
+  \caption{Keyword generation accuracy during validation. \emph{Baseline} is trained with only supervised learning, $\mathcal{L}_{\mathrm{SL}}$. Both models are trained directly from backbone to additionally demonstrate the difference during early training.}
+  \label{fig:keyword_learning}
+  \vspace{2pt}
+\end{figure}
+\begin{table}[t]
+  \centering
+  \scalebox{0.9}{
+  \begin{tabular}{l c c c c} 
+     \toprule
+     {Algo} & {Inform} & {Success} & {BLEU} & {Total}\\
+     \midrule
+     KRLS & {89.2} & {80.3} & {19.0} & {103.8}\\
+     \, +DST & {93.1} & {83.7} & {19.1} & {107.5}\\
+     \, +Both & {93.5} & {90.9} & {29.8} & {122.0}\\
+     \addlinespace[0.21em]
+     \hdashline
+     \addlinespace[0.21em]
+     \emph{Train} & 93.7& 90.9 & - & -  \\
+     \midrule
+  \end{tabular}
+  }
+  \caption{Test performance of KRLS when generating with Gold Dialog State (+DST), and with both Gold Dialog State and Gold System Act (+Both). \emph{Train} is the performance of the training dataset. Note that +DST is the same as the ``policy optimization'' task.}
+  \label{tbl:using_gold}
+\end{table}
+\subsection{Error Analysis}
+\label{subsec:Error Analysis}
+Despite reaching a higher inform rate and success rate as more key tokens are generated correctly, we still observe responses that miss some key tokens. We found that these errors often originate from incorrectly generated dialog states and system acts (see \Cref{sec:KRLS Error Examples} for examples). This is understandable, as we only used KRLS to improve the response generation component. 
+
+To quantify these errors, we additionally use our KRLS-trained model to generate responses when a) the gold dialog state is provided (\algo{+DST}) and b) both the gold dialog state and the gold system action are provided (\algo{+Both}). We present this result in \Cref{tbl:using_gold}, and found that \algo{+DST} improved the overall score by nearly 4 points, and \algo{+Both} further improved the overall score by 14.5 points, almost reaching the performance of the training dataset\footnote{
+In MultiWoZ, the training dataset includes human errors, hence does not have a perfect inform/success score. Validation/test datasets are hand-picked to only include successful dialogs, so that model performance can be fairly evaluated.}. 
+This shows that much error remains in the DST and system act generation process, so the overall performance can further increase if techniques to separately improve DST and system act generation (e.g., \citet{mars}) can be combined with KRLS. We leave this for future work.
+\section{Related Work}
+\label{sec:Related Work}
+
+End-to-end dialog systems such as \citet{e2e-tod,ubar,mttod,galaxy} have shown promising results in TOD benchmarks such as \dataset{MultiWoZ}. However, as the standard SL objective does not directly account for TOD metrics such as task success rate, much recent work seeks to incorporate RL techniques to improve TOD performance. In this section, we discuss related applications of RL in TOD, as well as other non-RL-based approaches that have similarities in concept.
+
+\textbf{RL for Text Generation}
+\citet{mixer, deep-rl-for-gen, mix-on-and-off-policy, rl4lm} applies RL to text generation tasks by treating each word as an action and then uses auto-regressive generation to explore high-reward sequences.
+This results in a large action space for exploration, and these work focuses on methods to stabilize the training process. In principle, these approaches can be modified for TOD tasks, but they would still generally use a user simulator and/or the slow auto-regressive generation step.
+
+\textbf{RL for Policy Planning}
+Many direct applications of RL in TOD focus on optimizing dialog policy planning \cite{multiagent-nlp, jotus, lava}. \citet{multiagent-nlp, jotus} jointly optimize both a user system and a dialog system to improve a model's TOD task performance and/or domain adaptation ability, but could be resource intensive as additional user-side training is needed.
+Alternatively, \citet{lava, rethink_action} uses RL to optimize system action generation in a latent space, but tends to result in the model generating very short responses (i.e., a low BLEU score of 10.8 in \dataset{MultiWoZ}). 
+
+\textbf{Offline RL in TOD}
+Many offline RL applications in TOD consider an actor-critic type algorithm \cite{gptcritic, chai}, which involves using a critic to choose better responses among several generated candidates. These approaches tend to be vulnerable to errors made by the critic model (especially for OOD actions \cite{offline-rl-overview}), and is resource intensive as multiple auto-regressive generations are needed per episode.
+Alternatively, \citet{GOLD} proposes the GOLD algorithm, which uses policy-gradient based method in an off-policy setting, by learning solely from the gold demonstrations without any generation/exploration. KRLS additionally performs sequence generations and utilizes gold demonstrations in computing the reward function (also see \Cref{subsec:KRLS Algorithm Ablation} for an empirical comparison). 
+
+\textbf{Other Notable Related Techniques} 
+\citet{kun-meta-learning} utilizes a student-teacher architecture and MAML \cite{MAML} to improve domain adaptation ability of the student model. Specifically, the teacher model provides weights to scale the NLL loss of each gold token when training the student model. In this aspect, this is similar to GOLD, performing a ``weighted learning'' on the gold demonstrations. KRLS aims to directly improve TOD performance and achieves this by utilizing RL to perform a ``weighted learning'' on generated tokens.
+
+\section{Conclusion}
+\label{sec:Conclusion}
+In this work, we explore an approach to utilize RL to improve a model's TOD performance, but also to avoid using a user-simulator or the slow auto-regressive generation process. 
+We propose the Keywords Reinforcement with Next-word Sampling (KRLS) training algorithm, which combines offline RL with a fast sequence generation scheme that directly samples from next-word distributions after supervised training, and a fine-grained per-token reward function that measures the importance and semantic closeness of each generated token. We then evaluate KRLS on the MultiWoZ dataset and show that a) it can help improve E2E response generation performance, reaching new state-of-the-art in the inform rate, success rate, and combined score; b) it can be trained 15\% faster than using a standard RL algorithm that performs auto-regressive generation during training/exploration.
+\section{Limitations}
+\label{sec:Limitations}
+Although KRLS is faster to train as it avoids auto-regressive generation, it is difficult for the model to learn/generate sequences significantly different from the gold examples in the dataset. Therefore, this could limit the potential to achieve performance better than the training dataset itself.
+
+Additionally, since during training KRLS creates sequences by conditioning on the gold response, whereas at inference we use auto-regressive generation, the problem of compounding generation error (exposure bias) is re-introduced \cite{ss-for-prediction, DAD, mixer}. Therefore, in this aspect KRLS trades its faster training speed with certain benefits brought by standard RL training in NLP. In the future, it would be worthwhile to explore if a more fine-grained trade-off can be found between an efficient sequence exploration strategy and those benefits inferred by using auto-regressive generation.
+
+Next, to make KRLS have minimal requirements of extra resources, we avoid using user simulators and perform offline RL training at turn-level. As a result, KRLS does not perform exploration/planning on a dialog-level, which can be very useful for tasks that require long-horizon planning to be successful (e.g., persuading a person to donate to a charity \cite{p4g}). We believe one way to extend KRLS could be using a GPT-like model to learn from an entire dialog, and combine with safe policy improvement methods to avoid potentially large bias and poor sample efficiency during dialog-level RL learning \cite{caspi}. We leave this for future work.
+
+Finally, in our runtime experiments (\Cref{subsec:Main Results}) we found that performing PPO (as well as PG) is a significant bottleneck, taking up more than half of the total training time. Future work may wish to consider ways to improve the speed/memory efficiency\footnote{
+In our implementation, we noticed that certain computations could be cached to save time. However, we found it infeasible in our setting due to limited GPU memory. Future work may also investigate ways to improve memory efficiency in our implementation, to allow for potential speedups.
+} of computing those RL objectives to further reduce training time.
+\section{Ethical Considerations}
+Our work describes an algorithm to improve a model's TOD performance and to expedite the training process. It is aimed at making current TOD systems easier to train, and also better at helping users to achieve their goals.
+
+Generally, while most algorithms are not designed for unethical usage, there is often potential for abuse in
+their applications. In our experiments, we apply KRLS on the MultiWoZ \cite{multiwoz} dataset, to improve performance on tasks such as restaurant booking and hotel reservation. However, because TOD training algorithms are typically task-agnostic, it is possible to use them for unethical tasks, such as scamming. We do not condone the use of KRLS for any unlawful or morally unjust purposes.
+
+Additionally, since our experiments use pre-trained language models, another concern is on their (in)ability to generate safe, respectful content \cite{challenges-detoxifying, realtoxicityprompts}. Our work specifically focuses on improving TOD performance, and hence we caution users against any potential unsafe/toxic/offensive responses generated from the models. 
+Without safety guardrails such as \citet{director, quark}, we do not advocate using any of our trained models in production settings.
+
+\clearpage
+\appendix
+
+\section{KRLS RL Details}
+\label{sec:KRLS RL Details}
+To avoid high variance during policy gradient:
+\[
+\nabla \mathcal{L}(\theta) = -G_t \nabla \log p_\theta(x_t|c)
+\]
+we consider a clipped version of this objective, borrowing from proximal policy gradient (PPO) \cite{PPO} to provide a more stable training and prevent the policy from moving too far away from the pretrained language model. Similar to \citet{TextGAIL}, we consider optimizing the following surrogate objective:
+\begin{equation}\label{eq:ppo}
+  \mathcal{L}_{\mathrm{RL}}=-\min \begin{cases}
+  r(\theta) \hat{A}_t,\\
+  \mathrm{clip}(r(\theta), 1-\epsilon, 1+\epsilon) \hat{A}_t,
+  \end{cases}
+\end{equation}
+where $\hat{A}_t = -V_\theta(s_t) + \sum_{l}\gamma^l r_{t+l}$ is the advantage function \cite{gae}, $\epsilon$ is the clipping parameter, and $r(\theta)$ is the ratio of the new policy to the old policy $p_\theta^{\mathrm{old}}$:
+\begin{equation}
+  x^{\mathrm{gen}} \sim p_\theta(x|c), \quad r(\theta) = \frac{p_\theta(x^{\mathrm{gen}}|c)}{p_\theta^{\mathrm{old}}(x^{\mathrm{gen}}|c)}
+\end{equation}
+In practice, we found that adding additional value function heads $V_\theta$ would 1) increase model size, making it difficult to train under our GPU setting and 2) since KRLS training is performed over a limited number of epochs (\Cref{sec:KRLS Hyperparameters}), we found fitting a small value function head can result in high variance during training. As such, we fixed the value function to be zero and used the return as an estimate $\hat{A}_t \approx \sum_{l}\gamma^l r_{t+l} = G_t$, which also signals the model the correct tokens to generate. We note that according to \citet{gae} page 4, $G_t$ is a $\gamma$-just advantage estimator for $\hat{A}_t$.
+
+For simplicity, we refer ``KRLS'' to use this clipped policy gradient objective unless explicitly mentioned otherwise. 
+\section{KRLS using PPO v.s. PG}
+\label{sec:KRLS PPO v.s. PG}
+As shown in \Cref{tbl:rl_backbone_cmp}, we found that using the clipped objective (\Cref{eq:ppo}) in KRLS can achieve better performance as compared to simple PG, which can cause high gradient variance \cite{TRPO,TextGAIL} during training. We believe that this is also due to the clipped objective preventing the new policy $p_\theta$ to move too far away from the old policy, which is useful in our approach as we approximated sequence generation by ``sampling'' from the gold response. Therefore, we believe that being more pessimistic \cite{PPO} about each $\theta$ update can be beneficial in our setting.
+\begin{table}[!h]
+  \centering
+  \scalebox{0.9}{
+  \begin{tabular}{l c c c c} 
+     \hline
+     \multicolumn{5}{c}{Finetune+KRLS}\\
+     RL Algo & {Inform} & {Success} & {BLEU} & {Total}\\
+     \midrule
+     PG & {88.7} & {78.7} & \textbf{19.1} & {102.8} \\
+     PPO & \textbf{89.2} & \textbf{80.3} & {19.0} & \textbf{103.8}  \\
+     \bottomrule
+  \end{tabular}
+  }
+  \caption{Performance comparison when training KRLS with Policy Gradient (PG) and a clipped version (PPO).}
+  \label{tbl:rl_backbone_cmp}
+\end{table}
+\section{Modeling Details}
+\label{sec:Modeling Details}
+We use a GODEL-base model as backbone, which is an encoder-decoder architecture like T5-base, with $\sim$220M parameters. Similar to MTTOD, an additional decoder is initialized for response generation (the other decoder for DST), which results in an additional $\sim$160M parameters. The encoder is shared for both DST and response generation. This results in a total model size of $\sim$380M parameters.
+
+\section{Implementation and Training Details}
+\label{sec:Implementation and Training Details}
+For all experiments (including (re)training MTTOD), we use Adam \cite{adam} for optimization, a linear schedule with an initial learning rate of $5e^{-5}$ and warm-up steps $=0.2\times$total training steps.
+
+For \algo{Baseline}, we re-train MTTOD \cite{mttod} using publicly released code and the best set of hyperparameters reported by the author.
+
+For \algo{KRLS} and \algo{finetune+KRLS}, we pick the best set of hyperparameters (see \autoref{sec:KRLS Hyperparameters} for details) using grid search. As task success and inform rate in MultiWoZ is highly correlated with correctly generating the predefined set of informable/requestable slot values such as ``[value\_address]'' in the response, we use $\mu=5$ for those key tokens and $\mu=1$ for others. In addition, we add a terminal reward by measuring the F1-score of generated key tokens compared to the gold key tokens (see \autoref{fig:KRLS_reward}) to measure overall performance in keywords generation. 
+Note that we did not add a BLEU score for terminal reward, as we found the SL training in KRLS is sufficient.
+
+\section{KRLS Hyperparameters}
+\label{sec:KRLS Hyperparameters}
+For the reported results of KRLS in MultiWoZ, we use $k=3$, $\kappa=0.5\times \text{total steps per epoch}$, sampling temperature during generation $\tau=1.1$, top-p during generation of 0.9, terminal reward scale of 5, learning rate of 5e$^{-5}$, learning rate decay of $0.2\times \text{total steps in training}$, and batch size of 4. When trained from a $\mathcal{L}_{\mathrm{SL}}$-finetuned checkpoint, we additionally add a regularization term using KL divergence (against the baseline model) with a weighting of 0.01 to reduce over-optimization on the reward function \cite{instructGPT, rl4lm, offline-with-kl}. During testing, we used auto-regressive generation with greedy decoding (same as \citet{mttod}).
+
+All of our experiments are run on a single GPU, NVIDIA RTX A4000. Running KRLS on a $\sim$380M encoder-decoder model (see \Cref{sec:Modeling Details}) for 4 epochs takes about one day, as it consists of 306 min/epoch for training and 32 min/epoch for validation.
+\section{KRLS Sampled Response Examples}
+\label{sec:KRLS Sampled Response Examples}
+We provide example comparisons between our generated response using next-word sampling (\algo{SAMPLED}), and responses produced with auto-regressive generation (\algo{GENERATED}) in \Cref{fig:gen_vs_sample_1}, \Cref{fig:gen_vs_sample_2}, and \Cref{fig:gen_vs_sample_3}. All examples are generated from a $\mathcal{L}_{\mathrm{SL}}$-finetuned checkpoint. For short responses, we observe that \algo{GENERATED} are similar to \algo{SAMPLED}. When responses get longer, \algo{SAMPLED} responses become less similar to the \algo{GENERATED} ones.
+
+When the model is not yet $\mathcal{L}_{\mathrm{SL}}$-finetuned on the dataset, \emph{SAMPLED} responses tend to repeat keywords and can hardly be interpreted as a sequence. For example, given the input context in \Cref{fig:gen_vs_sample_1}, a sampled response looks like: "[value\_stay] [welcome] [value\_stay] [value\_arrive] [taxi] [train] [value\_stay] [value\_stay] [value\_stay] [value\_stay] [value\_stay]".
+\section{BERTScore for KRLS}
+\label{sec:BERTScore for KRLS}
+To apply BERTScore in our setting, we first treat our sampled sequence as a standalone generated sequence, and use the cosine similarity between the embedding of each pair of token $x^{\mathrm{gen}}_t, x^{\mathrm{gold}}_t$ after passing through a $\mathcal{L}_{\mathrm{SL}}$-finetuned GODEL-base as rewards. Note that as we naturally have a one-to-one mapping between the generated and gold sequences, we can skip the maximal similarity matching step.
+
+However, as shown in both \Cref{tbl:token_level_semantic_score_finetuned} and \Cref{tbl:token_level_semantic_score}, \algo{BERTS.} does not perform as well as \algo{Prob.}. This is because BERTScore is designed to measure the semantic similarity between two standalone sentences, while in our setting the generated sequence is conditioned on the gold response. Therefore, in cases when many generated tokens are incorrect, viewing the sampled sequence as a standalone generated sentence will distort each token's contextual meaning, leading to sub-optimal performance.
+\begin{figure}[!h]
+  \centering
+  \includegraphics[width=0.99\linewidth]{./images/rlonly_vs_rlm.png}
+  \caption{Validation performance of \algo{KRLS} and \algo{RL Only} over time. In \algo{RL Only}, we remove the SL objective from KRLS, and for each sampled episode we additionally append its corresponding gold response.}
+  \label{fig:rl_only_vs_krls}
+\end{figure}
+\begin{table}[h]
+  \centering
+  \scalebox{0.9}{
+  \begin{tabular}{l c c c c} 
+     \toprule
+     Algo & {Inform} & {Success} & {BLEU} & {Total}\\
+     \midrule
+     SL only& 86.0 & 77.4 & 18.9 & 100.6\\
+     RL only& 84.2 & 72.2 & 17.5 & 95.7\\
+     KRLS & \textbf{87.3} & \textbf{78.3} & \textbf{19.2} & \textbf{102.0} \\
+     \bottomrule
+  \end{tabular}
+  }
+  \caption{Performance of individual components of the KRLS Algorithm when trained directly from backbone.}
+  \label{tbl:ablation_study_large}
+\end{table}
+\section{KRLS Directly from Backbone}
+\label{sec:Training KRLS from Scratch}
+
+In \Cref{tbl:ablation_study_large}, we present the results when training directly from from the backbone. \algo{SL only} refers to the baseline of only training with SL objective. \algo{RL Only} refers to the KRLS algorithm with SL objective removed. \algo{KRLS} refers to the full KRLS algorithm. When trained directly from backbone, removing the SL objective (\algo{RL Only}) degrades the performance as the assumption mentioned in \Cref{sec:RL with Next-word Sampling} becomes harder to satisfy especially during early training (see \Cref{fig:rl_only_vs_krls}). This is sensible because, without prior SL training, many sequences generated from our sampling method can be highly different from the auto-regressive generated ones. When SL training is included in KRLS, the overall performance improves by 1.4 points, as the additional SL training makes it easier to satisfy our assumption and also made training much smoother (see \Cref{fig:rl_only_vs_krls}).
+\section{Additional Keyword Learning Curves}
+\label{sec:Additional Keyword Learning Curves}
+
+In addition to the keyword generation accuracy during validation when trained directly from backbone (see \Cref{subsec:Keyword Learning}), in this section we also show: a) keyword generation accuracy when trained during both training and validation in \Cref{fig:keyword_learning_both}; b) overall generation accuracy learning curves in \Cref{fig:overall_learning}; c) keyword and overall generation accuracy curves when trained from a $\mathcal{L}_{\mathrm{SL}}$-finetuned checkpoint in \Cref{fig:finetune_keyword_overall_learning}. 
+Overall generation accuracy is measured by how often a generated token $x_t^{\mathrm{gen}}|x^{\mathrm{gold}}_{1:t-1},c$ matches the ground truth $x_t^{\mathrm{gold}}$, whether $x_t^{\mathrm{gold}}$ is a key token or a non-key token. Keyword generation accuracy only performs the above comparison when the ground truth token is a key token. 
+
+As shown in \Cref{fig:keyword_learning_both}, KRLS can achieve higher keyword generation accuracy than baseline during both training and validation. We believe this is because the RL component in KRLS, especially during the early stages of training, can help the model also learn the less abundant but more important keywords as it has a higher reward. As a result, in \Cref{fig:overall_learning}, KRLS training can also achieve a higher overall generation accuracy.
+
+When trained from a $\mathcal{L}_{\mathrm{SL}}$-finetuned checkpoint as shown in \Cref{fig:finetune_keyword_overall_learning}, KRLS further increases its keyword generation accuracy. However, in \Cref{fig:finetune_overall_validation}, the overall generation accuracy is similar to a $\mathcal{L}_{\mathrm{SL}}$-finetuned \algo{baseline}. We believe this is because, after the model has learned to generate most of the tokens correctly, it needs to maintain a balance between over-generating keywords (lower overall accuracy) and correctly generating the keywords (higher keyword generation accuracy).
+
+\section{RL with Auto-Regressive Gen. Setup}
+\label{sec:RL with Auto-Regressive Gen. Setup}
+In \Cref{subsec:Main Results}, we compared the training time between normal RL with auto-regressive generation, and our KRLS algorithm. As KRLS has an additional SL step during training, we removed this component to provide a fairer comparison against the normal RL procedure, which usually only includes an auto-regressive sequence generation step during experience collection and PPO training. However, after auto-regressive generation, the generated tokens no longer have a one-to-one mapping to the gold response. Therefore, in this setting we used a zero reward for each token, and a terminal reward of keywords $F_1$ (same as KRLS) as well as a BLEU score (as SL training is removed).
+
+In addition to a faster training speed as shown in \Cref{subsec:Main Results}, we found that our approach can also reach a better overall performance in \Cref{tbl:normal_rl_vs_krls} when trained from a $\mathcal{L}_{\mathrm{SL}}$-finetuned checkpoint for 4 epochs. We believe that this is because, without a fine-grained per-token reward, \algo{RL} might need many more epochs to figure out the importance of those keywords.
+\begin{table}[h]
+  \centering
+  \scalebox{0.9}{
+  \begin{tabular}{l c c c c} 
+     \toprule
+     Algo & {Inform} & {Success} & {BLEU} & {Total}\\
+     \midrule
+     RL   & 88.5 & 79.3 & 18.8 & 103.1\\
+     KRLS & \textbf{89.2} & \textbf{80.3} & \textbf{19.0} & \textbf{103.8} \\
+     \bottomrule
+  \end{tabular}
+  }
+  \caption{Test performance when trained from a $\mathcal{L}_{\mathrm{SL}}$-finetuned checkpoint for 4 epochs. \algo{RL} refers to removing the SL step in KRLS, and replacing sequence ``sampling'' step with auto-regressive generation.}
+  \label{tbl:normal_rl_vs_krls}
+\end{table}
+\section{Ablation Study Setup: GOLD}
+\label{sec:Ablation Study Setup: GOLD}
+GOLD \cite{GOLD} is an offline, off-policy RL algorithm that directly learns from the gold examples in the dataset without any generation step. As the RL component in KRLS is also an offline RL algorithm, we compared KRLS to {GOLD} in \Cref{subsec:KRLS Algorithm Ablation}.
+
+To implement {GOLD} in our experiments, we followed the descriptions in \citet{GOLD}, and replaced the RL component in KRLS with {GOLD}. We denoted this as \algo{SL+GOLD} in \Cref{tbl:rl_cmp}. 
+Additionally, as {GOLD} uses the simple policy gradient (PG), for a fair comparison we also replaced our PPO objective with PG in KRLS in this experiment. Finally, we kept our per-token reward function $\mathcal{R}$ in \algo{SL+GOLD}, as the reward function proposed by \citet{GOLD} is aimed at optimizing other metrics such as perplexity.
+
+\section{Proof of SL Equivalence}
+\label{sec:Proof of SL Equivalence}
+
+Applying our definition of $\mathcal{R}$ (see \Cref{sec:Per-Token Reward Function}) in \autoref{eq:real_policy_gradient} we get, \emph{if $x^{\mathrm{gen}} = x^{\mathrm{gold}}$ is generated correctly and corresponds to $\mathcal{R}=1$}, and with the discount factor $\gamma=0$:
+\[
+\nabla \mathcal{L}(\theta) \propto -\nabla \log p_\theta(x^{\mathrm{gen}}|c)
+\] 
+this gives the same gradient as the traditional supervised learning for SL in \autoref{eq:lm_loss}.
+\section{Effect of $\kappa,\mu$ and $k$ in KRLS}
+\label{sec:Effect of kappa and mu in KRLS}
+We empirically tested a range of hyperparameters for KRLS, including $\kappa \in \{0.1, 0.5, 1.0\} \times$ steps per epoch, $\mu \in \{2, 5, 10\}$, and $k \in \{1,3,5\}$. We present the results in \Cref{tbl:effect_of_kappa_and_mu} and \Cref{tbl:effect_of_k}.
+\begin{table}[th]
+  \centering
+  \begin{tabular}{l c c c} 
+     \toprule
+     \multicolumn{4}{c}{Finetune+KRLS}\\
+      & $\mu=2.0$ & $\mu=5.0$ & $\mu=10.0$\\
+     \midrule
+     $\kappa=0.1 n$   & 102.2 & 102.4 & 102.3 \\
+     $\kappa=0.5 n$   & 103.3 & 103.8 & 103.8 \\
+     $\kappa=1.0 n$   & 102.3 & 102.1 & 102.5 \\
+     \bottomrule
+  \end{tabular}
+  \caption{Effect of different $\kappa$ and $\mu$ on the combined score in MultiWOZ. $n$ represents the number of training steps in an epoch.}
+  \label{tbl:effect_of_kappa_and_mu}
+\end{table}
+\begin{table}[th]
+  \centering
+  \begin{tabular}{l c c c} 
+      \toprule
+     \multicolumn{4}{c}{Finetune+KRLS}\\
+      & $k=1$ & $k=3$ & $k=5$\\
+     \midrule
+     $\kappa=0.1n,$ &\multirow{2}{*}{102.9} & \multirow{2}{*}{103.8} & \multirow{2}{*}{102.8} \\
+     $\mu=5.0$ &  &  &  \\
+     \bottomrule
+  \end{tabular}
+  \caption{Effect of different $k$ on the combined score in MultiWOZ. $n$ represents the number of training steps in an epoch.}
+  \label{tbl:effect_of_k}
+\end{table}
+
+\section{Additional Reward Function Ablation}
+\label{sec:Additional Reward Function Ablation}
+We additionally show the effect of several per-token reward functions in our KRLS algorithm when trained directly from backbone (hence the assumption mentioned in \Cref{sec:RL with Next-word Sampling} is harder to satisfy). As shown in \Cref{tbl:token_level_semantic_score}, all variants using KRLS still achieved improvement from baseline (also see \Cref{fig:keyword_learning_both} and \Cref{fig:overall_learning}). Specifically, \algo{Zero} reward and \algo{Prob.} reward achieved the highest and second highest, with 102.2 and 102.0 as Combined Score, respectively.
+\begin{table}[!th]
+  \centering
+  \begin{tabular}{l c c c c} 
+     \toprule
+     \multicolumn{5}{c}{KRLS}\\
+     Reward & {Inform} & {Success} & {BLEU} & {Total}\\
+     \midrule
+     \emph{None} & 86.0 & 77.4 & 18.9 & 100.6  \\
+     Zero & 87.7 & 78.6 & 19.0 & 102.2\\
+     Error & 86.2 & 78.6 & 19.2 & 101.6\\
+     BERTS. & 87.2& 78.1 & 19.0 & 101.7\\
+     Static. & 87.2 & 77.6 & 19.3 & 101.7\\
+     Prob.   & {87.3} & {78.3} & {19.2} & {102.0} \\
+     \bottomrule
+  \end{tabular}
+  \caption{Performance of Training Directly from Backbone with KRLS using Different per-token Reward}
+  \label{tbl:token_level_semantic_score}
+\end{table}
+
+\section{KRLS Error Examples}
+\label{sec:KRLS Error Examples}
+We present three examples in \Cref{fig:error_1}, \Cref{fig:error_2}, and \Cref{fig:error_3} when KRLS trained model does not generate the required key tokens. We observe that in most cases, error originates from incorrectly generated system action and dialog state. This hints at a direction for further improvement in lines of making dialog state and system action generation more robust \cite{mars}.
+\begin{figure*}[!t]
+  \centering
+  \subfigure[Keyword Learning during Training]{%
+      \label{fig:keyword_learning_training}%
+  \includegraphics[scale=0.54]{./images/keyword_training.png}}%
+  \qquad
+  \subfigure[Keyword Learning Validation]{%
+      \label{fig:keyword_learning_validation}%
+  \includegraphics[scale=0.4]{./images/keyword_validation.png}}%
+  \caption{Keyword Generation Accuracy during Training and Validation. \emph{Baseline} is the standard SL training using $\mathcal{L}_{\mathrm{SL}}$. Both baseline and KRLS are directly trained from backbone.}
+  \label{fig:keyword_learning_both}
+\end{figure*}
+\begin{figure*}[!h]
+  \centering
+  \subfigure[All Tokens Learning during Training]{%
+      \label{fig:overall_training}%
+  \includegraphics[scale=0.54]{./images/overall_training.png}}%
+  \qquad
+  \subfigure[All Tokens Learning Validation]{%
+      \label{fig:overall_validation}%
+  \includegraphics[scale=0.4]{./images/overall_validation.png}}%
+  \caption{All Token Generation Accuracy during Training and Validation. \emph{Baseline} is the standard SL training using $\mathcal{L}_{\mathrm{SL}}$. Both baseline and KRLS are directly trained from backbone.}
+  \label{fig:overall_learning}
+\end{figure*}
+\begin{figure*}[!h]
+  \centering
+  \subfigure[Key Tokens Learning Validation]{%
+      \label{fig:finetune_keyword_validation}%
+  \includegraphics[scale=0.4]{./images/finetune_keyword_validation.png}}%
+  \qquad
+  \subfigure[All Tokens Learning Validation]{%
+      \label{fig:finetune_overall_validation}%
+  \includegraphics[scale=0.4]{./images/finetune_overall_validation.png}}%
+  \caption{Key and All Token Generation Accuracy during Training and Validation. \emph{Baseline} is the standard SL training using $\mathcal{L}_{\mathrm{SL}}$. \algo{finetunt+KRLS} is trained from a $\mathcal{L}_{\mathrm{SL}}$-finetuned checkpoint, i.e. \algo{Baseline}.}
+  \label{fig:finetune_keyword_overall_learning}
+\end{figure*}
+\begin{figure*}[]
+  \centering
+  \includegraphics[scale=0.7]{./images/gen_vs_sample_1.pdf}
+  \caption{Example sequence generated by KRLS. Texts in black are the user's utterances. \algo{GOLD} represents the gold response. \algo{GENERATED} represents response produced using auto-regressive generation. \algo{SAMPLED} represents response produced using the next-word sampling method in KRLS.}
+  \label{fig:gen_vs_sample_1}
+\end{figure*}
+\begin{figure*}[]
+  \centering
+  \includegraphics[scale=0.7]{./images/gen_vs_sample_2.pdf}
+  \caption{Example sequence generated by KRLS. Texts in black are the user's utterances. \algo{GOLD} represents the gold response. \algo{GENERATED} represents response produced using auto-regressive generation. \algo{SAMPLED} represents response produced using the next-word sampling method in KRLS.}
+  \label{fig:gen_vs_sample_2}
+\end{figure*}
+\begin{figure*}[]
+  \centering
+  \includegraphics[scale=0.7]{./images/gen_vs_sample_3.pdf}
+  \caption{Example sequence generated by KRLS. Texts in black are the user's utterances. \algo{GOLD} represents the gold response. \algo{GENERATED} represents response produced using auto-regressive generation. \algo{SAMPLED} represents response produced using the next-word sampling method in KRLS.}
+  \label{fig:gen_vs_sample_3}
+\end{figure*}
+\clearpage
+\begin{figure*}[!t]
+    \centering
+    \includegraphics[scale=0.7]{./images/error_1.pdf}
+    \caption{KRLS Generation Error Example 1. Texts in black are the input context, in blue are the generated tokens, and in yellow/gold are the ground truth. Texts highlighted in red are incorrect/missing key tokens compared to the ground truth.}
+    \label{fig:error_1}
+\end{figure*}
+\begin{figure*}[]
+  \centering
+  \includegraphics[scale=0.7]{./images/error_2.pdf}
+  \caption{KRLS Generation Error Example 2. Texts in black are the input context, in blue are the generated tokens, and in yellow/gold are the ground truth. Texts highlighted in red are incorrect/missing key tokens compared to the ground truth.}
+  \label{fig:error_2}
+\end{figure*}
+\begin{figure*}[]
+  \centering
+  \includegraphics[scale=0.7]{./images/error_3.pdf}
+  \caption{KRLS Generation Error Example 3. Texts in black are the input context, in blue are the generated tokens, and in yellow/gold are the ground truth. Texts highlighted in red are incorrect/missing key tokens compared to the ground truth.}
+  \label{fig:error_3}
+\end{figure*}
+
+\end{document}

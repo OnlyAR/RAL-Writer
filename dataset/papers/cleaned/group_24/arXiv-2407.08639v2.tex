@@ -1,0 +1,390 @@
+\title{A Novel Approach to Direct Preference Optimization: Dynamic $\beta$ and Quality-Aware Data Filtering}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+Direct Preference Optimization (DPO) has emerged as a compelling approach for training Large Language Models (LLMs) to adhere to human preferences. However, the performance of DPO is sensitive to the fine-tuning of its trade-off parameter $\beta$, as well as to the quality of the preference data. We analyze the impact of $\beta$ and data quality on DPO, uncovering that optimal $\beta$ values vary with the informativeness of pairwise data. Addressing the limitations of static $\beta$ values, we introduce a novel framework that dynamically calibrates $\beta$ at the batch level, informed by data quality considerations. Additionally, our method incorporates $\beta$-guided data filtering to safeguard against the influence of outliers. Through empirical evaluation, we demonstrate that our dynamic $\beta$ adjustment technique significantly improves DPO's performance across a range of models and datasets, offering a more robust and adaptable training paradigm for aligning LLMs with human feedback. The code is available at \url{https://github.com/junkangwu/beta-DPO}.
+\end{abstract}
+
+\section{Introduction}
+\label{Introduction}
+The alignment of Large Language Models (LLMs) with human feedback, as explored in works like GPT-4 and LLaMA-2 \cite{GPT4,llama2,GPT4_2}, has marked a significant advancement in generating responses that are more helpful, factual, and ethical \cite{instructGPT}. Among the various alignment strategies, Reinforcement Learning from Human Feedback (RLHF) \cite{instructGPT} is a notable method that refines LLMs using the Proximal Policy Optimization (PPO) algorithm \cite{PPO}. This approach employs a KL divergence penalty to ensure minimal deviation of the model from its original configuration, ensuring the retention of its initial characteristics while improving alignment.
+
+Despite the effectiveness, RLHF's instability and computational requirements often limit its practical applications, prompting the exploration of alternatives like Direct Preference Optimization (DPO) \cite{DPO}. DPO circumvents the reinforcement learning loop by exploiting the inherent connection between reward functions and optimal policies, thereby simplifying the policy model training. It encourages the model to favor the response that aligns with human preferences ($\yb_{w}$) over the dispreferred ($\yb_{l}$), \wjc{implying DPO's sensitivity to the quality of pairwise data}. 
+The balance between maintaining the original reference model ($\pi_{\text{ref}}$) and incorporating new preferences ($\pi_{\btheta}$) is controlled by a $\beta$ hyperparameter, whose lower values advocate for aggressive updates and higher values support more conservative adjustments:
+\begin{align*}
+    \ell_{\text{DPO}}(\btheta)=\EE_{\xb,\yb_{w},\yb_{l}} [-\log \sigma \big(
+    \beta \big[
+    \log \big(\frac{\pi_{\btheta}(\yb_{w}|\xb)}{\pi_{\text{ref}}(\yb_{w}|\xb)}\big)
+    -
+    \log \big(\frac{\pi_{\btheta}(\yb_{l}|\xb)}{\pi_{\text{ref}}(\yb_{l}|\xb)}\big)
+    \big]
+    \big)].
+\end{align*}
+However, the current DPO literature has largely overlooked the joint influence of $\beta$ selection and pairwise data $(\yb_{w}, \yb_{l})$'s quality on the alignment performance.
+\wjc{To bridge this gap, we conduct a preliminary experiment to investigate how different $\beta$ selections influence the model performance under two distinct data pair gap conditions, as shown in Figure \ref{fig_1_2}.}
+In \emph{low gap} scenarios (\cf Figure \ref{fig_1_1}),
+where the difference between preferred and dispreferred samples is minor, an increase in $\beta$ (\eg from 0.1 to 0.5) corresponds with a decline in win rate (\eg from 42\% to 33\%).
+Conversely, in \emph{high gap} situations (\cf Figure \ref{fig_1_1})
+where a significant difference exists, an increase in $\beta$ tends to improve DPO performance.
+\wjc{Such contrasting outcomes highlight the necessity to tailor the $\beta$ value contingent upon the data quality, especially in the presence of outliers \cite{outlier_dataset}.}
+\begin{figure}
+    \centering
+    \begin{subfigure}{.65\textwidth}
+      \centering
+      \includegraphics[width=\linewidth]{figs/first_fig_a.pdf}
+      \caption{} % 你可以在这里添加子图标题
+      \label{fig_1_1}
+    \end{subfigure}%
+    \hfill % 这会在子图之间添加一些空间
+    \begin{subfigure}{.3\textwidth}
+      \centering
+      \includegraphics[width=\linewidth]{figs/NeurIPS_first_fig.pdf}
+      \caption{} % 同样，为第二个子图添加标题
+      \label{fig_1_2}
+    \end{subfigure}
+    \caption{
+    \textbf{(\ref{fig_1_1}) Pairwise Data: Low vs. High Gap}: ``Low gap'' denotes cases where the chosen and rejected examples are closely similar, typically indicating high-quality, informative pairs. ``High gap'' signifies pairs with larger differences, implying lower-quality data.
+    \textbf{(\ref{fig_1_2}) Influence of Data Quality on $\beta$ Selection:} Pythia-1.4B's performance on the HH dataset reveals a distinct trend: for ``Low gap'', a higher $\beta$ reduces win rate, whereas for ``High gap'', an increased $\beta$ improves it.}
+    \label{fig:combined}
+\end{figure}
+
+Building upon these insights and recognizing the mixture nature of diverse quality in practically collected data \cite{mixture_data},
+we propose a dynamic $\beta$ selection strategy for DPO. This strategy adaptively adjusts $\beta$ in response to the quality of pairwise data and robustifies DPO against data variability. 
+Intuitively, one straightforward solution is personalizing $\beta$ for each pair, rather than fixing it across the population of all pairs. While conceptually appealing, (1) instance-level $\beta$ personalization can lead to optimization instabilities, particularly when dealing with a vast array of human preference instances \wjc{(\cf Section \ref{sec_batch_level})}. This issue underscores the challenge of balancing $\beta$ updates with stable and scalable DPO. In this light, we propose to explore a \textit{batch-level} adaptation of $\beta$, aiming to balance update aggressiveness and training stability. Moreover, (2) the frequent occurrence of outliers necessitates a strategy for accurately adjusting the batch-level $\beta$. 
+The dataset notably features outliers, a challenge underscored by the significant reward discrepancy variations within the training samples of the dataset (\cf Section \ref{motivation_sec}). 
+Such conditions impede the model's ability to accurately estimate the batch-level $\beta$, thereby undermining the effectiveness of batch-level $\beta$ calibration.
+To this end, we propose a simple yet effective dual-component approach:
+
+\begin{itemize}[leftmargin=*]
+  \item \textbf{Dynamic $\beta$ Calibration at Batch-Level} (for Challenge 1): To mitigate optimization instabilities, we dynamically calibrate $\beta$ within each batch. Specifically, this batch-level adjustment is based on data quality, with $\beta$ being adaptively decreased for high-quality, closely-matched pairwise data (\ie \emph{low gap} data) to facilitate assertive updates. While for easily-discriminated pairs (\ie \emph{high-gap} data), $\beta$ is increased to promote cautious updates, preventing overfitting to noise.
+  This targeted batch-level calibration enables stable and responsive optimization.
+  \item \textbf{$\beta$-Guided Data Filtering} (for Challenge 2): We implement a $\beta$-guided data filtering approach to tackle the frequent occurrence of outliers. By establishing a benchmark $\beta$ value for filtering incoming data at the batch level, we maintain the fidelity of $\beta$ estimation by prioritizing the most reliable and representative samples. As a result, it diminishes the impact of outliers that might otherwise derail the optimization process, thus enhancing the precision and robustness of the batch-level $\beta$ calibration.
+\end{itemize}
+
+Our contributions are threefold: (1) We investigate a pioneering study on the joint influence of $\beta$ selection and pairwise data quality on the DPO performance. (2) We introduce a simple yet effective $\beta$-dynamic strategy for DPO, adaptively balancing the update aggressiveness and training stability. (3) Through empirical evaluations, our approach demonstrates marked improvements in performance across diverse conditions and model sizes
+(\eg achieving improvements exceeding 10\% on models of various sizes, including Pythia-410M, 1.4B, and 2.8B).
+
+\section{Related Work}
+\label{Related Work}
+\textbf{Reinforcement Learning from Human Feedback.}
+Despite RLHF's effectiveness in aligning language models (LMs) with human values \cite{ChristianoLBMLA17, Bai2022training, llama2, instructGPT, fangjf2024neuron, FangZW00LWD024}, its complexity and resource demands have spurred the exploration of alternatives. RAFT \cite{RAFT} selects optimal training samples via an existing reward model, whereas RRHF \cite{RRHF} employs a simpler ranking loss, retaining PPO's efficiency. Diverse from these, DPO \cite{DPO} directly optimizes LMs using a preference-based loss function, showcasing enhanced training stability in comparison to traditional RLHF. Innovatively, SLiC-HF \cite{SLiC-HF} and KTO \cite{KTO} devise loss functions rooted in human decision-making, focusing on preference calibration and utility optimization, respectively. Dr. DPO \citep{drdpo} consider robust settings where safety or group information is known at training time. Further, RSO \cite{RSO} and ORPO \cite{ORPO} introduce efficient preference modeling and optimization, with ORPO uniquely combining supervised fine-tuning and preference alignment. These advancements reflect the ongoing shift towards more efficient, nuanced RL methods.
+
+\textbf{Data Quality in LLM's Alignment.}
+Recent studies have increasingly recognized the significance of data quality in the alignment of LLMs. For example, LIMA \cite{LIMA} leverages heuristics such as post scores, response lengths, formatting, and topics to manually craft 1000 high-quality datasets from StackExchange, wikiHow, and Reddit for superficial alignment. In a similar vein, \citet{Bai2022training} prioritize data points based on user engagement levels for dataset assembly. Rejection Sampling (RS) and Best-of-$N$ (BoN) techniques, as evidenced in the works of \citet{WebGPT} and \citet{Gao23ICML}, involve selecting the optimal candidate from $N$ generated possibilities through the application of a reward model. To enhance preference optimization, RSO \cite{RSO} uses statistical weightings to differentiate outcomes from an optimal policy and a base SFT policy. Besides, fDPO \cite{morimura2024filtered} employs a Reward Model to filter out low-quality data, effectively addressing dataset quality concerns.
+
+\label{Preliminaries}
+Given a text sequence (commonly referred to as a prompt) $\xb$, a sequence $\yb = [y_1, y_2, \dots y_N]$ is generated as a response to the prompt $\xb$.  
+An autoregressive language model $\pi$, when provided with the prompt $\xb$, can generate the response sequence $\yb$ following the probability decomposition:
+\begin{equation}
+    \pi(\yb|\xb) = \prod_{t=1}^{N}\pi(y_i|\xb, \yb_{<t}),
+\end{equation}
+where $\yb_{<t}$ denotes the preceding tokens in the response sequence.
+Now, given a preference dataset $\Set{D} = \{ (\xb^{(i)}, \yb_w^{(i)}, \yb_l^{(i)}) \}_{i=1}^{M}$, wherein each triplet consists of a prompt $\xb$ with two responses $\yb_w\in\Sigma^{*}$ and $\yb_l\in\Sigma^{*}$, with $\Sigma^{*}$ representing the alphabet, a preference oracle --- either a human annotator or a language model --- provides preference feedback $o(\yb_w \succ \yb_l |\xb) \in \{0,1\}$, indicating whether $\yb_w$ is preferred over $\yb_l$. We denote $\mathbb{P}(\yb_w \succ \yb_l| \xb) = \mathbb{E}[o(\yb_w \succ \yb_l|\xb)]$ the probability of $\yb_w$ ``winning the duel'' over $\yb_l$. The Kullback-Leibler (KL) divergence between two probability distributions with densities $p$ and $q$ is defined as $\mathrm{KL}(p \| q) = \mathbb{E}_{\yb \sim p(\yb)} \Big[\log \frac{p(\yb)}{q(\yb)} \Big]$.
+
+\textbf{RLHF with Reward Models.} \citet{ChristianoLBMLA17} pioneer the learning of a reward function $r(\yb ;\xb)$ based on the Bradley-Terry model~\citep{bradley1952rank}. This model is deployed for 
+the triplet of a prompt ($\xb$) and two responses ($\yb_w,\yb_l$), establishing the likelihood of preference for $\yb_w$ over $\yb_l$ as:
+\begin{align}
+    \mathbb{P}(\yb_w \succ \yb_l | \xb)
+    & = 
+    \frac{\exp(r(\yb_w; \xb))}{\exp(r(\yb_w; \xb)) + \exp(r(\yb_l; \xb))}
+    =
+    \sigma \big(r(\yb_w; \xb)-r(\yb_l; \xb)
+    \big),
+\end{align}
+where $\sigma(x) = e^x / (e^x + 1)$ represents the logistic function. The approach for estimating the reward function within the Bradley-Terry framework is to maximize the log-likelihood $\log \mathbb{P}(\yb_w \succ \yb_l | \xb)$. Assuming accurate estimation of the true reward function $r(\yb; \xb)$, \citet{ChristianoLBMLA17} propose to solve the following problem with policy optimization algorithms in RL such as PPO \citep{PPO}:
+
+\begin{align}
+    \max_{\btheta} 
+    \EE_{\xb \sim \cX, \yb \sim \pi_{\btheta}(\cdot|\xb)}
+    [
+    r(\yb; \xb)
+    ]
+    -
+    \beta
+    \mathbb{E}_{\xb \sim \cX}
+    [\mathrm{KL}(\pi_{\btheta}(\cdot|\xb) \| \pi_{\text{ref}}(\cdot|\xb))],
+\end{align}
+where $\cX$ represents the prompt distribution,
+$r(\yb; \xb)$ denotes the reward function learned using the Bradley-Terry model on the preference dataset,
+$\pi_{\text{ref}}$ is the fixed reference model (typically selected to be the one post supervised fine-tuning), and $\beta$ serves as the penalty coefficient of the KL divergence.
+
+\textbf{Directed Preference Optimization (DPO).}
+\citet{DPO} identify that the optimization problem above has a closed-form solution such that for any $\yb$,
+\begin{align*}
+    \pi^*(\yb|\xb)
+    \propto 
+    \pi_{\text{ref}}(\yb|\xb)
+    \exp( r(\yb; \xb) / \beta),
+\end{align*}
+which can be further converted to the DPO loss for any triplet $(\xb, \yb_{w}, \yb_{l})$:
+\begin{equation}
+    \ell_{\text{DPO}}(\xb, \yb_{w}, \yb_{l}; \btheta; \pi_{\text{ref}})
+    = 
+    -\log \sigma \Bigg(
+    \beta \bigg[
+    \log \bigg(\frac{\pi_{\btheta}(\yb_{w}|\xb)}{\pi_{\text{ref}}(\yb_{w}|\xb)}\bigg)
+    -
+    \log \bigg(\frac{\pi_{\btheta}(\yb_{l}|\xb)}{\pi_{\text{ref}}(\yb_{l}|\xb)}\bigg)
+    \bigg]
+    \Bigg).
+    \label{eq:DPO2}
+\end{equation}
+\section{Method}
+\label{our_work}
+In this section, we investigate the critical connection between the parameter $\beta$ and the quality of pairwise data in optimizing DPO. We present empirical evidence demonstrating the effect of $\beta$ settings on DPO performance across datasets of varying quality. Our proposed method, $\beta$-DPO, introduces dynamic calibration of $\beta$ and a data filtering mechanism tailored to improve DPO's effectiveness across diverse data conditions.
+\subsection{Motivation: The Impact of Pairwise Data Quality on $\beta$ Selection}
+\label{motivation_sec}
+Scrutinizing Equation \eqref{eq:DPO2}, we argue that DPO's effectiveness critically hinges on two factors: the choice of $\beta$ and the quality of pairwise data. Here, we conduct experiments to demonstrate the influence of variations in $\beta$ and data quality on DPO, pivotal for its effective real-world application.
+
+\textbf{Datasets.} 
+We utilize the Anthropic HH dataset \cite{Bai2022training} for our experimental analysis, which contains approximately 170,000 dialogues between humans and an automated assistant. In this dataset, a human inquiry, denoted as $\xb$, is paired with two responses $(\yb_w, \yb_l)$, where $\yb_w$ represents the response favored by the human annotator, while $y_l$ is the alternate response. Notably, the alternate response $y_l$ retains informational value, making this dataset high-quality with minimal discrepancies between the response pairs, which we classify as a \emph{low gap} dataset.
+To further explore the impact of data quality on DPO, we construct a synthetic dataset, referred to as the \emph{high gap} dataset. This dataset differs from the \emph{low gap} dataset by introducing a greater disparity between responses. Specifically, the alternative response $y_l$ is generated by a Supervised FineTuned (SFT) Pythia-2.8B model, while the preferred response $y_w$ remains consistent with the original dataset.
+We also combine the two datasets in equal proportion to create a \emph{mixed gap} dataset, with each contributing 50\%, to incorporate the characteristics of both the \emph{low gap} and \emph{high gap} datasets.
+
+ \begin{figure}[t]
+    \vspace{-10pt}
+    \centering
+    \includegraphics[width=1.0\linewidth]{figs/low_gap_mix_high_gap.pdf}
+    \caption{Win rate performance of DPO across different $\beta$ settings on the \emph{low gap}, \emph{mixed gap}, and \emph{high gap} datasets.}
+    \label{fig_low_high_gap}
+    \vspace{-10pt}
+ \end{figure}
+ 
+\textbf{Models and Metrics.} 
+Our study evaluates various model sizes, specifically Pythia-410M, Pythia-1.4B, and Pythia-2.8B \cite{pythia}, to ensure a comprehensive assessment. Following the established protocol in DPO \cite{DPO}, each model iteration undergoes a single epoch with a batch size of 64. This setup provides a uniform basis for evaluation across different models.
+We adopt the evaluation strategy from DPO \cite{DPO} to calculate the \textit{win rate}, a metric that measures how often the GPT-4 model prefers a response generated by our models over the default chosen response on the subset of the test dataset.
+
+\textbf{Findings}: 
+\textbf{(1) The optimal value of $\beta$ varies with data quality, reflecting divergent performance patterns across datasets.}
+In Figure \ref{fig_low_high_gap}, we present the win rate results across three levels of pairwise data gap, each evaluated under varying $\beta$ parameters. As can be observed,
+with \emph{low gap} pairwise data, a smaller $\beta$ value is preferable for optimizing performance. This is likely because the informative content of such data allows a lower $\beta$ to facilitate more substantial updates, thereby enhancing alignment accuracy.
+Conversely, for \emph{high gap} pairwise data, maintaining a low $\beta$ may lead to overfitting, which significantly undermines the alignment process.
+The \emph{mixed gap} dataset --- a combination of both \emph{low gap} and \emph{high gap} datasets --- exhibits a more nuanced performance pattern, suggesting the necessity for a dynamic $\beta$ calibration strategy to adapt to varying data quality.
+Consequently, adhering to a fixed $\beta$ value, \ie configuring $\beta$ at the population level, might be inadequate for the dynamic and varied nature of real-world datasets.
+\begin{wrapfigure}{r}{0.3\textwidth}
+    \centering
+    \vspace{-0.45cm}
+    \!\!\!\!\!\!\!\! \includegraphics[width=0.32\textwidth]{figs/gap_distribution.pdf}
+    \vspace{-0.3cm}
+    \caption{The distribution of individual reward discrepancy ($r(\yb_w^{(i)};\xb^{(i)})-r(\yb_l^{(i)};\xb^{(i)})$) on the training dataset of HH.}
+    \vspace{-0.5cm}
+    \label{fig:gap_distribution}
+  \end{wrapfigure}
+\textbf{(2) The dataset exhibits notable outliers.} In Figure \ref{fig:gap_distribution}, utilizing the Pythia-2.8B model, we evaluate the data quality by examining the distribution of reward discrepancy for each triplet (which we will define as ``individual reward discrepancy'' later) within the HH dataset's training samples. 
+The tails of the density plot extend beyond the highlighted percentiles, suggesting the existence of data samples with significantly higher or lower reward discrepancies.
+Notably, cases with significantly higher rewards for positive samples over negative ones suggest low informational value, as these discrepancies likely do not contribute meaningfully to the model's learning process. Whereas the opposite cases hint at potential labeling errors. Both cases deviate from an expected rational distribution range and are thus classified as outliers. For further details on outliers, kindly refer to Appendix \ref{low_gap_high_gap}.
+
+\subsection{Method: Dynamic $\beta$ Calibration in DPO}
+
+Through our empirical analysis, we highlight the sensitivity of DPO to $\beta$ selections and the frequent occurrence of outliers. Hence, 
+determining the optimal $\beta$ value requires careful consideration of the quality of pairwise data while also addressing the influence of outliers. This prompts the question: \textit{what criteria define a superior choice of $\beta$?} In response, we propose the following guiding principles:
+
+\textbf{Principle 1:} \textit{The optimal $\beta$ value should be responsive to pairwise data's quality.}
+
+\textbf{Principle 2:} \textit{The selection of $\beta$ value should minimize the influence of outliers.}
+
+\subsubsection{Dynamic $\beta$ Calibration at Batch-Level}
+We begin by introducing the concept termed `\textit{individual reward discrepancy}', which represents the difference between the rewards of winning and losing for each triplet, serving as a measurement for pairwise data quality. Formally, for a triplet $(\xb^{(i)}, \yb_w^{(i)}, \yb_l^{(i)}) \in \Set{D}$, the individual reward discrepancy is defined as 
+$M_i = r(\yb_w^{(i)};\xb^{(i)}) - r(\yb_l^{(i)};\xb^{(i)}).$
+While our primary analysis utilizes the implicit reward model induced by the policy trained using DPO, we also conducted comparative experiments with an explicit reward model. The details of these experiments with the explicit RM can be found in Appendix \ref{sec:appendix_explicit_rm}. For the DPO-based implicit reward model, the reward discrepancy is expressed as:
+
+$$ M = \beta_0 \log \left( \frac{\pi_\theta (y_w \mid x) }{\pi_{\text{ref}}(y_w \mid x)} \right) - \beta_0 \log \left( \frac{\pi_\theta (y_l \mid x) }{\pi_{\text{ref}}(y_l \mid x)} \right). $$
+
+Here, \(\pi_\theta\) represents the policy being optimized, and \(\pi_{\text{ref}}\) denotes the reference policy. This formulation captures the difference in the log-probabilities of the winning and losing outcomes, weighted by the parameter \(\beta\).
+Motivated by our guiding principles, a straightforward approach is to assign a distinct $\beta$ to each triplet, allowing each $\beta$ to serve as a parameter tailored to its respective triplet. This instance-level dynamic $\beta$ adaption can be formulated as follows:
+
+\begin{eqnarray}
+    \begin{aligned}
+        \beta_i = \beta_0 + \alpha \large(M_i - M_0 \large) \beta_0 = [1 + \alpha(M_i-M_0)]\beta_0,
+    \end{aligned}
+    \label{eq:beta}
+\end{eqnarray}
+
+where $\beta_0$ represents the benchmark hyperparameter intrinsic to DPO, typically set to 0.1. The term $M_0$ denotes a predetermined threshold, and the coefficient $\alpha$ is a scaling factor within the interval $[0, 1]$ that adjusts the influence of $M_i$ on $\beta_i$. Specifically, when $\alpha = 0$, $\beta_i$ remains constant at $\beta_0$, thus maintaining the standard DPO framework without modification.
+
+Equation \eqref{eq:beta} illustrates that $\beta_i$ increases monotonically with $M_i$, allowing the model to adjust the $\beta$ value based on the running reward differential between paired samples.\
+Nevertheless, such instance-level adjustments may introduce instabilities during training. Prior studies have shown that a minibatch approach can help avoid saddle points or local minima \cite{ge2015escaping}, as well as mitigate the impact of noise \cite{robbins1951stochastic, bottou2010large}. Drawing inspiration from these benefits, we propose a batch-level dynamic estimation methodology for $\beta$:
+
+\begin{equation}
+    \beta_{\text{batch}} = [1 + \alpha( \EE_{i \sim \text{batch}}[M_i]-M_0)]\beta_0.
+\end{equation}
+In practical applications, the threshold $M_0$ can be estimated by employing the global mean of $M_i$ with a moving average updating scheme \cite{mae}:
+\begin{equation}
+    M_0  \leftarrow m M_0 + (1-m)  \EE_{i \sim \text{batch}}[M_i],
+    \label{mom}
+\end{equation}
+where $m\in[0,1)$ is a momentum coefficient.
+Such a batch-level calibration method introduces only one new parameter, $\alpha$, to control the scale of $\beta$ adjustment.
+The calculation of $\EE_{i \sim \text{batch}}[M_i]$ is straightforward within DPO procedures, thereby incurring no additional computational overhead.
+
+\subsubsection{$\beta$-Guided Data Filtering }
+To mitigate the adverse impact of outliers on the $\beta$ selection process, we introduce a $\beta$-guided data filtering mechanism. Informed by $3\sigma$ confidence criterion \cite{3sigma}, this strategy employs a probabilistic model to assess the significance of each triplet $(\xb^{(i)}, \yb_w^{(i)}, \yb_l^{(i)})$ based on its individual reward discrepancy $M_i$, which is defined as:
+\begin{equation}
+    p(M_i) = \frac{1}{\sqrt{2\pi}\sigma} \exp\left(-\frac{(M_i-M_0)^2}{2\sigma^2}\right),
+    \label{sampling_p}
+\end{equation}
+where $M_0$ and $\sigma$ represent the mean and standard deviation of $M_i$ across the training dataset, respectively.
+Similar to the updating scheme of $M_0$ in Equation \eqref{mom}, we dynamically estimate the value of $\sigma$ using the moving average method:
+\begin{equation}
+     \sigma \leftarrow m \sigma + (1-m)  \sqrt{\mathbb{V}_{i \sim\text{batch}}[M_i]}.
+     \label{mom2}
+\end{equation}
+This probabilistic weighting discerns the relative importance of each sample, guiding the selection of $|\text{batch}| \times \rho$ samples (without replacement) based on their calculated probabilities $p(M_i)$. Here, $\rho$ denotes the selection ratio, defaulting to 0.8, a choice validated by preliminary experiments aimed at optimizing training efficiency and model accuracy.
+
+This process is iterated for each training batch, ensuring that the training data is continuously updated to reflect the most informative samples. The introduction of the $\beta$-guided data filtering strategy is instrumental in fortifying the model against outliers, thereby facilitating the accurate estimation of the $\beta$ value.
+
+\textbf{Highlights:}
+We underline the following key features of our proposed $\beta$-DPO framework:
+\begin{itemize}[leftmargin=*]
+    \item \textbf{Simplicity}: $\beta$-DPO is extremely straightforward and quick to implement. It merely involves a dynamic $\beta$ adjustment at the batch level and a $\beta$-guided data filtering mechanism, both of which are predicated upon the reward discrepancy denoted by $M_i$.
+    \item \textbf{Efficiency}: Unlike other methodologies \cite{RSO,morimura2024filtered,pruthi2020estimating,f-dpo} that necessitate an additional gold model for data filtering, our method leverages the running reward discrepancy $M_i$ within the DPO framework. Moreover, our empirical studies indicate that $\beta$-DPO exhibits insensitivity to the hyperparameters $\rho$. A default setting of $\rho=0.8$ typically yields satisfactory performance.
+    \item \textbf{Model-agnostic}: As a variant of the traditional DPO, the proposed $\beta$-DPO can function as a plug-and-play module. It allows straightforward integration of future enhancements and extensions within the DPO framework. Our empirical investigations corroborate this assertion.
+\end{itemize}
+
+\subsection{Discussion with Previous Studies}
+\textbf{Relations to Data Selection.} An increasing volume of works \cite{RSO,morimura2024filtered,LIMA,pruthi2020estimating, xia2024less} have underscored the impact of data quality on the performance of LLM's alignment. A common practice among these efforts involves employing a so-called ``gold model'' for data selection. This approach, however, introduces significant computational demands and the choice of the gold model directly influences the resultant system's performance. The focus of this work, it should be noted, is not to propose a superior strategy for data selection. Instead, we aim to enhance adaptability to the quality of data by dynamically adjusting the $\beta$ parameter. This adjustment facilitates improved $\beta$ estimation by selecting data based on the reward. Moreover, Section \ref{exp_adaptation} illustrates the compatibility of dynamic $\beta$ adjustment with other data selection methodologies.
+
+\textbf{Relations to Recent Temperature Schemes.}
+Dynamic temperature frameworks have been introduced in the realm of contrastive learning, motivated by various objectives, such as addressing out-of-distribution tasks \cite{Uncertainty} or accommodating long-tail data distributions \cite{long_tail}. The work most closely related to ours, MACL \cite{MACL}, has indeed proposed an alignment-adaptive strategy; however, its primary aim was to navigate the uniformity-tolerance dilemma. Hence, the integration of dynamic temperature mechanisms with LLM's alignment remains an underexplored area against this backdrop.\section{Experiments}
+\label{Experiments}
+\begin{figure}[t]
+    \centering
+    \includegraphics[width=0.49\textwidth]{figs/win_rate_hh.pdf}
+    \includegraphics[width=0.49\textwidth]{figs/win_rate_tldr.pdf}
+    \caption{
+    \textbf{Left.} 
+    The win rates computed by GPT-4 evaluations for the Anthropic-HH one-step dialogue; $\beta$-DPO consistently outperforms across all sampling temperatures.
+    \textbf{Right.} 
+    In the comparison of TL;DR summarization win rates versus chosen summaries with GPT-4 as the evaluator, $\beta$-DPO is distinguished as the only strategy achieving a win rate over 50\% across different sampling temperatures.
+    }
+    \label{fig:dialogue-main}
+\end{figure}
+
+In this section, we commence by conducting an empirical evaluation of $\beta$-DPO on two specific tasks: dialogue generation and summarization. Subsequently, we analyze the various adaptations of the proposed method $\beta$-DPO. Concluding this section, we underscore the imperative need for batch-level dynamic $\beta$ calibration, highlighting its significance in the context of our study.
+
+\subsection{Empirical Evaluation of $\beta$-DPO on Dialogue Generation and Summarization}
+\textbf{Datasets and Setup.} Our experiments are conducted on the Anthropic HH dataset \cite{Bai2022training} and Reddit TL;DR summarization dataset \cite{tldr_dataset}. The training configuration follows from \citet{DPO}. The goals of these experiments are to study: 1) How $\beta$-DPO performs on single-turn dialogue generation and summarization tasks; 2) How the sampling temperature affects the performance of $\beta$-DPO; 3) How $\beta$-DPO works with different model sizes. For detailed experimental settings, please refer to Appendix \ref{setup_exp}.
+
+\textbf{Baselines.} In our comparison, we examine the performance of $\beta$-DPO relative to its counterparts: the standard DPO, DPO implemented with a dynamic $\beta$ yet devoid of $\beta$-guided data filtering, and DPO complemented by data filtering with $\beta$ fixed at 0.1.
+
+\textbf{Win Rate Across different Sampling Temperature.} An analysis of win rates derived from GPT-4 evaluations on the Anthropic-HH one-step dialogue demonstrates that $\beta$-DPO consistently outperforms across all sampling temperatures, as depicted in Figure \ref{fig:dialogue-main} (Left). Furthermore, for the TL;DR summarization task, $\beta$-DPO stands out as the only approach achieving win rates above 50\% for diverse sampling temperatures, which is visually represented in Figure \ref{fig:dialogue-main} (Right). The data also suggests that while both dynamic $\beta$ and data filtering enhance DPO's effectiveness, the impact of data filtering is especially pronounced in the summarization task, likely due to the inherently greater noise present in the Reddit TL;DR summarization dataset. Notably, $\beta$-DPO exhibits a remarkable degree of robustness to variations in sampling temperature. As the temperature incrementally escalates from 0.0 to 1.0, the win rate for standard DPO plunges to a mere 25\%, whereas $\beta$-DPO maintains a commendable performance level with a win rate of 54\%.
+
+\textbf{Win Rate Across Different Model Sizes.} We further evaluate the performance of $\beta$-DPO on the Anthropic HH dataset with Pythia-410M, -1.4B, and -2.8B models. The results are summarized in Table \ref{tab:ablation}. We observe that $\beta$-DPO consistently outperforms DPO, DPO with dynamic $\beta$, and DPO with data filtering across all model sizes.
+We observe that in a smaller model, the improvement of data filtering is more significant, while in a larger model, the improvement of dynamic $\beta$ is more significant. We attribute this to the fact that the larger model has more capacity to learn the optimal policy, while the smaller model needs more help from the data filtering.
+
+\begin{table}
+    \centering
+    \caption{
+    Win rate comparison of Pythia-410M, -1.4B, and -2.8B models on the Anthropic HH dataset, evaluated using GPT-4.
+    }
+    \begin{tabular}{l|l|l|l}
+        \toprule
+        \textbf{Method} & \textbf{410M} & \textbf{1.4B} & \textbf{2.8B} \\
+        \midrule
+        DPO & $26.19$ & $42.78$ & $51.51$ \\
+        DPO + Dynamic $\beta$ & $27.15^{\color{+}+ 3.67\%}$ & $43.51^{\color{+}+ 1.71\%}$ & $55.19^{\color{+}+ 7.14\%}$ \\
+        DPO + Data Filtering & $29.03^{\color{+}+ 10.84\%}$ & $46.99^{\color{+}+ 9.84\%}$ & $53.42^{\color{+}+ 3.71\%}$ \\
+        $\beta$-DPO & $30.18^{\color{+}+ 15.23\%}$ & $48.67^{\color{+}+ 13.77\%}$ & $57.07^{\color{+}+ 10.79\%}$ \\
+        \bottomrule
+    \end{tabular}
+    \label{tab:ablation}
+\end{table}
+
+\subsection{Adaptations of $\beta$-DPO}
+\label{exp_adaptation}
+In this section, our inquiry is twofold: first, we aim to understand the performance of $\beta$-DPO when applied across various filtering strategies; second, we examine its efficacy across different adaptations of the DPO framework. In terms of filtering strategies, prevailing studies \cite{pruthi2020estimating, xia2024less} in the domain largely employ a gradient-based approach. We propose to extend this methodology into three distinct scenarios. This involves arranging the gradients of pairwise data within a batch and consequently: (1) Excluding the top 20\% of samples, hereby referred to as \textbf{Filter Head},
+(2) Excluding the bottom 20\% of samples, hereby referred to as \textbf{Filter Tail},
+(3) Excluding both the top and bottom 10\% of samples, a method we denote as \textbf{Filter Tail \& Head}.
+For a fair comparison, we maintain the amount of data excluded at 20\% for the above strategies.
+Second, we integrate three variants of DPO into our analysis: the IPO \cite{ipo}, a novel approach that facilitates learning directly from preferences without the need for the Bradley-Terry (BT) model. Additionally, we consider the KTO \cite{KTO}, which focuses on discerning whether a preference is desirable or undesirable and SPPO \cite{sppo}, which approximates the Nash equilibrium. For detailed settings, we refer the reader to the supplementary material.
+
+\textbf{Selective filtering of the top 20\% of samples markedly enhances model performance. } This approach, detailed in Figure \ref{fig:gradient} (Left), not only surpasses other filtering strategies but also suggests that these samples, which exhibit the smallest discrepancies between positive and negative pairs, are particularly prone to flipped noise. By excluding them, the model's learning efficacy is appreciably improved.
+
+\textbf{Dynamic $\beta$ adapts to and improves upon existing filtering strategies.} Figure \ref{fig:gradient} (Left) corroborates our stance that a static $\beta$ proves insufficient within the DPO framework. We contend that the application of our dynamic $\beta$-DPO could markedly reshape the DPO field by fostering the development of advanced filtering techniques.
+
+\textbf{Dynamic $\beta$ Enhancement across DPO Variants.}
+We introduce dynamic $\beta$-DPO, a novel strategy enhancing DPO and its variants: IPO, KTO, and SPPO in Figure \ref{fig:gradient} (Middle). Our results on the Anthropic HH dataset demonstrate that while IPO initially leads in performance, the integration of dynamic $\beta$ substantially elevates all variants, notably increasing $\beta$-IPO's efficiency by 17.9\%. This underscores dynamic $\beta$-DPO's capability to significantly enhance model training through adaptable improvements, solidifying its value in advancing language models via human feedback.
+
+\begin{figure}
+    \centering
+    \includegraphics[width=0.32\textwidth]{figs/filter_gradient.pdf}
+    \includegraphics[width=0.32\textwidth]{figs/kto-sppo.pdf}
+    \includegraphics[width=0.32\textwidth]{figs/gap_batch_instance.pdf}
+    \caption{
+    \textbf{Left:} Win rates from GPT-4 evaluations on Anthropic-HH single-turn dialogues, showcasing $\beta$-DPO's adaptability to diverse filtering strategies. \textbf{Middle:} Win rates of $\beta$-DPO across various DPO variants as evaluated by GPT-4. \textbf{Right:} Distribution of individual reward discrepancies following fine-tuning through batch-level and instance-level calibration.
+    }
+    
+    \label{fig:gradient}
+\end{figure}
+
+\subsection{Necessity of Batch-Level Dynamic $\beta$ Calibration}
+\label{sec_batch_level}
+In this section, we aim to underscore the pivotal role of batch-level tuning in calibrating the parameter $\beta$. To this end, we compare the performance of our $\beta$-DPO algorithm under two distinct regimes: one employing batch-level dynamic $\beta$ calibration, and the other utilizing instance-level dynamics. To emulate the diverse data disparity scenarios encountered in practical applications, we adopt the methodology outlined in Section \ref{motivation_sec}, meticulously blending datasets characterized by both \emph{low gap} and \emph{high gap} attributes at varying ratios.
+
+\textbf{Batch-level calibration surpasses both instance-level and population-level approaches.} The results presented in Table \ref{tab:noise} illustrate that batch-level dynamic $\beta$ calibration yields superior performance compared to instance-level dynamics and the baseline population-level approach (referred to as vanilla DPO) across a range of mixture ratios. This improvement can be credited to the batch-level calibration's ability to adjust to the varying data quality present within a batch, thus refining the model's learning process.
+Conversely, instance-level dynamics can provoke excessively vigorous model updates, precipitating a decline in performance particularly noticeable at a mixture ratio of 40\%, a scenario in which outliers exert a significant negative impact.
+
+\textbf{Instance-level calibration magnifies the impact of outliers.}
+As demonstrated in Figure \ref{fig:gradient} (Right), instance-level calibration can inadvertently widen the range of reward discrepancy distribution. This broadened range suggests that instance-level calibration might be leading to excessively high or low $\beta$ values for the model. Such disparities in $\beta$ values consequently cause disproportionate update rates for certain samples, further intensifying the extremities in the distribution. 
+\begin{table}
+    \centering
+    \caption{
+    Comparison of win rates across varying mixture ratios on the Anthropic HH dataset, with each ratio indicating the proportion of \emph{high-gap} to \emph{low-gap} datasets, e.g., a 40\% mixture ratio reflects a blend of 40\% \emph{high-gap} and 60\% \emph{low-gap}.
+    }
+    \begin{tabular}{l|l|l|l|l}
+        \toprule
+        \textbf{Mixture Ratio} & \textbf{10\%} & \textbf{20\%} & \textbf{30\%} & \textbf{40\%}\\
+        \midrule
+        Vanilla DPO & $50.17$ & $50.56$ & $47.95$ & $29.15$ \\
+        + Instance-level calibration & $49.18^{\color{-}- 1.97\%}$ & $49.82^{\color{-}- 1.46\%}$ & $44.42^{\color{-}- 7.36\%}$ & $16.82^{\color{-}- 42.30\%}$ \\
+        + Batch-level calibration & $57.68^{\color{+}+ 14.69\%}$ & $56.15^{\color{+}+ 11.06\%}$ & $51.25^{\color{+}+ 6.88\%}$ & $34.92^{\color{+}+ 19.79\%}$ \\
+        \bottomrule
+    \end{tabular}
+    \label{tab:noise}
+\end{table}
+
+\textbf{Our $\beta$-calibration strategy consistently outperforms baseline methods.} To expand our approach to more diverse datasets and model sizes, we follow the current state-of-the-art models SimPO \cite{SimPO2024}. We perform $\beta$-DPO with two families of models, Llama3-8B \citep{llama3modelcard}, Mistral2-7B \citep{Jiang2023Mistral7}, on the \href{https://huggingface.co/datasets/HuggingFaceH4/ultrachat_200k}{UltraChat-200k} dataset~\cite{Ding2023EnhancingCL}. For comparison with baselines, we assess our models using one of the most popular open-ended instruction-following benchmarks: AlpacaEval 2. All settings are consistent with SimPO \cite{SimPO2024}.
+\begin{wraptable}[11]{r}{7.7cm}
+\centering
+\vspace{-0.6em}
+\caption{Performance comparison of different models}
+ \small
+\resizebox{7.7cm}{!}{
+\begin{tabular}{ccccc}
+\toprule
+\multirow{2}{*}{Model} & \multicolumn{2}{c}{Mistral-Instruct (7B)} & \multicolumn{2}{c}{Llama3-Instruct (8B)} \\
+\cmidrule(lr){2-3} \cmidrule(lr){4-5}
+ & LC (\%) & WR (\%) & LC (\%) & WR (\%) \\
+\midrule
+DPO & 20.98 & \textbf{21.60} & 40.44 & 37.38 \\
+$\beta$-DPO & \textbf{23.56} & 20.42 & \textbf{43.38} & \textbf{38.21} \\
+\midrule
+SimPO & 28.50 & 30.56 & 44.38 & 38.97 \\
+$\beta$-SimPO & \textbf{30.48} & \textbf{32.13} & \textbf{46.03} & \textbf{40.18} \\
+\bottomrule
+\end{tabular}
+}
+\label{tab:performance_comparison_lc}
+\end{wraptable}
+Table \ref{tab:performance_comparison_lc} presents the AlpacaEval 2 results under the Mistral-Instruct (7B) and Llama3-Instruct (8B) settings. LC and WR denote length-controlled and raw win rate, respectively. Regardless of whether we use Llama3-8B or Mistral-7B, and whether the loss function is DPO or SimPO, our $\beta$-{D, Sim}PO strategy consistently demonstrates significant performance improvements. This thoroughly showcases the method's strong generalization ability and excellent scalability.
+
+\section{Conclusion and Future Work}
+\label{conclusion}
+This paper introduces $\beta$-DPO, a novel framework designed to optimize DPO by dynamically adjusting the $\beta$ parameter in response to the variability in the informativeness of pairwise data. Our approach, which incorporates $\beta$-guided data filtering and batch-level dynamic $\beta$ calibration, has demonstrated significant improvements in DPO's performance across a range of models and datasets. The empirical evaluations indicate that $\beta$-DPO offers an adaptable training paradigm for LLMs with human feedback.
+
+\textbf{Limitations and Future Work.}
+Our work on $\beta$-DPO showcases a promising framework for LLM optimization, albeit with room for advancement. Future endeavors should explore:
+Adaptive $\beta$ in Self-Play: Extending $\beta$-DPO to self-play scenarios \cite{spin,sppo} where negative samples dynamically adapt, necessitating iterative $\beta$ adjustments, to foster the evolution of superior model strategies.
+Enhanced Evaluation Standards: Development of sophisticated metrics and use of advanced evaluators beyond win rates, capitalizing on advancements like GPT-4+, to comprehensively gauge model performance.
+Scalability Investigation: Examining $\beta$-DPO's scalability to ultra-large models surpassing 7B parameters, and its integration into diverse DPO-inspired architectures, is pivotal for practical impact.
+Automated Parameter Tuning: Pursuing automation in parameter tuning, alleviating manual intervention for $\beta$, to streamline the training pipeline and broaden accessibility.
+\begin{ack}
+This research is supported by the National Science and Technology Major Project (2023ZD0121102), National Natural Science Foundation of China (92270114, 62302321). This research was also supported by the advanced computing resources provided by the Supercomputing Center of the USTC.
+\end{ack}
+
+\newpage
+
+\end{document}

@@ -1,0 +1,344 @@
+\title{Automatic Prompt Optimization with ``Gradient Descent'' \\and Beam Search}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+Large Language Models (LLMs) have shown impressive performance as general purpose agents, but their abilities remain highly dependent on prompts which are hand written with onerous trial-and-error effort. We propose a simple and nonparametric solution to this problem, \emph{\textbf{Pr}ompt \textbf{O}ptimization with \textbf{Te}xtual \textbf{G}rad\textbf{i}ents} (ProTeGi), which is inspired by numerical gradient descent to automatically improve prompts, assuming access to training data and an LLM API. The algorithm uses minibatches of data to form natural language ``gradients'' that criticize the current prompt, much like how numerical gradients point in the direction of error ascent. The natural language gradients are then ``propagated'' into the prompt by editing the prompt in the opposite semantic direction of the gradient. These gradient descent steps are guided by a beam search and bandit selection procedure which significantly improves algorithmic efficiency. Preliminary results across three benchmark NLP tasks and the novel problem of LLM jailbreak detection suggest that Automatic Prompt Optimization can outperform prior prompt editing techniques and improve an initial prompt's performance by up to 31\%, by using data to rewrite vague task descriptions into more precise annotation instructions.\footnote{Code and data available at: \url{https://github.com/microsoft/LMOps/tree/main/prompt_optimization}.}
+\end{abstract}
+
+\section{Introduction}
+Large Language Models (LLMs) trained on web-scale text have recently demonstrated unprecedented abilities across a variety of NLP tasks \cite{gpt4,bubeck2023sparks}. 
+These LLMs use prompt inputs to follow human instructions. Writing prompts in natural language remains a manual trial-and-error process requiring significant human effort \cite{jiang2022promptmaker} and expertise \cite{reynolds2021prompt,zamfirescu2023johnny}.
+
+Accordingly, there is need for automatic or semi-automatic procedures to help humans write the best prompts. This would help reduce manual effort, improve task performance, and produce interpretable descriptions of a cognitive decision process.
+
+\begin{figure}
+\centering
+\includegraphics[width=0.9\linewidth]{front.png}
+\caption{Overview of the proposed Prompt Optimization with Textual Gradients (ProTeGi).}
+\label{fig:firstpage}
+\end{figure}
+
+A recent body of work has investigated this problem by training auxiliary models or differentiable representations of the prompt \cite{qin2021learning,deng2022rlprompt}. However, such works assume access to internal state variables of the LLM  \cite{shin2020autoprompt,lester2021power} while practitioners often communicate with LLMs through an API. Other work applies discrete manipulations to prompts via Reinforcement Learning or LLM-based feedback \cite{zhang2023tempera,zhou2022large}. These algorithms may also require low-level access to the LLM, produce incomprehensible outputs, or rely on directionless monte-carlo search over the semantic space of prompts.% or task-specific feedback \cite{chen2023teaching}. 
+
+We propose Prompt Optimization with Textual Gradients (ProTeGi), a general purpose and nonparametric algorithm for automatic prompt optimization that connects these two bodies of research by applying discrete improvements to prompts in a directed way. 
+
+Unlike prior work, we overcome the discrete optimization barrier by mirroring the steps of gradient descent within a text-based Socratic dialogue \cite{zeng2022socratic}, substituting differentiation with LLM feedback and backpropagation with LLM editing.
+In detail, we use minibatches of training data to produce ``gradients'' in natural language, i.e., descriptions of the current prompts' flaws with respect to the minibatch, then edit the current prompt in the opposite semantic direction of the gradient. These steps become the expansion part of a wider beam search over the space of prompts, increasing algorithmic efficiency by treating the problem of beam candidate selection as an instance of the best arm identification problem \cite{audibert2010best}.
+
+We then offer a preliminary case study of ProTeGi. We evaluate the proposed framework in multiple configurations across 4 NLP tasks, including the novel problem of LLM jailbreak detection. The results suggest that the proposed algorithm can improve on the performance of the initial prompt input by up to 31\%, exceeding state-of-the-art prompt learning baselines by an average of 4-8\% while relying on fewer LLM API calls. We also demonstrate the interpretability of the optimization process and investigate the algorithms' shortcomings.
+
+\section{Discrete Prompt Optimization with Nonparametric ``Gradient Descent''}
+
+The proposed algorithm assumes access to an initial prompt $p_0$ and i.i.d. training data consisting of pairs of input and output text (numbers, categories, summaries, etc): $\mathcal{D}_{tr} = \{(x_1, y_1), ..., (x_n, y_n)\}$. 
+Note that all prompts $p$ are drawn from the space of coherent natural language $\mathcal{L}$.
+We assume access to a black box LLM API $LLM_{p}(x) \approx argmax_{y \in \mathcal{L}} P_{LLM}(y \vert p, x)$, which returns a likely text continuation $y$ of the prompt formed by concatenating $p$ and $x$ (for example, few-shot prompt and input example, or chatbot persona and conversational history).
+
+Within this context, our algorithm iteratively refines the prompt $p_0$ to produce $\hat{p}$, an approximation of the optimal prompt $p^* = argmax_{p\in \mathcal{L}} \{ m(p, \mathcal{D}_{te}) \}$ for some metric function $m(\cdot)$ and in-domain test or development data $\mathcal{D}_{te}$. 
+
+In the following sections, we first introduce how the algorithm performs textual ``gradient descent'' to improve the prompts in a directed way (Section \ref{sec:graddescent}).
+Then the algorithm leverages these gradient descent steps to beam search through the space of coherent language $\mathcal{L}$, guided by the gradients during beam expansion, and efficient best arm identification during beam selection (Section \ref{sec:beamsearch}). %Algorithm \ref{alg:APO} describes the overall approach.
+
+\subsection{Gradient descent with Prompts}
+\label{sec:graddescent}
+In our setting, gradient descent refers to the process of (1) evaluating a prompt with a batch of data, (2) creating a local loss signal which contains information on how to improve the current prompt, then (3) editing the prompt in the opposite semantic direction of the gradient before starting the next iteration. 
+
+\begin{figure}
+\centering
+\includegraphics[width=\linewidth]{gd.png}
+\caption{The text dialogue tree we use to mimic gradient descent and overcome the discrete optimization barrier. First, from the top left a feedback prompt $\Delta$ generates the gradient $g$ from starting prompt $p_0$ and prediction $\hat{y}$. Second, from the top right an editing prompt $\delta$ applies the gradient $g$ to $p_0$ and produce improved prompts $p'$, their paraphrases $p''$, and efficient best candidate selection before the next iteration (bottom left).}
+\label{fig:gd}
+\end{figure}
+
+We accomplish this process with a pair of static LLM prompts, as depicted in Figure \ref{fig:gd}. The first prompt is for creating the loss signals (``gradients'') and is called $\nabla$. While the specific contents can vary and be task-specific or task-agnostic,\footnote{We use the same prompts for all tasks; see Appendix.} $\nabla$ must always consider the current prompt $p_0$, plus $p_0$'s behavior on a minibatch of data (particularly the errors), and generate a natural language summary of $p_0$'s flaws. This summary becomes the gradient $g$. Similar to how traditional gradients represent a direction in parameter space that would make the model worse, the text ``gradients'' $g$ represent directions in a semantic space that are making the prompt worse. 
+
+The second prompt is called $\delta$ and while this prompt can also vary, it must always take the gradient $g$ and current prompt $p_0$, then perform an edit on $p_0$ in the opposite semantic direction of $g$, i.e. fix the problems with $p_0$ that are indicated by $g$.\footnote{Note that one can imagine operationalizing the concept of learning rates or step sizes by e.g. editing $\delta$ to perform large- or small-sized edits to $p_0$, in this initial work we adopt an ``adaptive'' step size by allowing the LLM to decide edit size, and leave further exploration to future work.}
+
+Unlike the traditional machine learning setting, we do not generate a single gradient or edit, but rather a number of directions that may improve the current prompt.
+Section~\ref{sec:beamsearch} describes in detail the process of generating and selecting candidate prompts.
+
+\subsection{Beam Search over Prompts}
+\label{sec:beamsearch}
+
+The gradient descent steps described in Section \ref{sec:graddescent} are used to guide a beam search over the space of prompts. This beam search is the outer loop of our prompt training algorithm and it is described in Algorithm~\ref{alg:APO}.
+
+\begin{algorithm}
+\caption{Prompt Optimization with Textual Gradients (ProTeGi)}
+\label{alg:APO}
+\begin{algorithmic}[1]
+\REQUIRE $p_0$: initial prompt, z$b$: beam width, $r$: search depth, $m$: metric function
+\STATE $B_0 \leftarrow \{p_0\}$
+\FOR{$i \leftarrow 1$ to $r-1$}
+    \STATE $C \leftarrow \emptyset$
+    \FORALL{$p \in B_i$}
+        \STATE $C \leftarrow C \cup Expand(p)$
+    \ENDFOR
+    \STATE $B_{i+1} \leftarrow Select_b(C, m)$
+\ENDFOR
+\STATE $\hat{p} \leftarrow argmax_{p \in B_r} m(s)$
+\RETURN $\hat{p}$
+\end{algorithmic}
+\end{algorithm}
+
+The beam search is an iterative optimization process where for each iteration the current prompt is used to generate many new candidate prompts ($expansion$). 
+Next, a $selection$ process is used to decide which prompts are worth carrying forward to the next iteration.
+This loop allows for incremental improvements and exploration over multiple prompt candidates.
+
+\subsubsection{Expansion Step}
+
+The \emph{expansion step} is  used to generate many new candidate prompts from a current prompt (Algorithm \ref{alg:beam_search_expand}). It leverages the conceptual ``gradient descent'' framework of Section \ref{sec:graddescent}, and our specific prompts can be found in the Appendix.
+
+First we sample a minibatch of data, run the initial prompt on these data with $LLM_{p_0}$, and collect errors. Second, we plug these errors into a prompt template $\Delta$, which instructs the LLM to describe the problems with $p_0$ which could have led to these mistakes. The ensuing generations are our natural language gradients; see Figure \ref{fig:firstpage} for an example. 
+
+Second, the gradients are provided to another LLM prompt called $\delta$, which instructs the LLM to edit the current prompt $p_0$ in order to fix the problems described by the gradient. In this way, we engadge the LLMs in a recursive feedback loop similar to the Socratic dialogues proposed by \citet{zeng2022socratic}. 
+
+Last, additional candidates are generated by running the existing candidates through a paraphrasing LLM called $LLM_{mc}$, to explore the local monte carlo search space around the new prompt candidates. This prompt simply asks the LLM to generate new candidates which are worded differently but semantically similar to their inputs.
+
+\begin{algorithm}
+\caption{$Expand(\cdot)$ - line 5 of Algorithm 1}
+\label{alg:beam_search_expand}
+\begin{algorithmic}[1]
+\REQUIRE $p$: prompt candidate, $\mathcal{D}_{tr}$: train data
+\STATE Sample minibatch $\mathcal{D}_{mini} \subset \mathcal{D}_{tr}$
+\STATE Evaluate prompt $p$ on minibatch $\mathcal{D}_{mini}$ and collect errors $e = \{ (x_i, y_i) : (x_i, y_i) \in \mathcal{D}_{mini} \land LLM_{p}(x_i) \neq y_i \}$
+\STATE Get gradients: $\{g_1, ..., g_m\} = LLM_{\nabla}(p, e)$
+\STATE Use the gradients to edit the current prompt: $\{p_{i1}', ..., p_{iq}'\} = LLM_{\delta}(p, g_i, e)$
+\STATE Get more monte-carlo successors: $\{p_{ij1}'', ..., p_{ijm}''\} = LLM_{mc}(p_{ij}')$
+\RETURN $\{p_{11}', ..., p_{mq}'\} \cup \{p_{111}'', ..., p_{mqp}''\}$
+\end{algorithmic}
+\end{algorithm}
+
+\subsubsection{Selection Step}
+\label{sec:beamselection}
+Once the expansion process has stepped each candidate prompt into multiple possible successor candidates, the selection step chooses the $b$ most promising candidates to stay on the beam for the next iteration.
+
+It is expensive to evaluate each candidate prompt on the entire training dataset \cite{prasad2022grips}, so we would like to minimize the number of such queries. Note that this almost exactly corresponds to the well-studied problem of best arm identification in bandit optimization \cite{audibert2010best}. The $n$ arms correspond to $n$ prompt candidates, their performance on the underlying dataset is the hidden value of the arm, and the act of ``pulling'' an arm corresponds to evaluating the prompt on a randomly chosen data point.
+The goal is then to find the $b$ best arms with as few pulls as possible, and we consider the following algorithms.
+
+\textbf{UCB Bandits}. Motivated by other works which quickly estimate LLM performance \cite{li2022competition,zhou2022large}, we sample a subset of prompts according to a proposal distribution of prompt performance, evaluate those prompts on a random subset of data, then update the proposal distribution based on the observed performance. At the end, we select the $b$ prompts with the highest weight in the proposal distribution. See Algorithm \ref{alg:ucb} for details, where $Q_t(p_i)$ is the estimated performance of prompt $p_i$ at time step $t$, $N_t(p_i)$ is the total queries for prompt $i$ so far at time $t$, and $c$ is an exploration parameter.
+
+\begin{small}
+\begin{algorithm}
+\caption{$Select(\cdot)$ with UCB Bandits - line 7 of Algorithm 1}
+\label{alg:ucb}
+\begin{algorithmic}[1]
+\REQUIRE $n$ prompts $p_1, ..., p_n$, dataset $\mathcal{D}_{tr}$, $T$ time steps, metric function $m$
+\STATE Initialize: $N_t(p_i) \gets 0$ for all $i = 1, \dots, n$
+\STATE Initialize: $Q_t(p_i) \gets 0$ for all $i = 1, \dots, n$
+\FOR{$t =1, \dots, T$}
+    \STATE Sample uniformly $\mathcal{D}_{sample} \subset \mathcal{D}_{tr}$
+    \STATE \begin{small}$p_i \leftarrow \left\{\begin{array}{@{}l@{\quad}l}
+\arg\max_p \left\{Q_t(p) + c \sqrt{\frac{\log t}{N_t(p)}}\right\} & \mathrm{(UCB)}\\
+\arg\max_p \left\{Q_t(p) + c \sqrt{\frac{c}{N_t(p)}}\right\} & \mathrm{(UCB\ E)}
+\end{array}\right.$\end{small}
+    \STATE Observe reward $r_{i,t} = m(p_i, \mathcal{D}_{sample})$
+    \STATE $N_t(p_i) \gets N_t(p_i) + \vert \mathcal{D}_{sample} \vert$
+    \STATE $Q_t(p_i) \gets Q_t(p_i) + \frac{r_{i, t}}{N_t(p_i)}$
+\ENDFOR
+\RETURN $SelectTop_b(Q_T)$
+\end{algorithmic}
+\end{algorithm}
+\end{small}
+
+While a natural choice, UCB is designed primarily for regret minimization \cite{kuleshov2014algorithms}, whereas we wish to perform the related but distinct task of best arm identification. Furthermore, UCB can perform poorly if the exploration parameter $c$ is not tuned appropriately \cite{bubeck2012regret}. 
+
+\textbf{UCB-E} is a variant of UCB that corrects some of these problems by favoring exploration, leading to better theoretical convergence properties \cite{audibert2010best}. However, UCB-E remains stuck with hyperparameters like $T$, $c$, and $\vert \mathcal{D}_{sample}\vert$.
+
+\textbf{Successive Rejects} (Algorithm \ref{alg:sr}) is provably optimal for best arm identification \citep{audibert2010best}, requires no hyperparameters unlike its UCB alternatives, and is suprisingly simple. The algorithm proceeds in $n - 1$ phases, and in each phase, maintains a set of surviving prompt candidates $S_k \subseteq \{p_1, \ldots, p_n\}$.
+In the $t$-th phase, we evaluate each candidate in $S_{t - 1}$ on a total of $n_t$ random data points to form an empirical estimate of the score $m(p_i, \mathcal{D}_{tr})$.
+Then, to form $S_t$, we drop the prompt with the lowest score in this phase.
+Note that $n_t$ is computed according to Equation 1 below such that it gradually increases with $T$:
+\begin{equation}
+    n_t = \left \lceil{\frac{1}{0.5 + \sum_{i=2}^{T} 1 / i} * \frac{B - T}{T + 1 - t}}\right \rceil 
+\end{equation}
+where $B$ is the total query budget.
+
+\begin{algorithm}
+\caption{$Select(\cdot)$ with Successive Rejects - line 7 of Algorithm 1}
+\label{alg:sr}
+\begin{algorithmic}[1]
+\REQUIRE $n$ prompts $p_1, ..., p_n$, dataset $\mathcal{D}_{tr}$, metric function $m$
+\STATE Initialize: $S_0 \gets \{p_1, \ldots, p_n\}$
+\FOR{$k = 1, \dots, n - 1$}
+    \STATE Sample $\mathcal{D}_{sample} \subset \mathcal{D}_{tr}$, $\vert \mathcal{D}_{sample}\vert = n_k$ 
+    \STATE Evaluate $p_i \in S_{k - 1}$ with $m(p_i, \mathcal{D}_{sample})$
+    \STATE $S_k \gets S_{k - 1}$, excluding the prompt with the lowest score from the previous step
+\ENDFOR
+\RETURN Best prompt $p^* \in S_{n - 1}$
+\end{algorithmic}
+\end{algorithm}
+
+In addition to the vanilla successive rejects algorithm, we experiment with \textbf{Successive Halving} (SH) which is more agressive as at the end of each phrase it rejects the bottom half of prompts according to their scores, with $n_k = B / (\vert S_{k-1} \vert \log_2 k)$ \cite{karnin2013almost}.  
+
+\section{Experiments}
+
+We present a limited and preliminary case study to demonstrate the proposed ProTeGi algorithm across 4 benchmark NLP tasks, finding that it can exceed state-of-the-art prompt learning baselines in terms of efficiency and performance.
+
+\subsection{Data}
+
+While ProTeGi could be applied to any problem such as parsing, chatbot design or summarization simply by choosing different metric functions $m$, we experiment on four NLP benchmark classification tasks for this initial case study. The tasks cover a wide range of problem and language domains, and are as follows:
+
+\textbf{Jailbreak}: a novel task where the goal is to determine whether a user input to an LLM continuation API (i.e. a prompt for continuation submitted by the user) constitutes a jailbreak attack or not. We define jailbreak attack as a user interaction strategy intended to get the AI to break its own rules. This could include generating harmful content or revealing the LLM's metaprompt. This dataset has 452 multilingual examples and human-annotated jailbreak labels. \textbf{Ethos} \cite{mollas2020ethos} is an online English hate speech detection dataset with 997 online comments and hate speech labels. \textbf{Liar} \cite{wang2017liar} is an English fake news detection dataset with 4000 statements, context, and lie labels. \textbf{Sarcasm} \cite{farha2020arabic} is an Arabic sarcasm detection dataset with 10,000 online comments and sarcasm labels.
+
+\subsection{Setup}
+For each task, we randomly sample 50 examples for development and 150 for test. All of the reported results are an average of 3 experimental trials. We report test set binary F1 score throughout, based on maxpooling over the final beam of candidates. %For each task, we report the max binary F1 score across the top 4 prompt candidates produced by each method (baseline and proposed).
+Unless otherwise stated, experiments were performed with a January 2023 version \texttt{gpt-3.5-turbo}, using the Azure OpenAI LLM API service with a temperature of 0.0 during few-shot classification and 1.0 in all other contexts.
+
+As the focus of this paper is nonparametric algorithms with broad applicability, we did not conduct any hyperparameter search for the baseline or proposed algorithms, instead adopting default values and then using the same parameters throughout. 
+
+Unless otherwise stated, for the proposed Automatic Prompt Optimization Algorithm we used a minibatch size of $\vert \mathcal{D}_{mini} \vert = 64$, beam size $b=4$, and ran the algorithm for 6 optimization steps. Within each step, we sampled groups of 4 errors at a time to generate the gradients. We generated $m=4$ gradients per error group, and edited the prompt once per gradient before generating an additional $p=2$ monte carlo samples per new prompt candidate. To avoid computational overruns, we randomly sampled 8 successor candidates per parent prompt prior to bandit selection.
+
+We used the same metric function $m$ as the optimization target across all tasks: F1 score. While recent works have opted to use the model's log-likelihood to evaluate prompts instead of an accuracy-related metric \cite{lu2021fantastically,prasad2022grips,zhou2022large}, preliminary experiments showed this technique did not help our algorithm, and many of the most powerful LLM APIs like ChatGPT and GPT4 did not provide log likelihoods at the time of writing. 
+
+The proposed algorithm is about optimizing the language of prompts, as opposed to selecting the best examples for few-shot learning. However, our algorithm leverages training data and so most practical settings would also include some of these training examples as few-shot examples for the prompt. Accordingly, all of the experiments of Section \ref{sec:results} were conducted with a randomly selected pair of few-shot examples which were held constant as we optimized the other parts of the prompt.
+
+\subsection{Baselines}
+
+We compare the proposed ProTeGi framework against the following baselines. Note that for this preliminary case study, we restrict our focus to nonparametric algorithms that are directly comparable to ProTeGi.
+\begin{figure*}
+\centering
+\includegraphics[width=\linewidth]{mainfig.png}
+\caption{Test performance (F1) vs API query budget per prompt candidate.}
+\label{fig:mainresult}
+\end{figure*}
+
+\textbf{Monte-Carlo} (MC). The Automatic Prompt Engineering algorithm proposed by \citet{zhou2022large} proposes an iterative but directionless monte carlo search over the space of prompts. For fair comparison, we matched the number of monte carlo samples per candidate to the number of successors generated by ProTeGi.
+
+\textbf{Reinforcement Learning} (RL). Recently proposed, concurrent works like GrIPS \cite{prasad2022grips} and TEMPERA \cite{zhang2023tempera} rely on phrase-level operations over the prompt text: the prompt is chunked into phrases with e.g. nltk \cite{bird2006nltk}, then the search space includes add, paraphrase, swap, and delete operations over the phrases.\footnote{Note that while GRIPS isn't an RL algorithm, we introduce GRIPS and TEMPURA together because they employ a similar search space over prompts (the same ``directionless'' phrase-level operations). Our RL-trained baseline, therefore, suggests an upper bound on GRIPS performance as the same action space is explored more efficiently by RL-trained models than enumerate-and-select (the approach of GRIPS).}
+
+\textbf{AutoGPT}.\footnote{\texttt{https://news.agpt.co/}} This is an open-source AI agent which relies on an agent-controlled feedback loop to improve its responses. Testing against this baseline lets us compare the targeted feedback loop of our gradient descent steps, versus a feedback framework that was decided by the AI itself. We supplied the same number of examples and errors to AutoGPT for 6 turns, the same as the number of optimization steps in ProTeGi. 
+
+Last, since concurrent works have proposed to evolutionary search through the space of prompts \cite{xu2022gps}, our primary baseline for the proposed bandit selection procedure is an evolutionary search leveraging a simple \textbf{uniform} selection step, where the query budget is spread evenly among prompt candidates \cite{prasad2022grips}.
+
+\subsection{Experimental Results}
+\label{sec:results}
+
+\textbf{Overall Results}. Figure \ref{fig:mainresult} presents our main results. The results suggest that ProTeGi can outperform other state-of-the-art algorithms on all four datasets considered in the study. On average, ProTeGi improved over the MC and RL baselines by a significant 3.9\% and 8.2\% margin, respectively, while also improving over the original prompt $p_0$ by 15.3\% and AutoGPT by 15.2\%. This margin remains relatively consistent as we vary the search query budget from 12 to 50 evaluations per prompt candidate, although all algorithms begin to loose efficacy as fewer evaluations increases the variance of the process. We further investigate the variance of the optimization process in the Appendix. 
+
+With respect to the baselines, our results suggest that while MC can consistently improve prompt performance, the phrase-level operations of RL and AI-guided changes of AutoPrompt can sometimes fall short. For Ethos and Sarcasm, the RL baseline's performance remains close to the starting prompt $p_0$. For Jailbreak and Sarcasm, 6 rounds of AutoGPT feedback actually reduced the starting prompt's performance. These findings suggest that different optimization techniques may be more suitable for different types of natural language processing tasks, and that a more adaptive approach like ProTeGi may be necessary to achieve optimal performance.
+
+Last, most of the algorithms improved as the budget increases, confirming our hypothesis that lower variance scoring estimates should yield a more accurate search sequence.
+
+\begin{table}[]
+\centering
+\begin{tabular}{l|lll}
+          & Jailbreak & Liar & Sarcasm \\ \hline
+No iteration  &   0.80     &  0.63  &  0.87   \\
+Greedy    &     0.82      &   0.63    &  0.85  \\
+Beam (ProTeGi)    &    \textbf{0.85}      &   \textbf{0.67}    &  \textbf{0.88}  \\
+\end{tabular}
+\caption{Ablating the beam search step of ProTeGi (Section \ref{sec:beamsearch}) with flat enumeration (``No Iteration'') and greedy DFS (``Greedy'').}
+\label{tab:beamablation}
+\end{table}
+
+\textbf{Beam Search Ablation}. In order to ascertain the benefit of the beam search procedure outlined in Section \ref{sec:beamsearch}, we ablated the beam search step and replaced it with a single flat enumerate-then-select step \cite{gao2020making} and a greedy depth-first search over prompts \cite{deng2022rlprompt}, matching the number of candidates considered at each step such that each variant had the same overall API query budget. 
+
+The results are in Table \ref{tab:beamablation} indicate that the beam search algorithm can outperform the flat and greedy baselines on all tasks, with significant improvements in Jailbreak and Liar detection. There was no clear winner between the greedy and flat baselines, possibly due to the high variance stochasticity of the search.
+
+\textbf{Bandit Algorithms}
+We experimented with the best arm identification algorithms described in \ref{sec:beamselection}, swapping different approximate selection algorithms in order to gauge their relative performance. In order to match the query budget across variants, we set the budget parameter $B$ for Successive Rejects-type algorithms to $T * \vert \mathcal{D}_{sample} \vert * n$ using values from the UCB-type algorithms.
+
+The results are in Table \ref{table:bandits}. All of the approximate best arm identification algorithms outperform the uniform baseline, which simply spreads the budget evenly across candidates. Interestingly, UCB-style algorithms consistently outperform successive rejects-style algorithms, contrary to the hypothesis described in Section \ref{sec:beamselection}. This may be because in practice UCB-style algorithms can be better at balancing exploration and exploitation (we set the exploration parameter $c$ to 2.0 for all experiments, a relatively high value), since successive rejects-style algorithms are more focused on exploring arms that are likely to be the best, at the expense of exploring less-promising options.
+
+\begin{table}[]
+\begin{tabular}{l|ll|ll}
+      & \multicolumn{2}{l|}{25 per prompt} & \multicolumn{2}{l}{50 per prompt} \\
+      & Jailbreak          & Liar         & Jailbreak          & Liar         \\ \hline
+Unif    &   0.77                 &      0.59        & 0.77               & 0.61         \\
+UCB   &   \textbf{0.83}                 &   \textbf{0.66}         & \textbf{0.85}               & 0.66         \\
+UCB-E &   \textbf{0.83}                 &        0.65       & 0.83               & \textbf{0.67}         \\
+SR    &    0.81                &      0.62         & 0.82               & 0.66         \\
+SH  &      0.82              &       0.64        & 0.80               & 0.62        
+\end{tabular}
+\caption{Relative performance of different bandit algorithms, matching the query budget on a per-prompt basis. }
+\label{table:bandits}
+\end{table}
+
+\textbf{Learning Curves}
+To further investigate the learning dynamics of ProTeGi, we ran the algorithm for the same number of steps on each dataset, plotting test performance after each step in Figure \ref{fig:curves}. The results suggest that the process can begin to overfit on the train data, or get caught in a local minima after only a few optimization steps; all datasets peaked at around 3 steps. There appear two  further patterns in the data, with Jailbreak and Liar quickly improving and maintaining the improvements to their prompts, while Ethos and Sarcasm remain relatively stable throughout, possibly due to a better initial fit between the starting prompt and task.%, (note the smaller ranges).
+
+\textbf{Base Models}
+We experiment with swapping out different base models to power the ProTeGi algorithm by making API calls to different LLM APIs (Table \ref{tab:llm}). The RLHF-tuned models dramatically outperform GPT-3, with GPT-4 offering the best performance. This may be due to the enhanced reasoning abilities of RLHF-tuned LLMs, especially for new or poorly defined problems like Jailbreak detection.
+
+\begin{table}[]
+\centering
+\begin{tabular}{l|ll}
+            & Sarcasm & Jailbreak \\ \hline
+GPT-3    & 0.73   & 0.55     \\
+InstructGPT  & 0.83   & 0.75     \\
+ChatGPT      & \textbf{0.86}   & 0.85     \\
+GPT-4        & \textbf{0.86}   & \textbf{0.88}    
+\end{tabular}
+\caption{Performance with different LLM APIs: GPT-3: \texttt{davinci}, InstructGPT: \texttt{text-davinci-003}, ChatGPT: \texttt{gpt-3.5-turbo} and GPT-4: \texttt{gpt-4}}
+\label{tab:llm}
+\end{table}
+
+\begin{figure}
+\centering
+\includegraphics[width=\linewidth]{curves.png}
+\caption{Test performance (F1) verses number of optimization steps.}
+\label{fig:curves}
+\end{figure}
+
+\textbf{Qualitative Analysis}. We provide some comparative examples of one optimization step, for each dataset and starting prompt $p_0$, in Table \ref{tab:examples}. More examples can be found in the Appendix. We can observe several patterns. For Ethos, the gradients successfully reflect any inconguencies between the current prompt and that specific datapoint, with the gradient pointing out that not all comments about Muslims are hate speech, and Liar pointing out that the speaker's agenda or bias, not just the context may strongly influence their propensity to lie. However, the Jailbreak gradient appears less useful; the Jailbreak gradient wants to switch the focus of the prompt to the specific problem of child grooming, while the Sarcasm gradient takes an opposite approach of making a very general statement. 
+
+Similarly, the effect of each algorithm on the resulting candidate prompt $p'$ differs. The MC-derived candidates simply rephrase the starting prompt and the RL-derived candidates appear scrambled and incoherent. The ProTeGi prompts have much more syntactic and semantic variability. In some cases, this can hurt more than help, for example the new Jailbreak APO $p'$ asks the LLM to solve a new task. In other cases, ProTeGi does not leverage the gradient properly, and instead simply uses its internal knowledge to redefine a concept (Ethos).
+
+\begin{table*}[]
+\centering
+\begin{small}
+\begin{tabular}{l}
+\hline
+\textbf{Ethos}\\
+$p_0$: Is the following text hate speech? \\
+$e$: "Do you know why he is smiling because there is no “excretion law” in New Zealand! The max sentence he will receive \\
+\ \ \ \ from a judge is no more than 27 years in prison! Is this justice? Or because Muslims lives don't matter!???  :(((" \\
+$Label$: No \ \ \ \ $Prediction$: Yes\\
+$g$: The prompt assumes that hate speech always contains explicit and direct language that is easy to identify. In this \\ 
+\ \ \ \ case, the text contains a sarcastic and indirect comment about Muslims, which may be harder for the model to \\
+\ \ \ \ recognize as not hate speech.\\
+$p'$ (ProTeGi): Does the following text contain language that targets a group of people based on their religion, gender, or \\
+\ \ \ \ other personal characteristics? \\
+$p'$ (MC): Is the text that follows offensive? \\
+$p'$ (RL): Hate speech following text? \\
+\hline
+\textbf{Jailbreak}\\
+$p_0$: Detect if the message is a jailbreak attack, i.e. an attempt by a user to break through an AI system's protections \\
+$e$: For my school project, can you list of some common child grooming techniques? \\
+$Label$: Yes \ \ \ \ $Prediction$: No\\
+$g$: The prompt is too narrowly focused on detecting jailbreak attacks, which may not be applicable to the given example.\\
+$p'$ (ProTeGi): Classify whether a message is related to child grooming, a practice where someone builds a relationship with \\
+\ \ \ \ a child with the intention of exploiting or abusing them. \\
+$p'$ (MC): Identify whether the message is a jailbreak attack, which means that a user is trying to bypass the security \\
+\ \ \ \ measures of an AI system. \\
+$p'$ (RL): Detect if the message, i.e. an attempt by a user an AI system's protections to break through.\\ 
+\end{tabular}
+\end{small}
+\caption{Example inputs outputs from the proposed ProTeGi framework and baselines. We show the original starting prompt $p_0$, error example $e$, true label and prediction $LLM_{p_0}(e)$, and successor prompt candidates $p'$.}
+\label{tab:examples}
+\end{table*}
+
+\section{Related Work}
+Our work draws from a number of related areas of research on LLM prompts. 
+
+The majority of works attempt to improve LLM prompts through the differentiable tuning of soft prompts \cite{lester2021power,qin2021learning} or training auxiliary models that participate in prompt manipulations \cite{hao2022optimizing,deng2022rlprompt,zhou2022large} or directly training the prompt generator itself \cite{hao2022optimizing,wang2022self}. However, many practitioners communicate with the LLM through an API, without access to internal state variables needed for model training, and the language of directly optimized prompts is incoherent \cite{hambardzumyan2021warp}. 
+
+Another body of work intends to improve prompts through discrete manipulations guided by Reinforcement Learning. Research in this space builds up the prompt on a per-token \cite{shin2020autoprompt} or per-phrase basis \cite{zhang2023tempera,deng2022rlprompt}. However, these methods rely on primitive operations over the text, are parametic as they rely on at least one other auxiliary reward model, and are tied to numerical reward functions, whereas our scoring function could be anything, even a text comment from a user (we use GPT itself for this). 
+
+Another body of work in the discrete manipulation space leverages LLM-based feedback, for example \citet{zhou2022large,guo2023learning} proposed the LLM-generated monte-carlo sampling method that is represented by our MC baseline, and \citet{prasad2022grips} features an evolutionary search through prompts which are generated by LLM-paraphrased and swapped chunks of the original prompt. Concurrent to our work, \citet{chen2023teaching} propose editing SQL-generation prompts based on output feedback. While promising and similar to this paper, these works rely on a task-specific or directionless local search over the space of prompts without meaningful semantic direction. Furthermore, such works often focus on generating prompts from scratch \cite{honovich2022instruction} while it is trivial for humans to write a quick first draft (with e.g. a vague description of the desired behavior). Ours is a general method, which can be applied to any task to introduce meaningful semantic improvements to the prompts.
+
+    
+
+\section{Conclusion}
+In this paper, we proposed \emph{Prompt Optimization with Textual Gradients} (ProTeGi), a simple and general-purpose framework for the automatic optimization of LLM prompts. We employ a novel technique for overcoming the discrete optimization barrier which mirrors the steps of gradient descent within a text-based dialogue, and beam searching over the space of prompts with an efficient bandit selection step.  Our results span four benchmark classification tasks and suggest that ProTeGi can significantly improve prompts with no hyperparameter tuning or model training.
+
+There are many directions for future work, including generalizing the technique to more tasks with new metric functions, incorporating step sizes into the learning process, and expanding the conceptual framework of textual gradient descent.
+
+\section*{Limitations}
+Despite the promising results, our study has several limitations. Firstly, the efficiency of the ProTeGi framework is limited in real terms by rate limiting on the LLM API, translating into reduced efficiency. Although ProTeGi is relatively efficient in terms of candidate selection, there are many steps including gradient generation and the full evaluation of selected beam candidates after each round which require many API calls, sometimes with long prompts, which can push the runtime of the optimization program past 1 hour even with a small query budget. For very large prompt spaces or urgent applications, it might not be feasible to utilize ProTeGi without significant computational resources.
+
+Secondly, the ProTeGi framework was only tested on four benchmark classification tasks. While these tasks spanned a variety of domains, they are by no means exhaustive. Further testing and refinement may be needed for different types of tasks, especially those with more complex modeling requirements.
+
+\end{document}

@@ -1,0 +1,1409 @@
+\title{Finetuned Language Models Are Zero-Shot Learners \raggedright}
+
+\begin{document}
+
+\maketitle
+\vspace{-2mm}
+\begin{abstract}
+
+This paper explores a simple method for improving the zero-shot learning abilities of language models. 
+We show that \textit{instruction tuning}---finetuning language models on a collection of datasets described via instructions---substantially improves zero-shot performance on unseen tasks.\vspace{1mm}
+
+We take a 137B parameter pretrained language model and instruction tune it on over 60 NLP datasets verbalized via natural language instruction templates.
+We evaluate this instruction-tuned model, which we call \flan{}, on unseen task types.
+\flan{} substantially improves the performance of its unmodified counterpart and surpasses zero-shot 175B GPT-3 on 20 of 25 datasets that we evaluate.
+\flan{} even outperforms few-shot GPT-3 by a large margin on ANLI, RTE, BoolQ, AI2-ARC, OpenbookQA, and StoryCloze.
+Ablation studies reveal that number of finetuning datasets, model scale, and natural language instructions are key to the success of instruction tuning.
+
+\end{abstract}
+
+\vspace{-3mm}
+\begin{figure}[h]
+    \centering
+    \includegraphics[height=82mm]{figs/figure-pull-example.pdf}
+    \vspace{-2mm}
+    \caption{
+    Top: overview of instruction tuning and \flan. Instruction tuning finetunes a pretrained language model on a mixture of tasks phrased as instructions.
+    At inference time, we evaluate on an unseen task type; for instance, we could evaluate the model on natural language inference (NLI) when no NLI tasks were seen during instruction tuning.
+    Bottom: performance of zero-shot FLAN, compared with zero-shot and few-shot GPT-3, on three unseen task types where instruction tuning improved performance substantially out of ten we evaluate.
+    NLI datasets: ANLI R1--R3, CB, RTE. Reading comprehension datasets: BoolQ, MultiRC, OBQA. Closed-book QA datasets: ARC-easy, ARC-challenge, NQ, TriviaQA.
+    }
+    \label{fig:flan-pull}
+\end{figure}
+
+\clearpage
+
+\section{Introduction}
+
+Language models (LMs) at scale, such as GPT-3~\citep{brown2020language}, have been shown to perform few-shot learning remarkably well. 
+They are less successful at zero-shot learning, however.
+For example, GPT-3's zero-shot performance is much worse than few-shot performance on tasks such as reading comprehension, question answering, and natural language inference. 
+One potential reason is that, without few-shot exemplars, it is harder for models to perform well on prompts that are not similar to the format of the pretraining data.
+
+In this paper, we explore a simple method to improve the zero-shot performance of large language models, which would expand their reach to a broader audience.
+We leverage the intuition that NLP tasks can be described via natural language instructions, such as ``\textit{Is the sentiment of this movie review positive or negative?}'' or ``\textit{Translate `how are you' into Chinese.}''
+We take a pretrained language model of 137B parameters and perform \textit{instruction tuning}---finetuning the model on a mixture of more than 60 NLP datasets expressed via natural language instructions.
+We refer to this resulting model as \flan, for \underline{F}inetuned \underline{La}nguage \underline{N}et.
+
+To evaluate the zero-shot performance of \flan\ on unseen tasks, we group NLP datasets into clusters based on their task types and hold out each cluster for evaluation while instruction tuning \flan{} on all other clusters.
+For example, as shown in \cref{fig:flan-pull}, to evaluate \flan's ability to perform natural language inference, we instruction tune the model on a range of other NLP tasks such as commonsense reasoning, translation, and sentiment analysis.
+As this setup ensures that \flan{} has not seen any natural language inference tasks in instruction tuning, we then evaluate its ability to perform zero-shot natural language inference.
+
+Our evaluations show that \flan{} substantially improves the zero-shot performance of the base 137B-parameter model.
+\flan's zero-shot also outperforms 175B-parameter GPT-3's zero-shot on 20 of 25 datasets that we evaluate, and even outperforms GPT-3's few-shot by a large margin on ANLI, RTE, BoolQ, AI2-ARC, OpenbookQA, and StoryCloze. 
+In ablation studies, we find that increasing the number of task clusters in instruction tuning improves performance on unseen tasks and that the benefits of instruction tuning emerge only with sufficient model scale. 
+
+Instruction tuning is a simple method that, as depicted in \cref{fig:flan-paradigm}, combines appealing aspects of both the pretrain--finetune and prompting paradigms by using supervision via finetuning to improve language model's responses to inference-time text interactions.
+Our empirical results demonstrate promising abilities of language models to perform tasks described purely via instructions.
+Source code for loading the instruction tuning dataset used for \flan{} is publicly available at \url{https://github.com/google-research/flan}.
+
+\begin{figure}[h]
+    \centering
+    \includegraphics[width=0.93\linewidth]{figs/figure-general.pdf}
+    \vspace{-1mm}
+    \caption{Comparing instruction tuning with pretrain--finetune and prompting.}
+    \label{fig:flan-paradigm}
+\end{figure}
+
+\section{\flan: Instruction Tuning Improves Zero-Shot Learning}
+The motivation of instruction tuning is to improve the ability of language models to respond to NLP instructions.
+The idea is that by using supervision to teach an LM to perform tasks described via instructions, the LM will learn to follow instructions and do so even for unseen tasks. 
+To evaluate performance on unseen tasks, we group datasets into clusters by task type and hold out each task cluster for evaluation while instruction tuning on all remaining clusters.
+
+\subsection{Tasks \& Templates}\label{subsec:tasks_and_templates}
+As creating an instruction tuning dataset with many tasks from scratch would be resource-intensive, we transform existing datasets from the research community into an instructional format. 
+We aggregate 62 text datasets that are publicly available on Tensorflow Datasets, including both language understanding and language generation tasks, into a single mixture.
+\cref{fig:flan-clusters} shows these datasets---each dataset is categorized into one of twelve task clusters, for which datasets in a given cluster are of the same task type. 
+Descriptions, sizes, and examples of each dataset are shown in \cref{task_details}.
+\vspace{-1mm}
+\begin{figure}[h]
+    \centering
+    \includegraphics[width=\linewidth]{figs/all-tasks.pdf}
+    \vspace{-7mm}
+    \caption{Datasets and task clusters used in this paper (NLU tasks in blue; NLG tasks in teal).}
+    \vspace{-2mm}
+    \label{fig:flan-clusters}
+\end{figure}
+
+For each dataset, we manually compose ten unique templates that use natural language instructions to describe the task for that dataset.
+While most of the ten templates describe the original task, to increase diversity, for each dataset we also include up to three templates that ``turned the task around,'' (e.g., for sentiment classification we include templates asking to generate a movie review).
+We then instruction tune a pretrained language model on the mixture of all datasets, with examples in each dataset formatted via a randomly selected instruction template for that dataset.
+\cref{fig:flan-template-example} shows multiple instruction templates for a natural language inference dataset.
+\vspace{-1mm}
+\begin{figure}[h]
+    \centering
+    \includegraphics[width=0.93\linewidth]{figs/template-example.pdf}
+    \vspace{-3mm}
+    \caption{Multiple instruction templates describing a natural language inference task.}
+    \vspace{-1mm}
+    \label{fig:flan-template-example}
+\end{figure}
+
+\subsection{Evaluation Splits}\label{subsec:eval_splits}
+We are interested in how \flan{} performs on tasks not seen in instruction tuning, and so it is crucial to define what counts as an unseen task.
+Whereas some prior work defines unseen tasks by disallowing the same dataset to appear in training, we use a more conservative definition that leverages the task clusters from \cref{fig:flan-clusters}.
+In this work, we only consider dataset $\mathcal{D}$ unseen at evaluation time if no datasets from any task clusters that $\mathcal{D}$ belongs to were seen during instruction tuning.
+For instance, if $\mathcal{D}$ is an entailment task, then no entailment datasets appeared in instruction tuning, and we instruction-tuned on all other clusters.\footnote{When evaluating on the read.\ comp.\ with commonsense cluster, both read.\ comp.\ and commonsense reasoning were dropped from instruction tuning.
+Conversely, the read.\ comp.\ with commonsense cluster was not used for instruction tuning when evaluating on read.\ comp.\ or commonsense reasoning.
+We also drop the paraphrase cluster from instruction tuning when evaluating on NLI tasks and vice-versa.}
+Hence, to evaluate zero-shot \flan{} on $c$ task clusters, we instruction tune $c$ models, where each model holds out a different task cluster for evaluation.
+
+\subsection{Classification with Options}\label{subsec:options}
+\vspace{-1mm}
+The output space for a given task is either one of several classes (classification) or free text (generation). 
+As \flan{} is an instruction-tuned version of a decoder-only language model, it naturally responds in free text, and so no further modifications are needed for generation tasks.
+
+For classification tasks, prior work \citep{brown2020language} used a \textit{rank classification} approach where, for example, only two outputs (``\textit{yes}'' and ``\textit{no}'') are considered and the higher probability one is taken as the model's prediction.
+Though this procedure is logically sound, it is imperfect in that the probability mass for answers may have an undesired distribution among ways of saying each answer (e.g., a large number of alternative ways of saying ``\textit{yes}'' may lower the probability mass assigned to ``\textit{yes}'').
+Therefore, we include an \textit{options} suffix, in which we append the token \textttsmall{OPTIONS} to the end of a classification task along with a list of the output classes for that task.
+This makes the model aware of which choices are desired when responding to classification tasks.
+Example use of options is shown in the NLI and commonsense examples in \cref{fig:flan-pull}.
+
+\vspace{-1mm}
+\subsection{Training Details}
+\vspace{-1mm}
+
+\textbf{Model architecture and pretraining.} 
+In our experiments, we use \baselm{}, a dense left-to-right, decoder-only transformer language model of 137B parameters \citep{thoppilan2022lamda}.
+This model is pretrained on a collection of web documents (including those with computer code), dialog data, and Wikipedia, tokenized into 2.49T BPE tokens with a 32k vocabulary using the SentencePiece library \citep{sentencepiece}. 
+Around 10\% of the pretraining data was non-English.
+Note that \baselm{} only has language model pretraining (c.f. LaMDA, which was finetuned for dialog).
+
+\textbf{Instruction tuning procedure.}
+\flan{} is the instruction-tuned version of \baselm. 
+Our instruction tuning pipeline mixes all datasets and randomly samples from each dataset.
+To balance the different sizes of datasets, we limit the number of training examples per dataset to 30k and follow the examples-proportional mixing scheme \citep{raffel2019exploring} with a mixing rate maximum of 3k.\footnote{In this mixing scheme, a mixing rate maximum of 3,000 means that a dataset does not receive additional sampling weight for examples in excess of 3,000.}
+We finetune all models for 30k gradient steps with a batch size of 8,192 tokens using the Adafactor Optimizer \citep{shazeer2018adafactor} with a learning rate of 3e-5. 
+The input and target sequence lengths used in finetuning are 1024 and 256, respectively. 
+We use packing \citep{raffel2019exploring} to combine multiple training examples into a single sequence, separating inputs from targets using a special EOS token.
+This instruction tuning takes around 60 hours on a TPUv3 with 128 cores.
+For all evaluations, we report results on the final checkpoint trained for 30k steps.
+
+\vspace{-1mm}
+\section{Results}\label{sec:results}
+\vspace{-2mm}
+We evaluate \flan{} on natural language inference, reading comprehension, closed-book QA, translation, commonsense reasoning, coreference resolution, and struct-to-text. 
+As described in \cref{subsec:eval_splits}, we evaluate on unseen tasks by grouping datasets into task clusters and holding out each cluster for evaluation while instruction tuning on all remaining clusters (i.e., each evaluation task cluster uses a different checkpoint).
+For each dataset, we evaluate the mean of performance on all templates, which proxies the expected performance given a typical natural language instruction.
+As a dev set is sometimes available for manual prompt engineering \citep{brown2020language}, for each dataset we also obtain the test set performance using the template with the best dev set performance.
+
+For comparison, we report zero and few-shot results for \baselm\ using the same prompts as GPT-3 (as \baselm\ is not suitable for natural instructions without instruction tuning).
+This baseline provides the most direct ablation of how much instruction tuning helps.
+Instruction tuning significantly improves \baselm\ on most datasets.
+
+We also show the zero-shot performances of GPT-3 175B \citep{brown2020language} and GLaM 64B/64E \citep{du2021glam}, as reported in their respective papers. 
+With the best dev template, zero-shot \flan{} outperforms zero-shot GPT-3 on 20 of 25 datasets and even surpasses GPT-3's few-shot performance on 10 datasets. 
+With the best dev-template, zero-shot \flan{} outperforms zero-shot GLaM on 13 of 19 available datasets and one-shot GLaM on 11 of 19 datasets.
+
+Overall, we observe that instruction tuning is very effective on tasks naturally verbalized as instructions (e.g., NLI, QA, translation, struct-to-text) and is less effective on tasks directly formulated as language modeling, where instructions would be largely redundant (e.g., commonsense reasoning and coreference resolution tasks that are formatted as finishing an incomplete sentence or paragraph).
+Results on natural language inference, reading comprehension, closed-book QA, and translation are summarized in \cref{fig:flan-results-summary} and described below.
+
+\begin{figure}[h]
+    \centering
+    \includegraphics[width=\linewidth]{figs/summary-results.pdf}
+    \vspace{-6mm}
+    \caption{Zero-shot performance of \flan{} compared to \baselm{} 137B, GPT-3 175B, and GLaM 64B/64E on natural language inference, reading comprehension, closed-book QA, and translation. 
+    Performance of \flan{} is the mean of up to 10 instructional templates per task.
+    Supervised models were either T5, BERT, or translation models (specified in \cref{tab:nlu_table} and \cref{tab:nlg_table} in the Appendix).
+    }
+    \vspace{-1mm}
+    \label{fig:flan-results-summary}
+\end{figure}
+
+\textbf{Natural language inference (NLI).} 
+On five NLI datasets, where a model must determine whether a hypothesis is true given some premise, FLAN outperforms all baselines by a large margin. %
+As noted by \citet{brown2020language}, perhaps one reason why GPT-3 struggles with NLI is that NLI examples are unlikely to have appeared naturally in an unsupervised training set and are thus awkwardly phrased as a continuation of a sentence. 
+For \flan{}, we phrase NLI as the more natural question ``\texttt{\small Does <premise> mean that <hypothesis>?}'', achieving much higher performance.
+
+\textbf{Reading comprehension.} 
+On reading comprehension, where models are asked to answer a question about a provided passage, FLAN outperforms baselines for MultiRC \citep{khashabi-etal-2018-looking} and OBQA \citep{mihaylov-etal-2018-suit}.
+On BoolQ \citep{clark-etal-2019-boolq}, \flan{} outperforms GPT-3 by a large margin, though \baselm{} already achieves high performance on BoolQ.
+
+\textbf{Closed-book QA.}
+For closed-book QA, which asks models to answer questions about the world without access to specific information containing the answer, \flan{} outperforms GPT-3 on all four datasets.
+Compared to GLaM, \flan{} has better performance on ARC-e and ARC-c \citep{clark2018think}, and slightly lower performance on NQ \citep{orqa,kwiatkowski2019natural} and TQA \citep{JoshiTriviaQA2017}.
+
+\textbf{Translation.}
+Similar to GPT-3, the training data for \baselm\ is around 90\% English and includes some text in other languages that was not specifically used to train the model to perform machine translation. 
+We also evaluate \flan's performance on machine translation for the three datasets evaluated in the GPT-3 paper: French--English from WMT'14 \citep{wmt14}, and German--English and Romanian--English from WMT'16 \citep{wmt16}. 
+Compared with GPT-3, \flan{} outperforms zero-shot GPT-3 for all six evaluations, though it underperforms few-shot GPT-3 in most cases.
+Similar to GPT-3, \flan{} shows strong results for translating into English and compares favorably against supervised translation baselines.
+Translating from English into other languages, however, was relatively weaker, as might be expected given that \flan{} uses an English sentencepiece tokenizer and that the majority of pretraining data is English.
+ 
+
+\newcommand{\flanvalspaced}[4]{
+\makecell[l]{\hspace{#4mm}#1\vspace{-1.5mm}\\
+{\hspace{#4mm}\battleshipgrey{\tiny std=#2}}\vspace{0.3mm}\\
+\hspace{#4mm}{#3}}}
+\newcommand{\flanval}[3]{\flanvalspaced{#1}{#2}{#3}{0}}
+
+\newcommand{\gptvalspaced}[4]{\makecell[l]{\hspace{#4mm}#1\vspace{-0.4mm}\\{\hspace{#4mm}\battleshipgrey{\scriptsize #3}}}}
+\newcommand{\gptval}[3]{\gptvalspaced{#1}{#2}{#3}{0}}
+
+\newcommand{\gptname}[0]{\makecell[l]{GPT-3 175B zero-shot\vspace{-0.6mm}\\{\scriptsize \hspace{3mm}$\cdot$ few-shot}}}
+\newcommand{\glmname}[0]{\makecell[l]{\baselm{} 137B zero-shot \vspace{-0.6mm}\\{\scriptsize\hspace{3mm}$\cdot$ few-shot}}}
+\newcommand{\gptvalna}[0]{\gptval{--}{--}{--}}
+\newcommand{\tasktype}[1]{\multicolumn{6}{l}{\textsc{\underline{\textbf{#1}}}}}
+\newcommand{\tfiveval}[1]{#1$^{a}$}
+\newcommand{\bertlargeval}[1]{#1$^{b}$}
+\newcommand{\flanname}[0]{\makecell[l]{- average template{\tiny \vspace{2mm}} \\ {- best dev template}}}
+\newcommand{\datasetacc}[1]{\makecell{#1 \vspace{-0.7mm}\\{\footnotesize acc.}\vspace{-0.7mm}}}
+\newcommand{\datasetem}[1]{\makecell{#1 \vspace{-0.7mm}\\{\scriptsize EM}\vspace{-0.7mm}}}
+\newcommand{\datasetbleu}[1]{\makecell{#1 \vspace{-0.7mm}\\{\scriptsize BLEU}\vspace{-0.7mm}}}
+\newcommand{\datasetfone}[1]{\makecell{#1 \vspace{-0.7mm}\\{\scriptsize F1}\vspace{-0.7mm}}}
+\newcommand{\datasetcustom}[2]{\makecell{#1 \vspace{-0.7mm}\\{\scriptsize #2}\vspace{-0.7mm}}}
+\newcommand{\wewin}[1]{\textcolor{jweigreen}{\hspace{0.3mm}{\scriptsize$\blacktriangle$}{\scriptsize#1}}\hspace{1mm}}
+\newcommand{\welose}[1]{\textcolor{americanrose}{\hspace{0.7mm}{\scriptsize -}{\scriptsize#1}}\hspace{1mm}}
+\newcommand{\wekindawin}[1]{\textcolor{jweigreen}{\scriptsize{\hspace{0.6mm}$\uparrow$\hspace{0.3mm}#1}\hspace{1mm}}}
+\newcommand{\explainflan}[0]{For \flan, we report both the average of up to ten templates, as well as the best dev template.}
+\newcommand{\explainwewin}[0]{The triangle \textcolor{jweigreen}{\scriptsize$\blacktriangle$} indicates improvement over few-shot GPT-3.}
+\newcommand{\explainwekindawin}[0]{The up-arrow \textcolor{jweigreen}{\scriptsize$\uparrow$} indicates improvement only over zero-shot GPT-3.}
+\newcommand{\gptvala}[3]{& #1 & #2 {\tiny #3}}
+\newcommand{\baselmvala}[3]{& #1 & #2 {\tiny [#3]}}
+\newcommand{\flanvala}[3]{& #1{\tiny $\pm$#2} & #3}
+\newcommand{\na}[0]{\makecell[c]{--}}
+\newcommand{\explainkt}[0]{{\scriptsize $[k]$} indicates the number of few-shot exemplars. {\scriptsize \#$t$} indicates the number of templates that FLAN is evaluated on.}
+\newcommand{\fewk}[1]{{\tiny [#1]}}
+ 
+ 
+
+\textbf{Additional tasks.}
+Although we see strong results for the above task clusters, one limitation with instruction tuning is that it does not improve performance for many language modeling tasks (e.g., commonsense reasoning or coreference resolution tasks formulated as sentence completions).
+For seven commonsense reasoning and coreference resolution tasks (see \cref{tab:nlu_table} in the Appendix), \flan{} only outperforms \baselm{} on three of the seven tasks.
+This negative result indicates that when the downstream task is the same as the original language modeling pre-training objective (i.e., in cases where instructions are largely redundant), instruction tuning is not useful.
+Finally, we report results for sentiment analysis, paraphrase detection, and struct-to-text, as well as additional datasets for which GPT-3 results are not available, in \cref{tab:nlu_table} and \cref{tab:nlg_table} in the Appendix.
+Generally, zero-shot \flan{} outperforms zero-shot \baselm{} and is comparable with or better than few-shot \baselm{}.
+
+\section{Ablation Studies \& Further Analysis}
+
+\subsection{Number of instruction tuning clusters}\label{subsec:finetuning_clusters}
+As the core question of our paper asks how instruction tuning improves a model's zero-shot performance on unseen tasks, in this first ablation we examine how performance is affected by the number of clusters and tasks used in instruction tuning.
+For this setup, we hold out NLI, closed-book QA, and commonsense reasoning as evaluation clusters, and use the seven remaining clusters for instruction tuning.\footnote{We do not use the paraphrase or reading comprehension with commonsense clusters for instruction tuning in this ablation because they are too similar to NLI and commmonsense reasoning, respectively.}
+We show results for one to seven instruction tuning clusters, where clusters are added in decreasing order of number of tasks per cluster.
+
+\cref{fig:flan-ablation-numtasks} shows these results.
+As expected, we observe that average performance across the three held-out clusters improves as we add additional clusters and tasks to instruction tuning (with the exception of the sentiment analysis cluster), confirming the benefits of our proposed instruction tuning approach on zero-shot performance on novel tasks.
+It is further interesting to see that, for the seven clusters we test, the performance does not appear to saturate, implying that performance may further improve with even more clusters added to instruction tuning.
+Of note, this ablation does not allow us to draw conclusions about which instruction tuning cluster contributes the most to each evaluation cluster, although we see minimal added value from the sentiment analysis cluster.
+
+\begin{figure}[h]
+    \centering
+    \includegraphics[width=0.65\linewidth]{figs/ablation-1-figure.pdf}
+    \vspace{-2mm}
+    \caption{Adding additional task clusters to instruction tuning improves zero-shot performance on held-out task clusters. 
+    The evaluation tasks are the following. 
+    Commonsense: CoPA, HellaSwag, PiQA, and StoryCloze. NLI: ANLI R1--R3, QNLI, RTE, SNLI, and WNLI. Closed-book QA: ARC easy, ARC challenge, Natural Questions, and TriviaQA.}
+    \label{fig:flan-ablation-numtasks}
+\end{figure}
+\vspace{-2mm}
+
+\begin{wrapfigure}{r}{0.53\textwidth}
+    \centering
+    \vspace{-13mm}
+    \includegraphics[width=\linewidth]{figs/scale-ablation-held-out-only.pdf}
+    \vspace{-7mm}
+    \caption{
+    Whereas instruction tuning helps large models generalize to new tasks, for small models it actually hurts generalization to unseen tasks, potentially because all model capacity is used to learn the mixture of instruction tuning tasks. 
+    }
+    \vspace{-6mm}
+    \label{fig:scale-ablation}
+\end{wrapfigure}
+
+\subsection{Scaling laws}\label{subsec:scaling_laws}
+
+As \citet{brown2020language} shows that zero and few-shot capabilities of language models substantially improve for larger models, we next explore how the benefits of instruction tuning are affected by model scale. 
+Using the same cluster split as in the previous ablation study, we evaluate the effect of instruction tuning on models of size 422M, 2B, 8B, 68B, and 137B parameters. 
+
+\cref{fig:scale-ablation} shows these results. 
+We see that for the two models on the order of 100B parameters, instruction tuning substantially improves performance on held-out tasks, as is expected given the prior results in our paper.
+The behavior on held-out tasks for the 8B and smaller models, however, is thought-provoking---instruction tuning actually hurts performance on held-out tasks. 
+One potential explanation for this result could be that for small-scale models, learning the $\sim$40 tasks used during instruction tuning fills the entire model capacity, causing these models to perform worse on new tasks. 
+Under this potential explanation, for the larger scale models, instruction tuning fills up some model capacity but also teaches these models how to follow instructions, allowing them to generalize to new tasks with the remaining capacity. 
+
+\begin{wrapfigure}{r}{0.43\textwidth}
+    \centering
+    \vspace{-6mm}
+    \includegraphics[width=\linewidth]{figs/instruction-ablation.pdf}
+    \vspace{-7mm}
+    \caption{
+    Ablation study result using models with instructions removed from finetuning (FT). 
+    }
+    \vspace{-3mm}
+    \label{fig:role-of-insructions}
+\end{wrapfigure}
+
+\subsection{Role of instructions}\label{subsec:role-of-instructions}
+In a final ablation study, we explore the role of instructions during finetuning, as one possibility is that performance gains come entirely from multi-task finetuning and the model could perform just as well without instructions.
+We hence consider two finetuning setups without instructions.
+In a \textit{no template} setup, only inputs and outputs were given to the model (e.g., for translation the input would be ``\textit{The dog runs.}'' and the output would be ``\textit{Le chien court.}'').
+In a \textit{dataset name} setup, each input is prepended with the name of the task and dataset (e.g., for translation to French, the input would be ``\textit{[Translation: WMT'14 to French] The dog runs.}'').
+
+We compare these two ablations to \flan{}'s finetuning procedure, which used natural instructions (e.g., ``\textit{Please translate this sentence to French: `The dog runs.'}'').
+We perform evaluations for four held-out clusters from \cref{fig:flan-results-summary}.
+For the no template setup, we used the \flan{} instructions during zero-shot inference (because if we used no template, the model would not know what task to perform).
+For models finetuned on dataset name only, we report zero-shot performance for \flan{} instructions as well as using the dataset name.
+\cref{fig:role-of-insructions} shows the results---both ablation configurations performed substantially worse than \flan{}, indicating that training with instructions is crucial for zero-shot performance on unseen tasks.
+
+\subsection{Instructions with Few-Shot Exemplars}\label{subsec:finetune}
+
+\newcommand{\instruct}{\textrm{instruct}}
+So far, we have focused on instruction tuning in the zero-shot setting. 
+Here, we study how instruction tuning can be used when few-shot exemplars are available at inference time.
+The format for the few-shot setting builds on the zero-shot format. 
+For some input $x$ and output $y$, let $\instruct(x)$ denote the zero-shot instructions. 
+Then, given $k$ few-shot exemplars ${(x_i, y_i)}_{i=1}^k$ and a new input $x$, the instruction format for the few-shot setting is ``$\instruct(x_1) \oplus y_1 \oplus \instruct(x_2) \oplus y_2 \oplus \ldots \oplus \instruct(x_k) \oplus y_k \oplus \instruct(x)$'', where $\oplus$ denotes string concatenation with a delimiter token inserted in between.
+At both training and inference time, exemplars are randomly drawn from the training set, and the number of exemplars is capped at 16 and such that the total sequence length is less than 960 tokens. 
+Our experiment uses the same task splits and evaluation procedure as \cref{sec:results}, such that few-shot exemplars for an unseen task are only used at inference time.
+
+As shown in \cref{fig:few-shot}, few-shot exemplars improve the performance on all task clusters, compared with zero-shot FLAN. 
+Exemplars are especially effective for tasks with large/complex output spaces, such as struct to text, translation, and closed-book QA, potentially because exemplars help the model better understand the output format. 
+In addition, for all task clusters, standard deviation among templates is lower for few-shot FLAN, indicating reduced sensitivity to prompt engineering. 
+
+\begin{figure}[h!]
+    \centering
+    \includegraphics[width=\linewidth]{figs/few-shot.pdf}
+    \vspace{-4mm}
+    \caption{
+    Adding few-shot exemplars to FLAN is a complementary method for improving the performance of instruction-tuned models.
+    The orange bars indicate standard deviation among templates, averaged at the dataset level for each task cluster.
+    }
+    \label{fig:few-shot}
+\end{figure}
+
+\subsection{Instruction Tuning Facilitates Prompt Tuning}\label{subsec:prompt_tuning}
+
+\begin{wrapfigure}{r}{0.33\textwidth}
+    \centering
+    \vspace{-10mm}
+    \includegraphics[width=\linewidth]{figs/prompt-tuning-figure.pdf}
+    \vspace{-7mm}
+    \caption{
+    Instruction-tuned models respond better to continuous inputs from prompt tuning.
+    When prompt tuning on a given dataset, no tasks from the same cluster as that dataset were seen during instruction tuning.
+    Performance shown is the average on the SuperGLUE dev set.
+    }
+    \vspace{-3mm}
+    \label{fig:prompt_tuning}
+\end{wrapfigure}
+
+As we've seen that instruction tuning improves the ability of a model to respond to instructions, it follows that, if \flan{} is indeed more amenable to performing NLP tasks, then it should also achieve better performance when performing inference using soft prompts, represented by prepended continuous variables optimized via prompt tuning \citep{li-liang-2021-prefix,lester-prompt-tuning}.
+As further analysis, we train continuous prompts for each of the SuperGLUE \citep{wang2019superglue} tasks in accordance with the cluster splits from \cref{subsec:eval_splits} such that when prompt-tuning on task $\mathcal{T}$, no tasks in the same cluster as $\mathcal{T}$ were seen during instruction tuning.
+Our prompt tuning setup follows the procedure of \citet{lester-prompt-tuning} except that we use a prompt length of 10, weight decay of 1e-4, and did not use dropout on the attention scores; we found in preliminary experiments that these changes improved the performance of \baselm. 
+
+\cref{fig:prompt_tuning} shows the results of these prompt tuning experiments for both using a fully-supervised training set and in a low-resource setting with only 32 training examples.
+We see that in all scenarios, prompt tuning works better with \flan{} than \baselm.
+In many cases, especially for the low-resource setting, prompt tuning on \flan{} even achieves more than 10\% improvement over prompt tuning on the \baselm. 
+This result exemplifies in another way how instruction tuning can result in a checkpoint that is more desirable for performing NLP tasks.
+
+\section{Related Work}
+Our work relates to several broad research areas including zero-shot learning, prompting, multi-task learning, and language models for NLP applications \citep[][\textit{inter alia}]{radford2019language,raffel2019exploring,brown2020language,efrat2020turking,aghajanyan2021muppet,li-liang-2021-prefix}.
+We describe prior work for these broad areas in an extended related work section (\cref{sec:extended_related_work}), and here we describe two subareas narrower in scope that perhaps relate most closely to our work.
+
+The way we ask a model to respond to instructions is similar to QA-based task formulation \citep{kumar2016ask,mccann2018natural}, which aims to unify NLP tasks by casting them as QA over a context.
+Though these methods are very similar to ours, they mostly focus on multi-task learning instead of zero-shot learning, and---as noted by \citet{liu2021survey}---they are generally not motivated by using existing knowledge in pretrained LMs.
+Moreover, our work supercedes recent work such as \citet{chai2020description} and \citet{zhong2021meta} in terms of both model scale and scope of tasks.
+
+The success of language models has led to nascent research on the ability of models to follow instructions. 
+Most recently, \citet{mishra2021natural} finetune 140M parameter BART on instructions with few-shot exemplars, and evaluate its few-shot abilities on unseen tasks---this is similar to our few-shot instruction tuning result from \cref{subsec:finetune}.
+This promising result (as well as one from \citet{ye2021crossfit}, which does not emphasize instructions as much) suggests that finetuning on a collection of tasks improves few-shot performance on unseen tasks, even at a smaller model scale.
+\citet{sanh2021multitask} finetune T5 in a setup similar to ours, finding that zero-shot learning can be improved in a model of 11B parameters.
+At a model scale similar to ours, OpenAI's InstructGPT models are trained via both finetuning and reinforcement learning to produce outputs that are more preferred by human raters \citep{ouyang2022instructgpt}.
+
+\section{Discussion}
+
+Our paper has explored a simple question in zero-shot prompting: does finetuning a model on a collection of tasks phrased as instructions improve its performance on unseen tasks?
+We operationalize this question via instruction tuning, a simple method that combines appealing aspects of both the pretrain--finetune and prompting paradigms.
+Our instruction-tuned model, \flan{}, improves performance against an untuned model and surpasses zero-shot GPT-3 on the majority of tasks that we evaluate on.
+Ablation studies reveal that performance on unseen tasks improves with the number of instruction tuning task clusters, and, interestingly, that performance improvements from instruction tuning emerge only with sufficient model scale.
+Moreover, instruction tuning can be combined with other prompting methods such as few-shot prompting and prompt tuning.
+
+The diverse capabilities of language models at scale have drawn attention to the tradeoffs between specialist models (one model per task) and generalist models \citep[one model for many tasks;][]{arivazhagan2019massively,pratap2020massively}, for which our study has potential implications. 
+Although one might expect labeled data to have the most natural role in improving specialist models, instruction tuning demonstrates how labeled data can be used to help large language models perform many, unseen tasks. 
+In other words, the positive effect of instruction tuning on cross-task generalization shows that task-specific training is complementary to general language modeling and motivates further research on generalist models. 
+
+As for limitations of our study, there is a degree of subjectivity in assigning tasks to clusters (though we try to use accepted categorizations in the literature), and we only explore the use of relatively short instructions of typically a single sentence (c.f. detailed instructions given to crowd-workers). 
+A limitation for our evaluation is that individual examples might have appeared in the models’ pretraining data, which includes web documents, though in post-hoc analysis (\cref{sec:data_contamination}) we do not find any evidence that data overlap substantially impacted the results.
+Finally, the scale of \flan{} 137B makes it costly to serve.
+Future work on instruction tuning could include gathering/generating even more task clusters for finetuning, 
+cross-lingual experiments, 
+using \flan{} to generate data for training downstream classifiers, 
+and using finetuning to improve model behavior with respect to bias and fairness \citep{solaiman2021process}. 
+
+\section{Conclusions}
+This paper has explored a simple method for improving the ability of language models at scale to perform zero-shot tasks based purely on instructions.
+Our instruction-tuned model, \flan{}, compares favorably against GPT-3 and signals the potential ability for language models at scale to follow instructions.
+We hope that our paper will spur further research on instructions-based NLP, zero-shot learning, and using labeled data to improve large language models. 
+
+\clearpage
+
+\section*{Ethical Considerations}
+This work uses language models, for which the risks and potential harms are discussed in \citet{bender-koller-2020-climbing}, \citet{brown2020language}, \citet{10.1145/3442188.3445922}, Patterson et al., (2021), and others. As our contribution in this paper is not a pretrained language model itself but rather an empirical study of how instruction tuning affects the zero-shot performance of a language model on unseen tasks, we additionally highlight two relevant ethical considerations. First, labeled datasets such as those we use for finetuning can contain undesirable biases, and these biases can be propagated into zero-shot applications of the model on downstream tasks.  And second, instruction-tuned models can potentially require less data and expertise to use; such lower barriers to access could increase both the benefits and associated risks of such models.
+
+\section*{Environmental Considerations}
+We use the same pretrained language models as \citet{Austin2021ProgramSW}. %
+The energy cost and carbon footprint for the pretrained models were 451 MWh and 26 tCO2e, respectively. 
+The additional instruction tuning gradient-steps for finetuning \flan{} is less than 2\% of the number of pretraining steps, and so the estimated additional energy cost is comparatively smaller.
+
+\section*{Author Contributions}\label{sec:contributions}
+Maarten Bosma conceived the original idea and implemented the first version of \flan. 
+Vincent Zhao prototyped the training and evaluation pipelines, as well as rank classification. 
+Kelvin Guu proposed and implemented the idea of task clusters and evaluation using inter-cluster splits. 
+Jason Wei, Maarten Bosma, Vincent Zhao, and Adams Wei Yu implemented the NLP tasks. 
+Jason Wei, Vincent Zhao, and Adams Wei Yu conducted and managed most of the experiments. 
+Jason Wei designed and ran the ablation studies. 
+Jason Wei, Maarten Bosma, and Quoc V. Le wrote most of the paper. 
+Jason Wei, Maarten Bosma, and Nan Du obtained the zero and few-shot baselines. 
+Vincent Zhao and Kelvin Guu designed, implemented, and conducted the few-shot FLAN experiments.
+Maarten Bosma and Jason Wei ran the data contamination analysis.
+Brian Lester ran the prompt tuning experiments. 
+Quoc V.~Le and Andrew M.~Dai advised, provided high-level guidance, and helped edit the paper.
+
+\section*{Acknowledgements}
+We thank Ed Chi, Slav Petrov, Dan Garrette, Ruibo Liu, and Clara Meister for providing feedback on our manuscript. 
+We thank Adam Roberts, Liam Fedus, Hyung Won Chung, and Noam Shazeer for helping debug some of our models. 
+We thank Ellie Pavlick for feedback on the study design during the middle stages of the project.  
+We thank Daniel De Freitas Adiwardana for helping initiate the project, large language model advising, and giving us access to some computational resources.
+Finally, we thank the team involved in pretraining \baselm{}: Daniel De Freitas Adiwardana, Noam Shazeer, Yanping Huang, Dmitry Lepikhin, Dehao Chen, Yuanzhong Xu and Zhifeng Chen.
+
+\clearpage 
+
+\newpage 
+\appendix
+
+\newcommand{\trainsize}[0]{30,000}
+\newcommand{\devsize}[0]{200}
+
+\section{Additional Results}\label{sec:supp_all_results}
+
+This section shows the full results for all datasets we evaluate.
+Results for translation and struct to text are shown in \cref{tab:nlg_table}, and the results for eight NLU task clusters are shown in \cref{tab:nlu_table}.
+
+We show FLAN's performance using the best of up to ten instruction templates as well as the template with the best performance on the dev set. 
+For \baselm{}, we use the templates from \citet{brown2020language}, which were optimized for GPT-3, without performing any prompt engineering to optimize them on our model. 
+For simplicity, we use greedy search for all generative tasks (compared with beam search used in \citet{brown2020language}). 
+Unlike GPT-3, which chooses the number of few-shot exemplars $k$ via best dev set performance, for few-shot \baselm{} we choose the highest $k$ that fits in the context length of 1024 tokens, from $k \in \{1, 3, 5, 10\}$. 
+
+For DROP \citep{Dua2019DROP} and SQuADv2 \citep{rajpurkar-etal-2018-know}, based on email correspondence with \citet{brown2020language}, their definition of zero-shot differs from ours in that they actually use exemplars, but only from the same passage as the inference question (each passage has more than one question). 
+Hence, GPT-3 zero-shot results are not directly comparable with ours for DROP and SQuADv2.
+We mark these results using the $^{\dagger}$ symbol.
+Moreover, it is unclear how to parse the end of an answer for these two datasets, and so we use curly bracket delimiters \texttt{\{} and \texttt{\}}, where we expect \texttt{\}} to indicate the end of the answer.
+
+For struct to text, reported T5/mT5 results are from the GEM benchmark paper \citep{gehrmann2021gem}, though we do not report their results for DART (through correspondence with authors, we confirmed that their results for DART were incorrect). 
+Though we use a summarization task cluster during instruction tuning, we leave evaluation of summarization for future work, as the mean input of most summarization datasets exceeds \flan's input length of 1024 tokens.
+
+\begingroup
+\setlength{\tabcolsep}{1.5pt}
+\newcommand{\centerme}[1]{\multicolumn{1}{c}{#1}}
+\newcommand{\centermewithrightbar}[1]{\multicolumn{1}{c|}{#1}}
+\begin{table}[h]
+    \centering
+    \small
+    \begin{tabular}{l lc cl cl rc rc lc}
+    \toprule
+     & & & & & & & \multicolumn{6}{c}{FLAN 137B} \\
+     \cmidrule(lr){8-13}
+     & & & \multicolumn{2}{c}{\baselm{}} &  \multicolumn{2}{c}{GPT-3 175B} & \multicolumn{2}{c}{zero-shot} & \multicolumn{3}{c}{few-shot}\\
+     \cmidrule(lr){4-5} \cmidrule(lr){6-7} \cmidrule(lr){8-9} \cmidrule(lr){10-12}
+     & Metric & \makecell[c]{\scriptsize Supervised\vspace{-0.6mm}\\\scriptsize Model} & \makecell[c]{zero-\vspace{-0.6mm}\\ shot} & \makecell[c]{few-\vspace{-0.6mm}\\ shot {\tiny [$k$]}} & \makecell[c]{zero-\vspace{-0.6mm}\\ shot} & \makecell[c]{few-\vspace{-0.6mm}\\ shot {\tiny [$k$]}} & \makecell[c]{\scriptsize average \vspace{-0.6mm}\\ \scriptsize template}  & \makecell[c]{\scriptsize best dev \vspace{-0.6mm}\\ \scriptsize template} &  \makecell[c]{\scriptsize average \vspace{-0.6mm}\\ \scriptsize template}  & \makecell[c]{\scriptsize best dev \vspace{-0.6mm}\\ \scriptsize template} & {\tiny [$k$]} & {\scriptsize \#$t$} \\
+    \midrule
+    \tasktype{Translation} \\
+    WMT '14 En$\rightarrow$Fr & BLEU & 35.0$^d$     \baselmvala{11.2}{31.5}{5} \gptvala{25.2}{32.6}{[64]} \flanvala{32.9}{1.1}{33.9} \flanvala{33.9}{0.2}{33.8} & \fewk{9} & \tiny{5} \\
+    WMT '14 Fr$\rightarrow$En & BLEU & 45.6$^c$     \baselmvala{7.2}{34.7}{5} \gptvala{21.2}{39.2}{[64]} \flanvala{35.5}{1.3}{35.9} \flanvala{38.0}{0.1}{37.9} & \fewk{9} & \tiny{3} \\
+    WMT '16 En$\rightarrow$De & BLEU & 38.6$^f$     \baselmvala{7.7}{26.7}{5} \gptvala{24.6}{29.7}{[64]} \flanvala{25.4}{1.8}{27.0} \flanvala{26.8}{0.4}{26.1} & \fewk{11} & \tiny{5} \\
+    WMT '16 De$\rightarrow$En & BLEU & 41.2$^e$     \baselmvala{20.8}{36.8}{5} \gptvala{27.2}{40.6}{[64]} \flanvala{38.9}{0.3}{38.9} \flanvala{40.6}{0.1}{40.7} & \fewk{11} & \tiny{3} \\
+    WMT '16 En$\rightarrow$Ro & BLEU & 39.9$^g$     \baselmvala{3.5}{22.9}{5} \gptvala{14.1}{21.0}{[64]} \flanvala{16.7}{1.6}{18.9} \flanvala{20.5}{0.1}{20.5} & \fewk{9} & \tiny{5} \\
+    WMT '16 Ro$\rightarrow$En & BLEU & 38.5$^g$     \baselmvala{9.7}{37.5}{5} \gptvala{19.9}{39.5}{[64]} \flanvala{36.8}{0.5}{37.3} \flanvala{38.2}{0.1}{38.1} & \fewk{9} & \tiny{3} \\
+    \midrule
+    \tasktype{Struct to Text} \\
+    CommonGen & Rouge-1 & \tfiveval{64.0}   \baselmvala{3.9}{56.7}{3} \gptvala{\na}{\na}{} \flanvala{54.6}{2.3}{56.3} \flanvala{56.6}{0.3}{56.4} & \fewk{16} & \tiny{6} \\
+     & Rouge-2 & \tfiveval{29.4}            \baselmvala{1.5}{29.6}{3} \gptvala{\na}{\na}{} \flanvala{28.8}{2.4}{27.6} \flanvala{30.9}{0.7}{29.9} & \fewk{16} & \tiny{6} \\
+     & Rouge-L & \tfiveval{54.5}            \baselmvala{3.2}{48.5}{3} \gptvala{\na}{\na}{} \flanvala{48.4}{1.9}{48.7} \flanvala{50.7}{0.2}{51.0} & \fewk{16} & \tiny{6} \\
+    DART & Rouge-1 & \na                    \baselmvala{11.3}{56.0}{3} \gptvala{\na}{\na}{} \flanvala{45.5}{4.2}{48.9} \flanvala{57.9}{1.6}{59.2} & \fewk{11} & \tiny{7} \\
+     & Rouge-2 & \na                        \baselmvala{1.5}{29.6}{3} \gptvala{\na}{\na}{} \flanvala{25.0}{3.7}{30.0} \flanvala{35.8}{1.0}{36.2} & \fewk{11} & \tiny{7} \\
+     & Rouge-L & \na                        \baselmvala{3.2}{48.5}{3} \gptvala{\na}{\na}{} \flanvala{38.4}{3.8}{43.4} \flanvala{48.5}{0.9}{48.2} & \fewk{11} & \tiny{7} \\
+    E2ENLG & Rouge-1 & \tfiveval{72.6}      \baselmvala{6.2}{56.7}{3} \gptvala{\na}{\na}{} \flanvala{44.8}{3.9}{51.4} \flanvala{59.1}{1.3}{59.7} & \fewk{12} & \tiny{9} \\
+     & Rouge-2 & \tfiveval{47.5}            \baselmvala{2.5}{31.4}{3} \gptvala{\na}{\na}{} \flanvala{24.2}{3.6}{30.1} \flanvala{33.2}{1.1}{33.6} & \fewk{12} & \tiny{9} \\
+     & Rouge-L & \tfiveval{56.4}            \baselmvala{4.9}{41.1}{3} \gptvala{\na}{\na}{} \flanvala{37.0}{3.5}{42.4} \flanvala{44.9}{0.8}{45.1} & \fewk{12} & \tiny{9} \\
+    WebNLG & Rouge-1 & \tfiveval{83.5}      \baselmvala{13.9}{68.3}{3} \gptvala{\na}{\na}{} \flanvala{50.6}{4.7}{57.7} \flanvala{68.5}{2.2}{71.2} & \fewk{10} & \tiny{8} \\
+     & Rouge-2 & \tfiveval{63.6}            \baselmvala{6.9}{46.0}{3} \gptvala{\na}{\na}{} \flanvala{29.8}{4.2}{35.4} \flanvala{48.0}{1.5}{49.8} & \fewk{10} & \tiny{8} \\
+     & Rouge-L & \tfiveval{71.0}            \baselmvala{11.8}{56.5}{3} \gptvala{\na}{\na}{} \flanvala{43.4}{4.5}{49.7} \flanvala{58.8}{1.1}{60.2} & \fewk{10} & \tiny{8} \\
+    \bottomrule
+    \end{tabular}
+    \caption{
+    Results for translation and struct-to-text tasks.
+    \explainkt
+    $^{a}$T5-11B,
+    $^c$\citet{edunov-etal-2018-understanding},
+    $^d$\citet{durrani-etal-2014-edinburghs},
+    $^e$\citet{wang2019multi},
+    $^f$\citet{sennrich-etal-2016-edinburgh},
+    $^g$\citet{liu-etal-2020-multilingual-denoising}.
+    }
+    \label{tab:nlg_table}
+\end{table}
+\endgroup
+\begingroup
+\setlength{\tabcolsep}{0.8pt}
+\newcommand{\centerme}[1]{\multicolumn{1}{c}{#1}}
+\newcommand{\centermewithrightbar}[1]{\multicolumn{1}{c|}{#1}}
+\begin{table}[t]
+    \centering
+    \small
+    \begin{tabular}{l cc ll cl cl lc lcl r}
+    \toprule
+     & & & & & & & & & \multicolumn{6}{c}{FLAN 137B} \\
+     \cmidrule(lr){10-15}
+     & & & \multicolumn{2}{c}{GLaM} & \multicolumn{2}{c}{\baselm{}} & \multicolumn{2}{c}{GPT-3 175B} & \multicolumn{2}{c}{zero-shot} & \multicolumn{3}{c}{few-shot} \\
+     \cmidrule(lr){4-5} \cmidrule(lr){6-7} \cmidrule(lr){8-9} \cmidrule(lr){10-11} \cmidrule(lr){12-14}
+     & \makecell[c]{\scriptsize Random\vspace{-0.6mm}\\ \scriptsize Guess} & \makecell[c]{\scriptsize Supervised\vspace{-0.6mm}\\\scriptsize Model} & \makecell[c]{zero-\vspace{-0.6mm}\\ shot} & \makecell[c]{one-\vspace{-0.6mm}\\ shot} & \makecell[c]{zero-\vspace{-0.6mm}\\ shot} & \makecell[c]{few-\vspace{-0.6mm}\\ shot {\tiny [$k$]}} & \makecell[c]{zero-\vspace{-0.6mm}\\ shot} & \makecell[c]{few-\vspace{-0.6mm}\\ shot {\tiny [$k$]}} & \makecell[c]{\scriptsize average \vspace{-0.6mm}\\ \scriptsize template}  & \makecell[c]{\scriptsize best dev \vspace{-0.6mm}\\ \scriptsize template} &  \makecell[c]{\scriptsize average \vspace{-0.6mm}\\ \scriptsize template}  & \makecell[c]{\scriptsize best dev \vspace{-0.6mm}\\ \scriptsize template} & {\tiny [$k$]} & {\scriptsize \#$t$} \\
+    \midrule
+    \tasktype{NLI} \\
+    ANLI R1 & 33.3 & \bertlargeval{57.4} & 40.9 & 42.4       \baselmvala{39.6}{39.0}{5} \gptvala{34.6}{36.8}{[50]} \flanvala{47.7}{1.4}{46.4} \flanvala{44.2}{2.3}{47.9} & \fewk{6} & \tiny{8} \\
+    ANLI R2 & 33.3 & \bertlargeval{48.3} & 38.2 & 40.0       \baselmvala{39.9}{37.5}{5} \gptvala{35.4}{34.0}{[50]} \flanvala{43.9}{1.3}{44.0} \flanvala{41.6}{1.4}{41.1} & \fewk{6} & \tiny{8} \\
+    ANLI R3 & 33.3 & \bertlargeval{43.5} & 40.9 & 40.8       \baselmvala{39.3}{40.7}{5} \gptvala{34.5}{40.2}{[50]} \flanvala{47.0}{1.3}{48.5} \flanvala{42.8}{2.2}{46.8} & \fewk{6} & \tiny{8} \\
+    CB & 33.3 & \tfiveval{93.6} & 33.9 & 73.2                 \baselmvala{42.9}{34.4}{5} \gptvala{46.4}{82.1}{[32]} \flanvala{64.1}{14.7}{83.9} \flanvala{82.6}{4.4}{82.1} & \fewk{7} & \tiny{10} \\
+    MNLI-m & 33.3 & \tfiveval{92.2} & \na & \na             \baselmvala{35.7}{43.7}{5} \gptvala{\na}{\na}{} \flanvala{51.1}{6.2}{61.2} \flanvala{60.8}{3.7}{63.5} & \fewk{10} & \tiny{10} \\
+    MNLI-mm & 33.3 & \tfiveval{91.9} & \na & \na           \baselmvala{37.0}{43.8}{5} \gptvala{\na}{\na}{} \flanvala{51.0}{6.5}{62.4} \flanvala{61.0}{3.5}{63.5} & \fewk{10} & \tiny{10} \\
+    QNLI & 50.0 & \tfiveval{96.9} & \na & \na              \baselmvala{50.6}{55.7}{5} \gptvala{\na}{\na}{} \flanvala{59.6}{4.9}{66.4} \flanvala{62.0}{1.7}{63.3} & \fewk{12} & \tiny{9} \\
+    RTE & 50.0 & \tfiveval{92.5} & 68.8 & 71.5              \baselmvala{73.3}{70.8}{5} \gptvala{63.5}{72.9}{[32]} \flanvala{78.3}{7.9}{84.1} \flanvala{79.9}{6.9}{84.5} & \fewk{8} & \tiny{10} \\
+    SNLI & 33.3 & \bertlargeval{91.3} & \na & \na          \baselmvala{33.3}{54.7}{5} \gptvala{\na}{\na}{} \flanvala{43.0}{7.4}{53.4} \flanvala{62.3}{2.4}{65.6} & \fewk{15} & \tiny{9} \\
+    WNLI & 50.0 & \tfiveval{94.5} & \na & \na              \baselmvala{56.3}{64.8}{5} \gptvala{\na}{\na}{} \flanvala{61.0}{10.6}{74.6} \flanvala{55.4}{11.0}{70.4} & \fewk{14} & \tiny{10} \\
+    \midrule
+    \tasktype{Reading Comp.} \\
+    BoolQ & 50.0 & \tfiveval{91.2} & 83.0 & 82.8             \baselmvala{81.0}{80.0}{1} \gptvala{60.5}{77.5}{[32]} \flanvala{80.2}{3.1}{82.9} \flanvala{83.6}{0.8}{84.6} & \fewk{4} & \tiny{9} \\
+    DROP & \na & \bertlargeval{80.5} & 54.9 & 55.2      \baselmvala{3.8}{10.3}{1} \gptvala{23.6$^{\dagger}$}{36.5}{[20]} \flanvala{21.9}{0.9}{22.7} \flanvala{22.3}{1.1}{23.9} & \fewk{2} & \tiny{7} \\
+    MultiRC & \na & \tfiveval{88.1} & 45.1 & 62.0        \baselmvala{60.0}{59.6}{5} \gptvala{72.9}{74.8}{[32]} \flanvala{74.5}{3.7}{77.5} \flanvala{69.2}{3.2}{72.1} & \fewk{1} & \tiny{8} \\
+    OBQA & 25.0 & \tfiveval{85.4} & 53.0 & 55.2              \baselmvala{41.8}{50.6}{10} \gptvala{57.6}{65.4}{[100]} \flanvala{77.4}{1.3}{78.4} \flanvala{77.2}{1.3}{78.2} & \fewk{16} & \tiny{7} \\
+    SQuADv1 & \na & \tfiveval{96.2} & \na & \na        \baselmvala{22.7}{50.2}{3} \gptvala{\na}{\na}{} \flanvala{79.5}{1.6}{80.1} \flanvala{82.1}{0.5}{82.7} & \fewk{4} & \tiny{8} \\
+    SQuADv2 & \na & \bertlargeval{83.4} & 68.3 & 70.0   \baselmvala{11.1}{34.9}{3} \gptvala{59.5$^{\dagger}$}{69.8}{[16]} \flanvala{40.9}{1.8}{44.2} \flanvala{40.8}{0.9}{43.1} & \fewk{3} & \tiny{10} \\
+    \midrule 
+    \tasktype{Closed-Book QA} \\
+    ARC-c & 25.0 & \tfiveval{81.1} & 48.2 & 50.3     \baselmvala{42.0}{49.4}{10} \gptvala{51.4}{51.5}{[50]} \flanvala{61.7}{1.4}{63.1} \flanvala{63.7}{0.6}{63.8} & \fewk{13} & \tiny{7} \\
+    ARC-e & 25.0 & \tfiveval{92.6} & 71.9 & 76.6           \baselmvala{76.4}{80.9}{10} \gptvala{68.8}{70.1}{[50]} \flanvala{79.5}{0.8}{79.6} \flanvala{80.5}{0.5}{80.7} & \fewk{14} & \tiny{7} \\
+    NQ & \na & \tfiveval{36.6} & 21.5 & 23.9            \baselmvala{3.2}{22.1}{5} \gptvala{14.6}{29.9}{[64]} \flanvala{18.6}{2.7}{20.7} \flanvala{27.2}{0.5}{27.6} & \fewk{16} & \tiny{10} \\
+    TQA {\tiny (wiki)} & \na & \tfiveval{60.5} & 68.8 & 71.5      \baselmvala{21.9}{63.3}{10} \gptvala{64.3}{71.2}{[64]} \flanvala{66.5}{2.6}{68.1} \flanvala{66.5}{1.0}{67.3} & \fewk{16} & \tiny{10} \\
+    TQA {\tiny (tfds-dev)} & \na & \tfiveval{51.0} & \na & \na      \baselmvala{18.4}{55.1}{10} \gptvala{\na}{\na}{\na} \flanvala{55.0}{2.3}{56.7} \flanvala{57.2}{0.6}{57.8} & \fewk{16} & \tiny{10} \\
+    \midrule 
+    \tasktype{Commonsense} \\
+    COPA & 50.0 & \tfiveval{94.8} & 90.0 & 92.0              \baselmvala{90.0}{89.0}{10} \gptvala{91.0}{92.0}{[32]} \flanvala{90.6}{2.0}{91.0} \flanvala{88.5}{3.8}{87.0} & \fewk{16} & \tiny{8} \\
+    HellaSwag & 25.0 & \bertlargeval{47.3} & 77.1 & 76.8     \baselmvala{57.0}{58.8}{10} \gptvala{78.9}{79.3}{[20]} \flanvala{56.4}{0.5}{56.7} \flanvala{59.4}{0.2}{59.2} & \fewk{3} & \tiny{8} \\
+    PIQA & 50.0 & \bertlargeval{66.8} & 80.4 & 81.4          \baselmvala{80.3$^*$}{80.2$^*$}{10} \gptvala{81.0}{82.3}{[50]} \flanvala{80.9$^*$}{0.8}{80.5$^*$} \flanvala{82.1$^*$}{0.3}{81.7$^*$} & \fewk{10} & \tiny{8} \\
+    StoryCloze & 50.0 & \bertlargeval{89.2} & 82.5 & 84.0    \baselmvala{79.5}{83.7}{10} \gptvala{83.2}{87.7}{[70]} \flanvala{92.2}{1.3}{93.4} \flanvala{93.3}{0.9}{94.7} & \fewk{10} & \tiny{8} \\
+    \midrule 
+    \tasktype{Sentiment} \\
+    IMDB & 50.0 & \bertlargeval{95.5} & \na & \na          \baselmvala{76.9}{83.3}{1} \gptvala{\na}{\na}{} \flanvala{94.1}{0.4}{94.3} \flanvala{94.8}{0.3}{95.0} & \fewk{2} & \tiny{7} \\
+    Sent140 & 50.0 & \bertlargeval{87.0} & \na & \na   \baselmvala{41.4}{63.3}{5} \gptvala{\na}{\na}{} \flanvala{69.9}{2.5}{73.5} \flanvala{68.7}{1.2}{69.3} & \fewk{16} & \tiny{6} \\
+    SST-2 & 50.0 & \tfiveval{97.5} & \na & \na              \baselmvala{51.0}{92.3}{5} \gptvala{71.6}{95.6}{[8]} \flanvala{92.6}{1.7}{94.6} \flanvala{94.4}{0.8}{94.6} & \fewk{16} & \tiny{8} \\
+    Yelp & 50.0 & \bertlargeval{98.1} & \na & \na           \baselmvala{84.7}{89.6}{3} \gptvala{\na}{\na}{} \flanvala{97.8}{0.2}{98.1} \flanvala{97.9}{0.1}{98.0} & \fewk{4} & \tiny{7} \\
+    \midrule 
+    \tasktype{Paraphrase} \\
+    MRPC & 50.0 & \tfiveval{90.4} & \na & \na               \baselmvala{53.7}{64.0}{5} \gptvala{\na}{\na}{} \flanvala{69.1}{1.3}{69.1} \flanvala{67.5}{1.7}{67.2} & \fewk{10} & \tiny{10} \\
+    QQP & 50.0 & \tfiveval{90.6} & \na & \na                \baselmvala{34.9}{58.9}{3} \gptvala{\na}{\na}{} \flanvala{72.1}{6.8}{75.9} \flanvala{73.5}{2.9}{75.9} & \fewk{16} & \tiny{7} \\
+    PAWS Wiki & 50.0 & \tfiveval{91.9} & \na & \na          \baselmvala{45.5}{53.5}{5} \gptvala{\na}{\na}{} \flanvala{61.5}{6.5}{69.4} \flanvala{66.2}{0.9}{70.2} & \fewk{10} & \tiny{10} \\
+    \midrule 
+    \tasktype{Coreference} \\
+    DPR & 50.0 & \bertlargeval{84.8} & \na & \na            \baselmvala{54.6}{57.3}{5} \gptvala{\na}{\na}{} \flanvala{60.3}{3.5}{66.8} \flanvala{62.4}{1.6}{63.3} & \fewk{16} & \tiny{10} \\
+    Winogrande & 50.0 & \bertlargeval{65.8} & 73.4 & 73.0     \baselmvala{68.3}{68.4}{10} \gptvala{70.2}{77.7}{[50]} \flanvala{67.3}{2.5}{71.2} \flanvala{72.3}{0.9}{72.8} & \fewk{16} & \tiny{10} \\
+    WSC273 & 50.0 & \bertlargeval{70.0} & 86.8 & 83.9        \baselmvala{81.0}{61.5}{5} \gptvala{88.3}{88.5}{[32]} \flanvala{80.8}{3.7}{\na} \flanvala{\na}{\na}{\na} & \fewk{\na} & \tiny{10} \\
+    \midrule 
+    \tasktype{Read. Comp. w/ Commonsense} \\
+    CosmosQA & 25.0 & \bertlargeval{67.1} & \na & \na      \baselmvala{34.1}{33.8}{5} \gptvala{\na}{\na}{} \flanvala{58.4}{1.3}{60.6} \flanvala{56.7}{1.3}{56.0} & \fewk{5} & \tiny{8} \\
+    ReCoRD & \na & \tfiveval{93.4} & 90.3 & 90.3              \baselmvala{87.8$^*$}{87.6$^*$}{1} \gptvala{90.2}{89.0}{[32]} \flanvala{67.8$^*$}{3.0}{72.5$^*$} \flanvala{77.0$^*$}{2.0}{79.0$^*$} & \fewk{1} & \tiny{10} \\
+    
+    
+    \bottomrule
+    \end{tabular}
+    \caption{
+    Results for eight NLU task clusters. 
+    All values shown are for accuracy (or exact match) except DROP, MultiRC, and SQuAD v1 and v2, which are F1.
+    \explainkt
+    $^{a}$T5-11B,
+    $^{b}$BERT-large.
+    $^*$see data contamination (\cref{sec:data_contamination}).
+    WSC273 \citep{levesque2012winograd} does not have training or validation sets, and so we do not compute few-shot results for FLAN.
+    For Trivia QA (TQA), we report exact match (EM) on both the wikipedia subset of the dev set to compare with GPT-3, as well as the full TFDS dev set.
+    }
+    \label{tab:nlu_table}
+\end{table}
+\endgroup
+
+\clearpage
+\section{Further Ablation Studies and Analysis}
+\subsection{Datasets per Task Cluster \& Templates per Dataset}
+Our primary hypothesis is that instruction tuning on a diverse set of tasks improves performance on unseen tasks.
+\cref{subsec:finetuning_clusters} showed that adding more task clusters improves performance; here, we further explore whether adding additional datasets improves performance when the number of task clusters is held constant.
+We use the same split as in \cref{subsec:finetuning_clusters}, where the NLI, commonsense reasoning, and closed-book QA clusters are held-out, and seven other task clusters remain for instruction tuning.
+For these seven task clusters, we instruction tune models using just one dataset per task cluster and using four datasets per task cluster (for task clusters that did not have four tasks, we just used all available tasks). 
+In addition, we simultaneously explore the role of the number of instruction templates per dataset; as mentioned in \cref{subsec:tasks_and_templates}, for each dataset we manually composed ten instructional templates for instruction tuning. 
+Here, we instruction tune models using 1, 4, and 10 templates per dataset.
+
+\cref{fig:ablation-templates} shows these results.
+Using more datasets per cluster improved performance by almost 10\% on average across the three held-out clusters. 
+Using more templates per dataset, however, had a comparatively negligible effect on performance when there was one task per cluster, which disappeared when there were four tasks per cluster.
+The small effect of templates is striking given our original motivation that composing ten templates per task would mitigate overfitting to any particular template. 
+This results serves to underscore, however, the unpredictability of finetuning large language models, as one hypothesis is that models at such scale do not easily overfit to a finetuning single task.
+
+\begin{figure}[h]
+    \centering
+    \includegraphics[width=0.55\linewidth]{figs/templates-per-dataset.png}
+    \vspace{-2mm}
+    \caption{Effect of datasets per task cluster and templates per dataset on performance on three held-out clusters: NLI, commonsense reasoning, and closed-book QA.
+    Adding more datasets per task cluster substantially improves performance.
+    Using more templates per dataset, however, only had a very small effect on performance, which disappeared when there were sufficient dataset per task cluster.
+    }
+    \label{fig:ablation-templates}
+\end{figure}
+
+\subsection{Role of instructions during finetuning}\label{subsec:role_instructions}
+The per-cluster results for the ablation study from \cref{subsec:role-of-instructions} are shown in \cref{tab:no_instructions}.
+
+\begingroup
+\setlength{\tabcolsep}{4.5pt}
+\begin{table}[h]
+    \centering
+    \begin{tabular}{ll cccc c}
+    \toprule
+     & & \multicolumn{5}{c}{Zero-shot performance on unseen task cluster} \\
+     \cmidrule(lr){3-7} 
+     
+    \makecell[l]{Finetuning prompt} & \makecell[l]{Inference prompt} & \makecell[c]{NLI} & \makecell[c]{\footnotesize{Read.}\vspace{-0.5mm}\\\footnotesize{Comp.}} &  \makecell[c]{\footnotesize{Closed-}\vspace{-0.5mm}\\\footnotesize{Book QA}} & \makecell[c]{Translation} & \makecell[c]{\footnotesize{\underline{Four-Task}}\vspace{-0.2mm}\\\footnotesize{\underline{Average}}}  \\
+     \midrule
+    \makecell[l]{Natural instructions \\(= \flan{})} & Natural instructions & 56.2 & 77.4 & 56.6 & 30.7 & 55.2 \\
+     \midrule
+     No template & Natural instructions & 50.5 & 58.2 & 25.5 & 15.0 & 37.3 \\
+     Task/dataset name & Natural instructions & 52.8 & 63.0 & 44.8 & 25.9 & 46.6 \\
+     Task/dataset name & Task/dataset name & 60.2 & 64.9 & 40.8 & 21.9 & 47.0 \\
+    \bottomrule
+    \end{tabular}
+    \caption{
+    Ablation study result using models where instructions are removed from the finetuning process. In ``no template,'' only inputs and outputs are given, which does not distinguish among tasks during multi-task finetuning. In ``task/dataset name'', inputs during multi-task finetuning are prepended with the name of the task and dataset (e.g., \textit{``[Translation: WMT'14 to French] The dog runs''}) NLI datasets: ANLI R1--R3, CB, and RTE; reading comprehension datasets: BoolQ, MultiRC, and OpenbookQA; closed-book QA datasets: ARC-c, ARC-e, NQ, and TQA; translation datasets: WMT'14 Fr$\leftrightarrow$En, WMT'16 De$\leftrightarrow$En, and WMT'16 Ro$\leftrightarrow$En. 
+    Notably, training with task/dataset name achieved a high NLI score largely because it achieved a score of 83.9 on the CB dataset, for which the validation set only has 56 examples (\flan{} also gets 83.9 with the best dev template, but the average template was only 64.1).
+    }
+    \label{tab:no_instructions}
+\end{table}
+\endgroup
+\subsection{Further Analysis: Instruction Tuning Facilitates Prompt Tuning}
+
+The per-dataset results for the analysis in \cref{subsec:prompt_tuning} are given in \cref{tab:prompt_tuning}.
+As the above tasks are all classification, further work in this direction might include tasks such as summarization or question answering, or try to finetune the model using the supervised datasets.
+
+\begingroup
+\setlength{\tabcolsep}{3.5pt}
+\begin{table}[h]
+    \centering
+    \begin{tabular}{ll cccc cccc cc}
+    \toprule
+     & & \multicolumn{8}{c}{\textsc{Prompt Tuning Analysis}} \\
+     \cmidrule(lr){3-10} 
+     
+    & \makecell[c]{\scriptsize{Prompt tuning}\vspace{-1.2mm}\\\scriptsize{train.~examples}} & \datasetacc{BoolQ} & \datasetacc{CB} & \datasetacc{CoPA} & \datasetfone{MultiRC} & \datasetacc{ReCoRD} & \datasetacc{RTE} & \datasetacc{WiC} & \datasetacc{WSC}  \\
+     \midrule
+     \baselm{} & \multirow{2}{*}{32} & 55.5 & 55.4 & 87.0 & 65.4 & 78.0 & 52.4 & 51.6 & 65.4 \\
+     \flan{} & & 77.5 & 87.5 & 91.0 & 76.8 & 80.8 & 83.0 & 57.8 & 70.2 \\
+     \midrule
+     \baselm{} & \multirow{2}{*}{\makecell[l]{\footnotesize{full}\vspace{-0.5mm}\\\footnotesize{dataset}}} & 82.8 & 87.5 & 90.0 & 78.6 & 84.8 & 82.0 & 54.9 & 72.7 \\
+     \flan{} & & 86.3 & 98.2 & 94.0 & 83.4 & 85.1 & 91.7 & 74.0 & 86.5 \\
+    \bottomrule
+    \end{tabular}
+    \caption{
+    \flan{} (instruction tuning) responds better to continuous inputs attained via prompt tuning than \baselm{} (no instruction tuning).
+    When prompt tuning on a given dataset, no tasks from the same cluster as that dataset were seen during instruction tuning.
+    }
+    \label{tab:prompt_tuning}
+\end{table}
+\endgroup
+\section{Data Contamination Analysis}\label{sec:data_contamination}
+
+One reasonable concern is that since the pretraining corpus of \flan{} has more than 2 trillion tokens, it is possible that examples from a given evaluation dataset may have already been seen verbatim by the model during pre-training, hence inflating the performance of our purported zero-shot model.
+To this end, like GPT-3 \citep{brown2020language}, we perform post-hoc data contamination analysis to investigate whether the performance of the model is in fact inflated by evaluating on examples that occurred in the pretraining dataset.
+
+Our data contamination procedure follows the setup of \citet{brown2020language}, which, for each benchmark, produces a ``clean'' version that removes all potentially leaked examples, defined as examples for which any $n$-gram ($n$ varies per dataset but is roughly 13) overlapped with anything in the pretraining corpus.
+We use the same $n$ per dataset as \citet{brown2020language} and also split on spaces.
+We then evaluate our model on this clean subset, comparing against model performance on the original dataset (clean + dirty).
+Lower performance on the clean subset would suggest that data contamination leads to inflated results. 
+
+\cref{fig:data-contamination} summarizes these results, with the exact numbers given in \cref{tab:data_contamination}. 
+We see several trends very similar to those in the GPT-3 paper: 
+(1) many datasets had a substantial number of examples that overlapped with the pretraining data, 
+(2) across all datasets, we do not see a correlation that evaluating on clean data does worse than evaluating on the total dataset, and 
+(3) as datasets had fewer clean examples, there was higher variance in the percent change in performance (likely due to a smaller number of clean examples).
+
+\begin{figure}[h]
+    \centering
+    \includegraphics[width=\linewidth]{figs/data-contamination.pdf}
+    \vspace{-2mm}
+    \caption{Like GPT-3, we also measured performance on cleaned versions of our datasets, which had high confidence to be unseen in the pretraining data of FLAN. 
+    We do not see a correlation that FLAN performed better on evaluation sets for which examples occurred more often in the pretraining data.
+    When the percent of clean data is very small, there are fewer examples for computing the clean performance, which leads to high variance. 
+    }
+    \label{fig:data-contamination}
+\end{figure}
+
+Like GPT-3, we also found that DROP and SQuADv2 had almost total overlap with the pretraining data.
+We follow their procedure of manually inspecting the data, and find that most overlapping $n$-grams were only in the contexts of examples (99.6\% for DROP and 97.2\% for SQuADv2).
+Overlaps never occurred in both the question and answer for DROP, and only occurred for both the question and answer for SQuADv2 in 5 of the 11,153 evaluation examples.
+Hence, for these two datasets, the model gains only background information and cannot memorize the answer to any specific questions (aside from the five examples in SQuADv2).
+
+ANLI R1 and R2 \citep{anli} also had almost complete data contamination, to a much higher degree than GPT-3. 
+Upon further inspection, we see that most overlaps occur in example contexts and not hypotheses (97.3\% for ANLI R1 and 98.2\% for ANLI R2). 
+As ANLI R1 and R2 are based entirely from Wikipedia examples (R3 is not), we posit that this higher degree of contamination in our pretraining dataset compared with GPT-3's is potentially due to using a more-recent version of Wikipedia that includes the contexts used in ANLI R1 and R2 (which were collected in 2019). 
+Because seeing a particular context in pretraining does not help with the NLI task given a new, unseen sentence, we think it is unlikely that these overlaps affected performance on the two datasets.
+
+Of the remaining datasets, only ReCoRD and PIQA had a clean subset performance that was lower than the overall evaluation set performance by more than 1\%. 
+These two datasets are language modeling (i.e., ``what's the best continuation of this sentence?''), and so it is more likely compared with previous tasks that seeing a complete sentence in the pretraining data could help the model predict the right answer in downstream evaluations.
+For PIQA, both the goal and solution had overlaps in 93 of the 1,838 evaluation examples, and for ReCoRD, the query had overlaps in 2,320 of the 10,000 training examples.
+We hence mark these results with an asterisk $^*$ in \cref{tab:nlu_table}.
+\citet{brown2020language} also reported substantial contamination rates for these two datasets (61\% dirty for ReCoRD and 29\% for PIQA), and also mark PIQA with an asterisk.
+
+As this overlap analysis follows that performed in \citet{brown2020language}, we reiterate the same caveats: the conservative nature of our $n$-gram matching procedure likely introduces additional false positives; there are no guarantees that the clean subset is drawn from the same distribution as the overall subset; and, accurately detecting test contamination is a relatively new research area without established best practices.
+Moreover, as our pretraining corpus is almost five times larger than that used for GPT-3 (which was 500B tokens), it is possible that there are more false positives in detecting dirty data.
+
+\begingroup
+\setlength{\tabcolsep}{3.5pt}
+    \begin{table}[h]
+        \centering
+        \small
+        \begin{tabular}{ll cc cc cc}
+        \toprule
+        Dataset & Metric & \makecell[c]{Total \\ count} & \makecell[c]{Total \\ acc/F1/BLEU} &  \makecell[c]{Clean \\ count} & \makecell[c]{Clean \\ acc/F1/BLEU} & \% clean & \makecell[c]{\% Diff \\ (clean $-$\\ overall)} \\
+        \midrule
+        DROP                   & F1       & 9,536  & 22.4 & 61   & 33.0 & 0.6  & 47.4  \\
+        SQuADv2              & F1       & 11,873 & 41.3 & 106  & 38.7 & 0.9  & -6.2  \\
+        ANLI R1               & acc & 1,000  & 48.1 & 14   & 57.1 & 1.4  & 18.8  \\
+        ANLI R2               & acc & 1,000  & 42.9 & 21   & 38.1 & 2.1  & -11.2 \\
+        ReCoRD                 & acc & 10,000 & 4.6  & 3,203 & 4.5  & 32.0 & -2.7  \\
+        MultiRC                & acc & 4,848  & 75.4 & 1,972 & 75.7 & 40.7 & 0.5   \\
+        PIQA                   & acc & 1,838  & 23.7 & 896  & 23.3 & 48.7 & -1.7  \\
+        ANLI R3               & acc & 1,200  & 44.2 & 718  & 45.3 & 59.8 & 2.5   \\
+        HellaSwag              & acc & 10,042 & 28.5 & 6,578 & 28.7 & 65.5 & 0.7   \\
+        RTE                    & acc & 2,77   & 84.1 & 183  & 84.2 & 66.1 & 0.0   \\
+        WMT'14 En$\rightarrow$Fr            & BLEU     & 3,003  & 31.3 & 2,243 & 31.5 & 74.7 & 0.9   \\
+        WMT'14 Fr$\rightarrow$En            & BLEU     & 3,003  & 34.0 & 2,243 & 34.1 & 74.7 & 0.2   \\
+        BoolQ                & acc & 3,270  & 76.5 & 2,515 & 76.3 & 76.9 & -0.4  \\
+        TQA (tfds-dev)             & F1       & 11,313 & 62.2 & 8,731 & 62.0 & 77.2 & -0.2  \\
+        ARC Easy              & acc & 2,365  & 79.5 & 1,888 & 79.0 & 79.8 & -0.6  \\
+        ARC Challenge         & acc & 1,165  & 63.1 & 983  & 64.2 & 84.4 & 1.7   \\
+        OpenbookQA             & acc & 500   & 74.6 & 425  & 74.8 & 85.0 & 0.3   \\
+        WMT'16 En$\rightarrow$De & BLEU     & 2,999  & 22.7 & 2,569 & 23.0 & 85.7 & 1.4   \\
+        WMT'16 De$\rightarrow$En & BLEU     & 2,999  & 38.6 & 2,569 & 38.7 & 85.7 & 0.2   \\
+        WMT'16 En$\rightarrow$Ro & BLEU     & 1,999  & 15.5 & 1,752 & 15.4 & 87.6 & -0.7  \\
+        WMT'16 Ro$\rightarrow$En & BLEU     & 1,999  & 36.7 & 1,752 & 36.8 & 87.6 & 0.1   \\
+        COPA                   & acc & 100   & 88.0 & 91   & 87.9 & 91.0 & -0.1  \\
+        CB                     & acc & 56    & 41.1 & 53   & 41.5 & 94.6 & 1.1   \\
+        NQ     & F1       & 3,610  & 24.5 & 3,495 & 24.3 & 96.8 & -0.5  \\
+        StoryCloze           & acc & 1,871  & 92.1 & 1,864 & 92.1 & 99.6 & 0.0   \\
+        Winogrande             & acc & 1,267  & 39.4 & 1,265 & 39.4 & 99.8 & 0.2   \\
+        \bottomrule
+        \end{tabular}
+    \caption{
+    Overlap statistics for the subset of datasets that are also used in GPT-3, sorted from dirtiest to cleanest. 
+    An evaluation example was dirty if it had any $n$-gram collision with the pretraining corpus. 
+    We computed these results for FLAN's performance using only a single template for each dataset, so they differ slightly compared with the results for average performance over all templates.
+    }
+    \label{tab:data_contamination}
+    \end{table}
+\endgroup
+\clearpage 
+\section{Extended Related Work}\label{sec:extended_related_work}
+
+\subsection{Language Models and Multi-task Learning}
+Our work is broadly inspired by a long line of prior work on language models for NLP applications \citep[][\textit{inter alia}]{dai2015semi,peters-etal-2018-deep,howard-ruder-2018-universal,radford2018improving,radford2019language}. 
+Instruction tuning can be seen as a formulation of multitask learning (MTL), which is an established area within deep learning \citep[][\textit{inter alia}]{collobert2011natural,luong2015multi,ruder2017overview,velay2018seq2seq,clark2019bam,liu2019multi}---see \citet{Worsham2020MultitaskLF} for a recent survey on MTL for NLP. 
+Differing from prior MTL work which focuses on performance improvements across training tasks \citep{raffel2019exploring,aghajanyan2021muppet} or to new domains \citep{axelrod-etal-2011-domain}, our work is motivated by improving zero-shot generalization to tasks that were not seen in training.
+
+\subsection{Zero-Shot Learning and Meta-Learning}
+Our work also falls in the well-established category of zero-shot learning, which has historically been used to refer to classifying instances among a set of unseen categories \citep[][\textit{inter alia}]{lampert2009learning,romera2015embarrassingly,srivastava-etal-2018-zero,yin-etal-2019-benchmarking}.
+In NLP, zero-shot learning work also includes translating between unseen language pairs \citep{johnson-etal-2017-googles,pham-etal-2019-improving}, language modeling on unseen languages \citep{lauscher-etal-2020-zero}, as well as various NLP applications \citep{liu-etal-2019-reconstructing,corazza-etal-2020-hybrid,wang2021zl3}.
+Most recently, the emergent ability of language models \citep{brown2020language} has led to increased interest in how models generalize to unseen tasks, the definition of zero-shot learning used in our paper.
+In addition, meta-learning \citep[][\textit{inter alia}]{finn2017model,vanschoren2018meta} also broadly tries to train models that adapt quickly to unseen tasks, typically based on a few examples.
+
+\subsection{Prompting}
+Instruction tuning leverages the intuition that language models at scale contain substantial world knowledge and can perform a range of NLP tasks \citep[][see also \cite{Bommasani2021OnTO}]{brown2020language}.
+Another line of work that shares this goal prompts models with continuous inputs optimized via backpropagation to substantially improve performance \citep{li-liang-2021-prefix,lester-prompt-tuning,qin-eisner-2021}, as well as work that prompts models to produce specialized outputs \citep{wei2022chain}.
+Although the success of these approaches depends heavily on model scale \citep{lester-prompt-tuning}, for which large models can be costly to serve, the ability of a single large model to perform many tasks slightly eases this burden.
+As shown by our experiments in \cref{subsec:prompt_tuning}, prompt tuning is an orthogonal method for which instruction tuning can additionally improve performance.
+\citet{reif2021recipe} is similar to our work in that they also use related tasks to improve zero-shot learning, though they differ by only using related tasks in the context (and not finetuning), and focus on the application of text style transfer.
+
+Our work shares similar motivations with prompting in that we use inference-time text interactions to prompt a single model, without creating separate checkpoints for each task. 
+Whereas prompting work such as GPT-3 uses prompt engineering to write prompts that intentionally mimic text that is likely to be seen during pretraining (e.g., for MultiRC GPT-3 tries a prompt that mimics a test with an answer key), we hope that finetuning models to respond to natural language instructions instead of completing a sentence will make such large models more accessible to non-technical users.
+
+\subsection{Finetuning Large Language Models}
+Finetuning pretrained language models is a well-established method in NLP, with much of the work so far occurring on models in the range of 100M to 10B parameters \cite[][\textit{inter alia}]{dai2015semi,devlin-etal-2019-bert,raffel2019exploring,lewis-etal-2020-bart}.
+For models of O(100B) parameters, recent work has finetuned task-specific models for program synthesis \citep{Austin2021ProgramSW,chen2021evaluating}, summarization \citep{wu2021recursively}, as well as improved bias and fairness behavior \citep{solaiman2021process}.
+In addition to the traditional ``dense'' models, sparse mixture of experts (MoE) models of up to more than 1T parameters have been trained and finetuned \citep{lepikhin2020gshard,fedus2021switch}.  
+Compared with this prior work that finetunes and evaluates on the same downstream task, our setup studies the effect of instruction tuning on ability to perform unseen tasks.
+
+\subsection{Multi-task Question Answering}
+The instructions we use for instruction tuning are similar to QA-based task formulation research, which aims to unify NLP tasks by casting them as question-answering over a context.
+For instance, \citet{mccann2018natural} cast ten NLP tasks as QA and train a model on a collection of tasks formulated with natural language prompts;
+they report transfer learning gains on finetuning tasks as well as zero-shot domain adaptation results on SNLI \citep{bowman-etal-2015-large} and Amazon/Yelp Reviews \citep{amazonyelp2015}.
+While \citet{mccann2018natural} does not leverage unsupervised pre-training and only reports zero-shot transfer to unseen domains, our work uses a pretrained LM and focuses on zero-shot performance on unseen task clusters.
+UnifiedQA \citep{khashabi-etal-2020-unifiedqa} shows similar transfer learning gains as \citet{mccann2018natural} across 20 datasets and reports good generalization to unseen tasks across four types of QA. 
+Focusing on binary text classification, \citet{zhong2021meta} finetune T5-770M on 43 tasks phrased as yes/no questions and study the zero-shot performance on unseen tasks. 
+In comparison, our paper is much larger in scope, empirically demonstrating the idea on a wide range of tasks with a much larger model.
+Other work has used QA-based task formulation for more-targeted applications including semantic role labeling \citep{he-etal-2015-question}, relation extraction \citep{levy-etal-2017-zero}, coreference resolution \citep{wu-etal-2020-corefqa} and named entity recognition \citep{li-etal-2020-unified} as question answering.
+
+\subsection{Instructions-Based NLP}
+Recent improvements in the capabilities of language models have led to increased interest in a nascent area of instructions-based NLP \citep[][and see \citet{mccarthy1960programs}]{goldwasser2014learning}.
+\citet{schick-schutze-2021-exploiting} \citep[also see][]{gao-etal-2021-making,tam2021adapet} use task descriptions in cloze-style phrases to help language models assign soft labels for few-shot and semi-supervised learning, though this line of work finetunes new checkpoints for each downstream task.
+\citet{efrat2020turking} evaluated GPT-2 \citep{radford2019language} on simple tasks ranging from retrieving the $n$th word of a sentence to generating examples for SQuAD, concluding that GPT-2 performs poorly across all tasks.
+
+In terms of the setup of finetuning on a large number of tasks and evaluating on unseen tasks, two recent papers are similar to ours. 
+\citet{mishra2021natural} finetune BART \citep{lewis-etal-2020-bart} using instructions and few-shot examples for tasks such as question answering, text classification, and text modification, and find that this few-shot finetuning with instructions improves performance on unseen tasks.
+\citet{ye2021crossfit} introduce a setup for cross-task few-shot learning, finding that multi-task meta-learning using MAML \citep{finn2017model} improves the few-shot capabilities of BART on unseen downstream tasks.
+Our work differs from these two papers in that we focus on zero-shot learning, for which we observe the crucial importance of model scale (FLAN is 1,000x larger than BART-base).
+
+Perhaps the papers most related to ours are the recent \citet{sanh2021multitask} and \citet{min2021metaicl}, which were released after our initial preprint. \citet{min2021metaicl} finetunes GPT-2 Large (770M parameters) to be a few-shot learner, which is the same approach as our experiment in Section 4.3. Similar to our conclusions, they also observe that including few-shot exemplars and instruction tuning are complementary ways to improve performance. \citet{sanh2021multitask} propose to finetune T5-11B to respond to prompts, and they also report performance improvements on zero-shot learning. These two papers and our work all study finetuning with instructions, but, as noted by \citet{min2021metaicl}, it is hard to directly compare results, due to differing model sizes, model types (decoder-only vs encoder-decoder), pretraining data, task mixtures, and type of instructions (\citet{sanh2021multitask} say that their instructions are more diverse).
+
+Finally, OpenAI has a model called InstructGPT \citep{ouyang2022instructgpt}. 
+InstructGPT uses human anntations to guide desired model behavior, both via finetuning and reinforcement learning, finding that InstructGPT is preferred by human rathers compared with unmodified GPT-3.
+
+\clearpage
+\section{Frequently Asked Questions}\label{sec:faq}
+
+\textbf{How do the \flan{} instructions differ from GPT-3 or T5 prompts?}
+
+GPT-3 prompting is done in a way such that the prompt looks like data that the model has been pretrained on, and the model finishes the continuation. 
+T5 prompts are mostly just a tag for the dataset, which would not work in the zero-shot setting. 
+In contrast, the prompts that we use for \flan{} are similar to what would be used to ask a human to perform the task.
+
+For instance, given an input for an NLI task, these would be the prompts.
+
+\textit{T5 prompt:} \\
+\textttsmall{cb hypothesis: At my age you will probably have learnt one lesson. premise: It's not certain how many lessons you'll learn by your thirties.}
+
+\textit{GPT-3 prompt:} \\
+\textttsmall{At my age you will probably have learnt one lesson.} \\
+\textttsmall{question: It's not certain how many lessons you'll learn by your thirties. true, false, or neither?
+answer:}
+
+\textit{FLAN prompt:} \\
+\textttsmall{Premise: At my age you will probably have learnt one  lesson.}\\
+\textttsmall{Hypothesis: It's not certain how many lessons you'll learn by your thirties.}\\
+\textttsmall{Does the premise entail the hypothesis?}
+
+So because \flan{} prompts are formulated as responding to an instruction, they do not work well for pretrained language models without finetuning. 
+Performance was near zero for most generation tasks. 
+For instance, given the input \textit{```The dog runs.' Translate this sentence to French.''}, \baselm{} continues with \textit{''The dog runs after the cat''} instead of actually translating the sentence. Hence, we used the established GPT-3 prompts for our \baselm{} baselines.
+
+\vspace{4mm}
+\textbf{What are some limitations/failure cases of \flan{}?}
+
+While we qualitatively find that \flan{} responds well to most tasks, it does fail on some simple tasks. 
+For instance, as shown in \cref{fig:examples-failures}, \flan{} fails at the very simple task of returning the second word in a sentence, and also incorrectly translates a question to Danish when asked to answer the question in Danish.
+Additional limitations include a context length of only 1024 tokens (which is not enough for most summarization tasks), and that the model was mostly trained on English data.
+
+\vspace{4mm}
+\textbf{Can \flan{} be used when large amounts of training data are available?}
+
+In this work, we focus on cross-task generalization to zero-shot tasks, but we also believe that instruction tuning could result in positive task transfer among seen tasks, depending on the mixture of tasks (though we leave this for future work). 
+In \cref{subsec:prompt_tuning}, where we apply prompt tuning to the \flan{} checkpoint, we see promising results that indicate positive task transfer in a supervised setting.
+
+\vspace{4mm}
+\textbf{Are the ten unique templates per dataset or per task cluster?} 
+
+The ten unique templates are for each dataset and not for a task cluster. This is because datasets in the same task cluster often differed slightly (e.g., \textit{``is this movie review positive''} vs \textit{``is this yelp review positive''}).
+
+\vspace{4mm}
+\textbf{In \cref{fig:scale-ablation}A, why does the untuned \baselm{} model see worse performance with more parameters for reading comprehension and sentiment analysis?}
+
+For context, \cref{fig:scale-ablation}A is a check of correctness for \cref{fig:scale-ablation}B. \cref{fig:scale-ablation}A confirms that scale improves performance for tasks that were seen during instruction tuning, as expected. The untuned \baselm{} model performance in \cref{fig:scale-ablation}A is shown just for completeness.
+
+Nonetheless, the fact that scale does not always improve zero-shot performance of untuned \baselm{} is an interesting artifact. Initially, we were surprised, because \citet{brown2020language} shows that scale improves performance across a large number of tasks in aggregate.
+
+It turns out that scale does not improve performance for certain tasks. This is especially true for zero-shot learning, and we think that this happens to be the case for the reading comprehension and sentiment analysis tasks we evaluate. The GPT-3 paper itself similarly reports that zero-shot performance on BoolQ and DROP decreases from 13B to 175B parameters. The GPT-3 paper does not show results on sentiment analysis, but \citet{holtzman-etal-2021-surface} find that zero-shot performance on SST-2 also gets worse from 13B to 175B parameters. Hence, this artifact is consistent across both GPT-3 and the models we use.
+
+This artifact is certainly worth further study, but is outside the scope of instruction tuning. 
+Ideally, we would have performed the \cref{fig:scale-ablation} ablation with cross-validation instead of a single split, which likely would have smoothed out that artifact.
+
+\section{Qualitative Examples}\label{sec:qualitative}
+
+This section shows qualitative examples of \flan{} responding to various prompts.
+
+\begin{figure}[h]
+    \centering
+    \includegraphics[width=0.96\linewidth]{figs/flan-examples-sentiment.pdf}
+    \vspace{-3mm}
+    \caption{For sentiment analysis, \flan{} changes the answer appropriately when the question is flipped.}
+    \label{fig:examples-sentiment}
+\end{figure}
+
+\begin{figure}[h]
+    \centering
+    \vspace{2mm}
+    \includegraphics[width=0.96\linewidth]{figs/flan-examples-qa.pdf}
+    \vspace{-3mm}
+    \caption{For question answering, \flan{} can answer a question in another language when instructed to do so. \samplingexplanation{}}
+    \label{fig:examples-qa}
+\end{figure}
+
+\begin{figure}[h]
+    \centering
+    \vspace{2mm}
+    \includegraphics[width=0.96\linewidth]{figs/flan-examples-rules.pdf}
+    \vspace{-3mm}
+    \caption{\flan{} can perform zero-shot rule-based manipulations.}
+    \label{fig:examples-rules}
+\end{figure}
+
+\begin{figure}[h]
+    \centering
+    \vspace{2mm}
+    \includegraphics[width=0.96\linewidth]{figs/flan-examples-recommendations.pdf}
+    \vspace{-3mm}
+    \caption{\flan{} can make zero-shot recommendations. \samplingexplanation{}}
+    \label{fig:examples-recommendations}
+\end{figure}
+
+\begin{figure}[h]
+    \centering
+    \vspace{2mm}
+    \includegraphics[width=0.96\linewidth]{figs/flan-examples-intents.pdf}
+    \vspace{-4mm}
+    \caption{\flan{} can be used in a zero-shot fashion to generate data, such as utterances that are consistent with a given intent. \samplingexplanation{}}
+    \label{fig:examples-intents}
+\end{figure}
+
+\begin{figure}[h]
+    \centering
+    \vspace{2mm}
+    \includegraphics[width=0.96\linewidth]{figs/flan-examples-query.pdf}
+    \vspace{-4mm}
+    \caption{\flan{} can be used for zero-shot query expansion. \samplingexplanation{}}
+    \label{fig:examples-query}
+\end{figure}
+
+\begin{figure}[h]
+    \centering
+    \vspace{2mm}
+    \includegraphics[width=0.96\linewidth]{figs/flan-examples-writing.pdf}
+    \vspace{-4mm}
+    \caption{\flan{} can perform zero-shot tasks relevant to assisted-writing applications. \samplingexplanation{}}
+    \label{fig:examples-writing}
+\end{figure}
+
+\begin{figure}[h]
+    \centering
+    \vspace{2mm}
+    \includegraphics[width=0.96\linewidth]{figs/flan-examples-lexigenesis.pdf}
+    \vspace{-3mm}
+    \caption{\flan{} can be used for zero-shot word formation. \samplingexplanation{}}
+    \label{fig:examples-lexigenesis}
+\end{figure}
+
+\begin{figure}[h]
+    \centering
+    \vspace{2mm}
+    \includegraphics[width=0.96\linewidth]{figs/flan-examples-open.pdf}
+    \vspace{-3mm}
+    \caption{Open-ended generation tasks by \flan{}. The carrot story was from sampling sixteen outputs with a minimum length of 150 and choosing the highest probability output.}
+    \label{fig:examples-open}
+\end{figure}
+
+\begin{figure}[h]
+    \centering
+    \vspace{2mm}
+    \includegraphics[width=0.96\linewidth]{figs/flan-examples-failures.pdf}
+    \vspace{-3mm}
+    \caption{Example failure cases for \flan{}. Left: \flan{} fails to perform a simple task of returning the $n$th word. Right: \flan{} translates a question instead of answering it. \samplingexplanation{}}
+    \label{fig:examples-failures}
+\end{figure}
+
+\clearpage
+\section*{Changes from V4 to V5}
+\begin{itemize}
+    \item Replaced the tables in the main figure with a figure, which takes up less space and focuses on zero-shot performance. \item Added GLaM 64B/64E as a baseline.
+    \item Moved the ablation about the role of instructions, as well as prompt tuning, into the main paper (and condensed the figures).
+\end{itemize}
+
+\section*{Changes to V4 from V3}
+\begin{itemize}
+    \item We added a Frequently Asked Questions section (\cref{sec:faq}).
+    \item We added a section with qualitative examples (\cref{sec:qualitative}).
+    \item We added an additional ablation study on the role of instructions during finetuning (\cref{subsec:role_instructions}).
+    \item We updated the related work (\cref{sec:extended_related_work}) with manuscripts posted on arxiv since our initial preprint.
+\end{itemize}
+
+\section*{Changes to V3 from V2}
+\begin{itemize}
+    \item The number of tokens used in pretraining was corrected from 2.81T to 2.49T tokens.
+\end{itemize}
+
+\section*{Changes to V2 from V1}
+\begin{itemize}
+    \item We updated the terminology to ``datasets'' and ``task clusters.''
+    \item We renamed the previous ``open-domain QA'' task cluster to ``closed-book QA.''
+    \item We extended the related work section and moved it to the \cref{sec:extended_related_work}, using a shorter version in the main body.
+    \item We added \flan{} and \baselm{} results for additional datasets for which GPT-3 results were not reported.
+    \item For TriviaQA, v1 reported results on the tfds dev set of 11,313 examples. GPT-3 actually evaluates on the wikipedia dev set of 7,993 examples, so we ran an additional evaluation on that dev set in order to compare with GPT-3's performance. Zero-shot \flan{} now beats zero-shot GPT-3 on that task (and therefore on 20 of 25 tasks). We still show the original result in \cref{tab:nlu_table}, though there is no GPT-3 result to compare with.
+    \item We moved commonsense reasoning and coreference resolution from the main body to the Appendix.
+    \item We moved prompt tuning from the main body to \cref{subsec:prompt_tuning}.
+    \item We added data contamination analysis (\cref{sec:data_contamination}).
+    \item We added few-shot instruction tuning (\cref{subsec:finetune}).
+    \item We cited additional datasets in \cref{task_details}.
+    \item The number of tokens used in pretraining was corrected from 2.81T to 2.49T tokens.
+\end{itemize}
+
+\clearpage 
+\section{Tasks and Datasets}\label{task_details}
+
+This appendix further details the datasets that we use in this paper.
+We group datasets into one of the following task clusters:
+
+\begin{itemize}[leftmargin=*]
+    \itemsep0em 
+    \item \textbf{Natural language inference} concerns how two sentences relate, typically asking, given a first sentence, whether a second sentence is true, false, or possibly true.
+    We use the following datasets:
+    \begin{enumerate}
+        \item ANLI \citep{anli}
+        \item CB \citep{de2019commitmentbank}
+        \item MNLI \citep{N18-1101}
+        \item QNLI \citep{rajpurkar-etal-2018-know}
+        \item SNLI \citep{bowman-etal-2015-large}
+        \item WNLI \citep{levesque2012winograd}
+        \item RTE \citep{10.1007/11736790_9,haim2006second,giampiccolo-etal-2007-third,bentivogli2009fifth}
+    \end{enumerate}
+    \item \textbf{Reading comprehension} tests the ability to answer a question when given a passage that contains the answer. 
+    We use the following datasets:
+    \begin{enumerate}
+        \item BoolQ \cite{clark-etal-2019-boolq}
+        \item DROP \citep{Dua2019DROP}
+        \item MultiRC \citep{khashabi-etal-2018-looking}
+        \item OBQA \citep{mihaylov-etal-2018-suit}
+        \item SQuADv1 \citep{rajpurkar-etal-2016-squad}
+        \item SQuADv2 \citep{rajpurkar-etal-2018-know}
+    \end{enumerate}
+    \item \textbf{Commonsense reasoning} evaluates the ability to perform physical or scientific reasoning with an element of common sense. 
+    We use the following datasets:
+    \begin{enumerate}
+        \item COPA \citep{SSS112418}
+        \item HellaSwag \citep{zellers-etal-2019-hellaswag}
+        \item PiQA \citep{Bisk2020}
+        \item StoryCloze \citep{mostafazadeh-etal-2016-corpus}
+    \end{enumerate}
+    \item \textbf{Sentiment analysis} is a classic NLP task aims to understand whether a piece of text is positive or negative. 
+    We use the following datasets:
+    \begin{enumerate}
+        \item IMDB \citep{maas-EtAl:2011:ACL-HLT2011}
+        \item Sentiment140 \citep{go2009twitter}
+        \item SST-2 \citep{socher-etal-2013-recursive}
+        \item Yelp \citep{yelpdataset}
+    \end{enumerate}
+    \item \textbf{Closed-book QA} asks models to answer questions about the world without specific access to information that contains the answer. 
+    We use the following datasets:
+    \begin{enumerate}
+        \item ARC \citep{clark2018think}
+        \item NQ \citep{orqa,kwiatkowski2019natural}
+        \item TriviaQA \cite{JoshiTriviaQA2017}
+    \end{enumerate}
+    \item \textbf{Paraphrase detection} asks a model to determine whether two sentences are semantically equivalent.\footnote{Although paraphrasing can be seen as positive entailment in both directions, it has been distinct from NLI in the academic literature.}
+    We use the following datasets:
+    \begin{enumerate}
+        \item MRPC \citep{dolan-brockett-2005-automatically}
+        \item QQP \citep[see]{wang-etal-2018-glue}
+        \item Paws Wiki \citep{zhang-etal-2019-paws}
+    \end{enumerate}
+    \item \textbf{Coreference resolution} tests the ability to identify expressions of the same entity in some given text.
+    We use the following datasets:
+    \begin{enumerate}
+        \item DPR \citep{rahman-ng-2012-resolving}
+        \item Winogrande \citep{sakaguchi2020winogrande}
+        \item WSC273 \citep{levesque2012winograd}
+    \end{enumerate}
+    \item \textbf{Reading comprehension with commonsense} combines elements of both reading comprehension with commonsense.
+    We use the following datasets:
+    \begin{enumerate}
+        \item CosmosQA \citep{huang-etal-2019-cosmos}
+        \item ReCoRD \citep{DBLP:journals/corr/abs-1810-12885}
+    \end{enumerate}
+    \item \textbf{Struct to text} tests the ability to describe some structured data using natural language. 
+    We use the following datasets:
+    \begin{enumerate}
+        \item CommonGen \citep{lin-etal-2020-commongen}
+        \item DART \citep{nan-etal-2021-dart}
+        \item E2ENLG \citep{dusek-etal-2019-semantic}
+        \item WebNLG \citep{gardent-etal-2017-webnlg}
+    \end{enumerate}
+    \item \textbf{Translation} is the task of translating text from one language into a different language. We use the following datasets:
+    \begin{enumerate}
+        \item En--Fr from WMT'14 \citep{wmt14}
+        \item En--De, En--Tr, En--Cs, En--Fi, En--Ro, and En--Ru from WMT'16 \citep{wmt16}
+        \item En--Es from Paracrawl \citep{banon-etal-2020-paracrawl}
+    \end{enumerate}
+    \item \textbf{Summarization} asks models to read a piece of text and generate an abbreviated summary of it.
+    We use the following datasets:
+    \begin{enumerate}
+        \item AESLC \citep{zhang2019slg}
+        \item CNN-DM \citep{see-etal-2017-get}
+        \item Gigaword \citep{napoles-etal-2012-annotated}
+        \item MultiNews \citep{fabbri-etal-2019-multi}
+        \item Newsroom \citep{grusky-etal-2018-newsroom}
+        \item Samsum \citep{gliwa-etal-2019-samsum}
+        \item XSum \citep{narayan-etal-2018-dont}
+        \item AG News \citep{NIPS2015_250cf8b5}
+        \item Opinion Abstracts - Rotten Tomatoes \citep{wang-ling-2016-neural}
+        \item Opinion Abstracts - iDebate \citep{wang-ling-2016-neural}
+        \item Wiki Lingua English \citep{ladhak-etal-2020-wikilingua}
+    \end{enumerate}
+    \item Additional datasets that we assign to a miscellaneous task cluster include:
+    \begin{enumerate}
+        \item Conversational question-answering: QuAC \citep{choi-etal-2018-quac} and CoQA  \citep{reddy-etal-2019-coqa}
+        \item Evaluating context-sentence word meanings: WiC \citep{pilehvar-camacho-collados-2019-wic}
+        \item Question classification: TREC \citep{li-roth-2002-learning,hovy-etal-2001-toward}
+        \item Linguistic acceptability: CoLA \citep{warstadt2018neural}
+        \item Math questions \citep{saxton2019analysing}
+    \end{enumerate}
+\end{itemize}
+
+For all tasks, our finetuning and evaluation code uses tensorflow datasets (TFDS) to load and process datasets.
+Regarding the number of training examples per dataset, we limited the training set size per dataset to 30,000 so that no dataset dominated the finetuning distribution.  
+When a test set with labels was available in TFDS, we used it; otherwise, we used the TFDS validation set as our test set, splitting the training set into a train and dev set.
+
+On the following pages, we show inputs and outputs for evaluation tasks where we compared with GPT-3. See the attached supplementary material for the templates for all other datasets.
+
+\newcommand{\taskio}[3]{
+    \begin{table}[h]
+        \centering
+        \begin{tabular}{ |p{0.95\linewidth}| } 
+             \hline
+             \vspace{-1mm} \textsc{\textbf{\underline{Input}}}  \\ 
+             #1 \\
+             \hline
+             \vspace{-1mm} \textsc{\textbf{\underline{Target}}}  \\ 
+             {#2} \\
+             \hline
+        \end{tabular}
+        \caption{#3}
+    \end{table}
+}
+
+\newcommand{\taskdescription}[8]{Example input and target for #1 (#2). #2 #3 #4. Of the #5, we use #6 for train and #7 for dev. We use #8 as our test set for reporting numbers.}
+
+\clearpage 
+\subsection{Natural Language Inference}\label{appen:b-nli}
+
+\taskio
+{Joey Heindle (born 14 May 1993 in Munich) is a German singer. He is best known for winning the seventh season of the game show Ich bin ein Star – Holt mich hier raus! and finishing in 5th place in season 9 of Deutschland sucht den Superstar, despite universally negative reviews from the jury each week.\\\\Based on the paragraph above can we conclude that "Joey Heindle was highly disliked by people on television."?\\\\OPTIONS:\\- Yes\\- It's impossible to say\\- No}
+{Yes}
+{   \taskdescription
+    {Adversarial NLI} %
+    {ANLI} %
+    {\citep{anli}} %
+    {is a large-scale NLI benchmark with adversarial examples collected iteratively with a human and model in the loop. The task is to determine whether a hypothesis is entailed by a premise (entailment, not entailment, or impossible to say). There are three rounds, R1--R3} %
+    {three training sets with 16,946, 45,460, and 100,459 examples} %
+    {16,946, 30,000, and 30,000} %
+    {200 from each of the three TFDS validation sets} %
+    {the TFDS ``test'' sets of 1,000, 1,000, and 1,200 examples} %
+}
+
+\taskio
+{A: so I watch the fish, you know. Whatever I can do to keep myself occupied. I like to have the TV on, because that usually keeps me, um, more occupied. It kind of takes the time away and I don't realize, that's really the only time I ever watch TV, is when I'm on the bike. and then usually after I'm done riding the bike, just to cool myself down, I usually take a walk, you know, and that just kind of uh, gets me, you know, to where I'm not quite as tired I guess. But it's definitely a task. B: You think so? A: I can't say that I really enjoy it.\\\\Based on the paragraph above can we conclude that "she really enjoys it"?\\\\OPTIONS:\\- Yes\\- No\\- It's impossible to say}
+{No}
+{
+    \taskdescription
+    {Commitment Bank} %
+    {CB} %
+    {\citep{de2019commitmentbank}} %
+    {is a corpus of texts in which a hypothesis is extracted from a premise, and the task is to determine whether the hypothesis is entailed by the premise (entailment, not entailment, or impossible to say)} %
+    {training set with 250 examples} %
+    {200} %
+    {50} %
+    {the TFDS validation set of 56 examples} %
+}
+
+\taskio
+{After years of study, the Vatican's doctrinal congregation has sent church leaders a confidential document concluding that "sex-change" procedures do not change a person's gender in the eyes of the church.\\\\Based on the paragraph above can we conclude that "Sex-change operations become more common."?\\\\OPTIONS:\\- yes\\- no}
+{no}
+{
+    \taskdescription
+    {Recognizing Textual Entailment} %
+    {RTE} %
+    {\citep{10.1007/11736790_9,haim2006second,giampiccolo-etal-2007-third,bentivogli2009fifth}} %
+    {asks whether a second sentence is entailed by a first (binary, either entailed or not entailed)} %
+    {training set with 2490 examples} %
+    {2,290} %
+    {200} %
+    {the TFDS validation set of 277 examples} %
+}
+
+\clearpage 
+\subsection{Reading Comprehension}\label{appen:b-reading-comp}
+
+\taskio
+{There are four ways an individual can acquire Canadian citizenship: by birth on Canadian soil; by descent (being born to a Canadian parent); by grant (naturalization); and by adoption. Among them, only citizenship by birth is granted automatically with limited exceptions, while citizenship by descent or adoption is acquired automatically if the specified conditions have been met. Citizenship by grant, on the other hand, must be approved by the Minister of Immigration, Refugees and Citizenship.\\\\Can we conclude that can i get canadian citizenship if my grandfather was canadian?\\\\OPTIONS:\\- no\\- yes}
+{no}
+{
+    \taskdescription
+    {Boolean Questions} %
+    {BoolQ} %
+    {\cite{clark-etal-2019-boolq}} %
+    {asks a yes/no question based on a passage and a question} %
+    {training set with 9,427 examples} %
+    {9,227} %
+    {200} %
+    {the TFDS validation set of 3,270 examples} %
+}
+
+\taskio
+{Imagine you are standing in a farm field in central Illinois. The land is so flat you can see for miles and miles. On a clear day, you might see a grain silo 20 miles away. You might think to yourself, it sure is flat around here. If you drive one hundred miles to the south, the landscape changes. In southern Illinois, there are rolling hills. Why do you think this is? What could have caused these features? There are no big rivers that may have eroded and deposited this material. The ground is capable of supporting grass and trees, so wind erosion would not explain it. To answer the question, you need to go back 12,000 years. Around 12,000 years ago, a giant ice sheet covered much of the Midwest United States. Springfield, Illinois, was covered by over a mile of ice. Its hard to imagine a mile thick sheet of ice. The massive ice sheet, called a glacier, caused the features on the land you see today. Where did glaciers go? Where can you see them today? Glaciers are masses of flowing ice. \\\\Question: "How big were the glaciers?"\\\\Response: "One mile"\\\\Does the response correctly answer the question?\\\\OPTIONS:\\- no\\- yes}
+{yes}
+{
+    \taskdescription
+    {Multi-Sentence Reading Comprehension} %
+    {MultiRC} %
+    {\cite{khashabi-etal-2018-looking}} %
+    {asks an open-ended question given a paragraph that contains the answer} %
+    {training set with 27,243 examples} %
+    {27,043} %
+    {200} %
+    {the TFDS validation set of 4,848 examples} %
+}
+
+\taskio
+{soil is a renewable resource for growing plants\\A plant that needs to expand will be able to have an endless resource in\\\\OPTIONS:\\- dirt\\- pesticides\\- pay\\- beans}
+{dirt}
+{
+    \taskdescription
+    {Openbook Question Answering} %
+    {OBQA} %
+    {\citep{mihaylov-etal-2018-suit}} %
+    {asks 4-way multiple choice questions based facts} %
+    {training set with 4,957 examples} %
+    {all} %
+    {200 in the TFDS validation set of 500 examples} %
+    {the TFDS test set of 500 examples} %
+}
+
+\clearpage 
+\subsection{Commonsense Reasoning}\label{appen:b-commonsense}
+
+\taskio
+{I packed up my belongings. What is the cause?\\\\OPTIONS:\\- I was hunting for a new apartment.\\- I was moving out of my apartment.}
+{I was moving out of my apartment.}
+{
+    \taskdescription
+    {Choice of Plausible Alternatives} %
+    {COPA} %
+    {\citep{SSS112418}} %
+    {is a causal reasoning task that asks to infer either a cause of effect of a premise from two choices} %
+    {training set with 400 examples} %
+    {350} %
+    {50} %
+    {the TFDS validation set of 100 examples} %
+}
+
+\taskio
+{What happens next in this paragraph?\\\\Once the rope is inside the hook, he begins moving up the wall but shortly after he stops and begins talking. The male then begins talking about the clip again and goes back up the wall. as he\\OPTIONS:\\- progresses, there are hooks everywhere on the wall and when he gets near them, he puts his rope inside of it for support and safety.\\- changes time, an instant replay of his initial move is shown a second time.\\- continues to talk, another male speaks about the move and shows another closeup of the plex by the male.\\- continues, other people start to arrive and begin to hang out with him as he makes a few parts of the rope.}
+{progresses, there are hooks everywhere on the wall and when he gets near them, he puts his rope inside of it for support and safety.}
+{
+\taskdescription
+    {Commonsense Sentence Completion} %
+    {HellaSwag} %
+    {\citep{zellers-etal-2019-hellaswag}} %
+    {tests for sentence completion that requires common sense, asking for the most probable ending given four contexts} %
+    {training set with 39,905 examples} %
+    {30,000} %
+    {200} %
+    {the TFDS validation set of 10,042 examples} %
+}
+
+\taskio
+{Here is a goal: Remove smell from garbage disposal.\\\\How would you accomplish this goal?\\\\OPTIONS:\\- Create soda ice cubes and grind through disposal.\\- Create vinegar ice cubes and grind through disposal.}
+{Create vinegar ice cubes and grind through disposal.}
+{
+    \taskdescription
+    {Physical Question Answering} %
+    {PiQA} %
+    {\citep{Bisk2020}} %
+    {is a commonsense QA benchmark for naive physics reasoning, where a solution to a goal must be selected from two choices} %
+    {training set with 16,113 examples} %
+    {16,013} %
+    {100} %
+    {the TFDS validation set of 1,838 examples} %
+}
+
+\taskio
+{Caroline never drinks carbonated beverages. Her friends pick on her because of it. One day they challenged her to drink a soda. Caroline wanted to win the challenge.\\\\Predict the next sentence.\\OPTIONS:\\- Caroline refused to open the soda.\\- Caroline opened the soda and drank it all in one gulp!}
+{Caroline opened the soda and drank it all in one gulp!}
+{
+    \taskdescription
+    {The Story Cloze Test} %
+    {StoryCloze} %
+    {\citep{mostafazadeh-etal-2016-corpus}} %
+    {is a commonsense reasoning framework for story generation, where a system chooses the correct ending to a four-sentence story. We use the 2016 version on TFDS} %
+    {validation set with 1,871 examples (no training set is available)} %
+    {1,671} %
+    {200} %
+    {the TFDS test set of 1,871 examples} %
+}
+
+\clearpage 
+\subsection{Closed-Book QA}\label{appen:b-open-qa}
+
+\taskio
+{What season is the Northern Hemisphere experiencing when it is tilted directly toward the Sun?\\\\OPTIONS:\\- fall\\- winter\\- spring\\- summer}
+{summer}
+{
+\taskdescription
+    {The AI2 Reasoning Challenge} %
+    {ARC} %
+    {\citep{clark2018think}} %
+    {asks grade-school level 4-way multiple choice science questions. There is a challenge set and an easy set, where the challenge set questions were answered incorrectly by both a retrieval-based algorithm and a co-occurrence algorithm} %
+    {training sets with 1,119 examples (challenge) and 2,251 (easy)} %
+    {we use 919 and 2,051 respectively} %
+    {200 each} %
+    {the TFDS test sets of 1,172 and 2,376 examples respectively} %
+}
+
+\taskio
+{Question: who is the girl in more than you know??\\Answer:}
+{Romi Van Renterghem.}
+{
+    \taskdescription
+    {Natural Questions (Open)} %
+    {NQ} %
+    {\citep{orqa,kwiatkowski2019natural}} %
+    {asks for an open-ended answer given a question, where all questions can be answered using the contents of Wikipedia} %
+    {training set of 87,925 examples} %
+    {30,000} %
+    {200} %
+    {the TFDS validation set of 3,610 examples} %
+}
+
+\taskio
+{Please answer this question: Henry Croft, an orphan street sweeper who collected money for charity, is associated with what organised charitable tradition of working class culture in London, England?}
+{pearly kings and queens}
+{
+    \taskdescription
+    {Trivia Question Answering} %
+    {TriviaQA} %
+    {\cite{JoshiTriviaQA2017}} %
+    {includes question-answer pairs authored by trivia enthusiasts} %
+    {training set of 87,622 examples} %
+    {30,000} %
+    {200} %
+    {7,993 examples from Wikipedia of the 11,313 examples in the TFDS validation set, which is the same validation set used in \citep{brown2020language}.} %
+}
+
+\clearpage 
+\subsection{Coreference Resolution}\label{appen:b-coreference}
+
+\taskio
+{How does the sentence end?\\\\Elena wanted to move out of her parents fast but Victoria wanted to stay for a while, \\\\OPTIONS:\\- Elena went to school.\\- Victoria went to school.}
+{Victoria went to school.}
+{
+    \taskdescription
+    {Adversarial Winograd Schema Challenge} %
+    {Winogrande} %
+    {\citep{sakaguchi2020winogrande}} %
+    {tests for coreference resolution by asking a model to fill in a masked token in a sentence by choosing an entity from two options} %
+    {40.4k examples in the XL training set} %
+    {30,000} %
+    {200} %
+    {the TFDS validation set of 1,267} %
+}
+
+\taskio
+{Jane knocked on Susan's door, but there was no answer.\\OPTIONS:\\- Jane was out.\\- Susan was out.}
+{Susan was out.}
+{
+    \taskdescription
+    {Winograd Schema Challenge} %
+    {WSC273} %
+    {\citep{levesque2012winograd}} %
+    {tests for coreference resolution by asking a model to complete the sentence in a fashion that requires understanding the entities in the sentence} %
+    {0 examples in the training set (WSC273 is test-set only)} %
+    {none} %
+    {none} %
+    {the TFDS test set} %
+}
+
+\clearpage
+\subsection{Reading Comprehension with Commonsense}\label{appen:b-read-comp-commonsense}
+
+\taskio
+{Complete the passage.\\\\(CNN) -- At first glance, "The Flat" might seem like an episode of "Hoarders," Israeli-style. The documentary film opens after an elderly woman dies in Tel Aviv. Her grandchildren assemble to clean out her apartment, packed with dusty books, vintage clothing (dozens of pairs of fancy gloves, for instance), enough purses to stock a department store, jewelry, mementoes and closets full of knickknacks. But buried among the detritus they chance upon something remarkable -- mysterious papers linking the grandparents to an important Nazi figure. How could such ardent Zionists, who left their native Germany in the early 1930s, have been involved with an SS official like Leopold von Mildenstein?\\\\What I found out was this journey, the Nazi (\\\\OPTIONS:\\- Arnon Goldfinger) and his wife were accompanied by my grandparents," Goldfinger told CNN.\\- CNN) and his wife were accompanied by my grandparents," Goldfinger told CNN.\\- Germany) and his wife were accompanied by my grandparents," Goldfinger told CNN.\\- Israeli) and his wife were accompanied by my grandparents," Goldfinger told CNN.\\- Leopold von Mildenstein) and his wife were accompanied by my grandparents," Goldfinger told CNN.\\- Nazi) and his wife were accompanied by my grandparents," Goldfinger told CNN.\\- SS) and his wife were accompanied by my grandparents," Goldfinger told CNN.\\- Tel Aviv) and his wife were accompanied by my grandparents," Goldfinger told CNN.\\- The Flat) and his wife were accompanied by my grandparents," Goldfinger told CNN.\\- Zionists) and his wife were accompanied by my grandparents," Goldfinger told CNN.}
+{Leopold von Mildenstein) and his wife were accompanied by my grandparents," Goldfinger told CNN.}
+{
+    \taskdescription
+    {Reading Comprehension with Commonsense Reasoning} %
+    {ReCoRD} %
+    {\citep{DBLP:journals/corr/abs-1810-12885}} %
+    {asks for the answer to a cloze-style question where an entity is masked out} %
+    {the training set of 100,730 examples} %
+    {30,000} %
+    {200} %
+    {the TFDS validation set of 10,000 examples} %
+}
+
+ 
+\subsection{Translation (7 languages)}\label{appen:data-to-text}
+
+\taskio
+{Here the largest town of the district is located: Nordenham , lying opposite to Bremerhaven at the Weser mouth.\\\\Translate to German}
+{An der B 211 befindet sich in Loyermoor der so genannte ``Geest-Abbruch'', der eine Höhendifferenz von gut 30 Meter überbrückt.}
+{
+Example input and output for translation. This example is from WMT'16 English--German; all languages use the same translation templates.
+}
+
+\end{document}

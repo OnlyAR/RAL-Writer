@@ -1,0 +1,357 @@
+\title{Video Instruction Tuning with Synthetic Data}
+
+\begin{document}
+
+\maketitle
+
+\renewcommand{\thefootnote}{\fnsymbol{footnote}}
+\footnotetext{$\heartsuit$ Work collaborated with ByteDance;~$\P$ Co-senior authors}
+\renewcommand{\thefootnote}{\arabic{footnote}}
+
+\begin{abstract}
+The development of video large multimodal models (LMMs) has been hindered by the difficulty of curating large amounts of high-quality raw data from the web. To address this, we consider an alternative approach, creating a high-quality synthetic dataset specifically for video instruction-following, namely~\DataName{}. This dataset includes key tasks such as detailed captioning, open-ended question-answering (QA), and multiple-choice QA. By training on this proposed dataset, in combination with existing visual instruction tuning data, we introduce \ModelName{}, a new video LMM. Our experiments demonstrate that \ModelName{} achieves strong performance across various video benchmarks, highlighting the effectiveness of our dataset. We plan to release the dataset, its generation pipeline, and the model checkpoints.
+\end{abstract}\section{Introduction}
+
+We are in an era where large-scale computing and data is crucial for multimodal learning~\citep{li2024multimodalsurvey}. A significant recent advancement was introduced by visual instruction tuning~\citep{liu2024visual}, which laid the foundation for building a general-purpose visual assistant. Notably, it proposed a data generation pipeline to create high-quality image-language instruction-following data. This pipeline has inspired subsequent researches~\citep{li2024llavaonevision,li2024llavanext-strong,li2024llavanext-ablations,lin2024vila} aimed at generating diverse image-language instruction data across various visual domains, accelerating the development of visual instruction tuning techniques.
+
+Compared to the construction of image-language instruction-following data, obtaining high-quality video-language instruction-following data is challenging~\citep{damonlpsg2023videollama,li2024videochatchatcentricvideounderstanding}. First, sourcing high-quality videos is difficult. We need to find videos with significant temporal changes that provide more knowledge than what image-language data can offer. However, we have found that most videos in current video-language instruction-following datasets~\citep{chen2024sharegpt4video,zhang2024direct} are relatively static. Additionally, these videos are mostly trimmed based on scene changes, resulting in simplified plots. Such simplified video-language instruction-tuning data is inadequate for models to understand videos with complex narratives. Furthermore, current video-language instruction-following datasets often use a very sparse sampling rate for frame annotation. For instance, ShareGPT4Video~\citep{chen2024sharegpt4video} has an average sampling rate of 0.15, sometimes sampling only 2 frames from a 30-second video. 
+This sparse sampling rate is effective in describing overall scenes but fails to capture detailed movements or changes in the video, resulting in hallucination  when detailed descriptions of the video are required.
+
+To overcome these shortcomings, we introduce a comprehensive video instruction-tuning dataset named~\DataName, consisting of 178,510 videos ranging from 0 to 3 minutes. This dataset is enriched with detailed annotations, open-ended questions, and multiple-choice questions, developed through a combination of GPT-4o~\citep{openai2024gpt4o} and human efforts. It features four favorable properties: \textbf{$(i)$ Extensive Video Source:} We conduct a comprehensive survey on the video sources of exsiting video understanding datasets, and conclude 10 major video data sources, from which we start our video data collection by building a video pool.
+Although there are over 40 video-language datasets, their video data are mainly sourced from 10 datasets~\citep{Zhou2017YouCookIID,xue2022hdvila,goyal2017something,caba2015activitynet,kay2017kinetics,sigurdsson2016charades,wang2023internvid,shang2019vidor,grauman2022ego4d,zhu2023languagebind}, covering a wide range of video domains, such as activities, cooking, TV shows, and egocentric views.  \textbf{$(ii)$ Dynamic Untrimmed Video Selection:} From these sources, we use several filtering logic to select the most dynamic videos from the video data pool. Notably, we select original, untrimmed videos to ensure plot completeness. \textbf{$(iii)$ Recurrent Detailed Caption Generation Pipeline with Dense Frame Sampling:} We propose a detailed video caption pipeline that operates recurrently, enabling us to generate detailed captions for videos of any length. This pipeline has three levels, each level of description represents a different time-range: from 10 seconds to the entire video length. It is recurrent as the historical description from any level serves as the context for generating new descriptions at any level. Additionally, we adopted a dense sampling strategy of one frame per second to ensure the sampled frames are rich enough to represent the videos. \textbf{$(iv)$ Diverse Tasks:} Based on the detailed video descriptions, we can generate question-answer pairs. To ensure our questions cover a wide range of scenarios, by referring to the video question-answering dataset, we define 16 question types. We prompt GPT-4o to generate question-answer pairs by referring to these question types, covering open-ended and multi-choice questions.
+
+Based upon the~\DataName~dataset, we developed~\ModelName. Contrary to previous studies suggesting that training with single frames is sufficient for video-language understanding~\citep{lei2022revealing}, our findings reveal a significant impact of frame count on~\ModelName's performance, attributable to the detailed features of~\DataName. Observing this, we explored maximizing frame sampling within the constraints of limited GPU memory. We introduce~\MethodName, a video representation technique that optimally distributes visual tokens across different frames. This approach allows for incorporating up to three times more frames than traditional methods, which allocate an equal number of visual tokens to each frame.
+
+Our contributions are as follows:
+\begin{itemize}[leftmargin=7.5mm]
+\setlength{\itemsep}{2pt}
+\item {\it Video-language Instruction-Following Data}: We present a high-quality dataset \textit{\DataName} tailored for video instruction-following. It consists of 178K video with 1.3M instruction samples, including detailed captions, free-form and multiple-choice question answering.
+
+\item {\it Video Large Multimodal Models}: We develop \textit{\ModelName}, a series of advanced large video-language models that expand the capabilities of open models in understanding video content.
+
+\item {\it Open-Source}: In an effort to support the development of general-purpose visual assistants, we release our multimodal instruction data, codebase, model checkpoints, and a visual chat demo to the public.
+\end{itemize}
+\section{Related Work}
+
+In this work, our goal is to create a high-quality video-language dataset that goes beyond simple video captions. We aim to improve the ability to follow instructions, which includes detailed video descriptions, open-ended video question-answering, and multiple-choice video question-answering data. We discuss related datasets in Table~\ref{tab:dataset_comparison}. Previous video-language datasets~\citep{miech19howto100m} include manually annotated data for various tasks, such as video captions~\citep{chen2011msvd,xu2016msrvtt,rohrbach2015LSMDC,anne2017didemo,caba2015activitynet,Zhou2017YouCookIID}, and video question-answering~\citep{yu2019activityqa,zadeh2019social,xiao2021next}. However, manual annotation is expensive and limits the size of such datasets. To address the shortage of data, studies like~\citep{miech19howto100m,lee2021acav100m,zellers2021merlot,xue2022hdvila} suggest automatically annotating data using subtitles created by ASR. While this method greatly expands the dataset size to 100 million samples, the subtitles often fail to accurately describe the main video content. Additionally, other studies~\citep{xu2017msvdqa,grunde2021agqa,wu2024star} use language models~\citep{xu2017msvdqa} or question templates~\citep{grunde2021agqa,wu2024star} to generate question-answer pairs. Although this approach can generate a large number of questions and answers, it often produces poor-quality questions that do not reflect real-world user inquiries. More recent research~\citep{chen2024panda70m} has prompted video-language models such as BLIP-2~\citep{li2023blip2bootstrappinglanguageimagepretraining}, VideoChat~\citep{li2024videochatchatcentricvideounderstanding}, Video-LLaMA~\citep{damonlpsg2023videollama}, and MiniGPT-4~\citep{zhu2023minigpt} to generate video captions. However, these models are limited in their ability to provide detailed descriptions. 
+
+The most related works to ours are the recent AI-generated synthetic video instruction tuning data, LLaVA-Hound~\citep{zhang2024direct} and ShareGPT4Video~\citep{chen2024sharegpt4video}, where they have used GPT-4~\citep{openai2023gpt4v} to generate video captions and open-ended video question-answering. Although the quality of the captions and question-answer pairs has significantly improved, the video sources they use are too static to produce high-quality data for instruction-following scenarios. They also only use very sparse frames for prompting GPT-4V, which results in annotations that fail to capture nuanced actions and continuous plots in the videos. Additionally, Shot2Story~\citep{han2023shot2story20k} and Vript~\citep{han2023shot2story20k} also employ GPT-4V~\citep{openai2023gpt4v} for video captioning. Their outputs, however, include audio details, which are outside the scope of this study.
+
+\section{Video Instruction-Following Data Synthesis}
+\label{sec:dataset}
+
+\begin{figure}[t!]
+    \centering
+    \includegraphics[width=0.95\textwidth]{figures/video_data_source.pdf}
+
+    \caption{\textbf{Video sources in the proposed \textit{\DataName{}}}. (Left) The relationship between 10 video sources we have utilized and other existing video-language datasets. (Right) Filtering logic for video sources. The detail of filtering logic: \ding{172} Sorted by Views, \ding{173} Number of scenes greater than 2, \ding{174} Video duration between 5 seconds and 180 seconds, \ding{175} Ratio of scenes to video duration less than or equal to 0.5, \ding{176} Resolution greater than 480p, \ding{177} 50 samples for each category.}
+\label{fig:video_data_source}
+\end{figure}
+
+A high-quality dataset for video instruction-tuning is crucial for developing effective video-language models. We identify a key factor in building such datasets: ensuring richness and diversity in both video content and its language annotations. We perform comprehensive survey on the existing video benchmarks, covering across various public video captioning and question-answering datasets, then identify ten unique video sources that contribute to over 40 video-language benchmarks. From each source, we select videos that exhibit significant temporal dynamics. To maintain diversity in the annotations, we establish a pipeline capable of generating detailed captions for videos of any length. Additionally, we define 16 types of questions that guide GPT-4o in creating question-answer pairs to assess the perceptual and reasoning skills of the video-language models.
+
+\subsection{Video source}
+\label{sec:dataset;subsec:datasource}
+One important starting point in building a high-quality video instruction-following dataset is to find a sufficiently diverse pool of video data. From this pool, we can select the qualified videos. In our study of public video-language datasets---including video captioning, video question answering, video summarization, and moment-wise captioning---we noticed that although different datasets focus on various video understanding tasks (\eg, AGQA~\citep{grunde2021agqa} for spatial-temporal relations and STAR~\citep{wu2024star} for situational reasoning), most are sourced from ten main video sources. For instance, both AGQA and STAR use data from Charades~\citep{sigurdsson2016charades}. Specifically, these ten sources are HD-VILA-100M~\citep{xue2022hdvila}, InternVid-10M~\citep{wang2023internvid}, VidOR~\citep{shang2019vidor}, VIDAL (YouTube Shorts)\citep{zhu2023languagebind}, YouCook2\citep{Zhou2017YouCookIID}, Charades~\citep{sigurdsson2016charades}, ActivityNet~\citep{caba2015activitynet}, Kinetics-700~\citep{kay2017kinetics}, Something-Something v2~\citep{goyal2017something}, and Ego4d~\citep{grauman2022ego4d}. These sources offer a wide range of video data from different websites, viewpoints, and domains. The relationship between these ten selected video datasets and others is shown in Fig.~\ref{fig:video_data_source}. The videos from this ten datsets build the video pool for the further video selection.  Notably, we use untrimmed videos from each source except for YouCook2 and Kinetics-700. We believe that cutting videos into clips can break the plot continuity, which is essential for understanding the videos.
+
+Based on the video pool, we aim to select dynamic videos. In Figure~\ref{fig:video_data_source}, we outline our criteria for selecting high-quality data. Our main method for identifying dynamic content involves using PySceneDetect, which calculates the number of scenes in a video
+We found that the number of scenes is a good indicator of video dynamism. Additionally, we have designed a specific approach~\ding{175} to exclude videos that mainly contain ``slides."
+
+\begin{figure}[t!]
+\centering
+\includegraphics[width=0.95\textwidth]{figures/llava_video_data_creation.pdf}
+\caption{\textbf{The video detail description creation pipeline}. A three-level creation pipeline is considered, with each level developed via a recurrent approach. 
+Note that $t$ is the index of time internal at its own level, and $T$ is the last time internal index. 
+(a) To generate the caption for time internal $t$ at level-1, we condition on the current frames in this internal, the caption for time internal $t-1$, and the most recent description summary at level-2 if applicable. 
+(b) To generate caption for time internal $t$ at level-2, we condtion on the previous caption at level-2, and captions from three most recent time internals at level-1.
+(c) To generate the overall caption at the last time internal $T$ at level-3, we condtion on the the most recent caption at level-2 and the current caption from level-1.
+}
+\label{fig:data_generation}
+\end{figure}
+
+\subsection{Video Detail Description}
+\label{sec:dataset;subsec:video_detail_description}
+\paragraph{Automated Generation}
+For selected videos, we use GPT-4o~\citep{openai2024gpt4o} to systematically describe their content. We start by sampling video frames at one frame per second (fps). However, due to the input size constraints of GPT-4o, we cannot use all sampled frames. Instead, we describe the videos sequentially, as shown in Fig~\ref{fig:data_generation}. We create descriptions at three distinct levels, detailed below.
+
+\begin{itemize}[leftmargin=7.5mm]
+\setlength{\itemsep}{2pt}
+\item {\it Level-1 Description}: Every 10 seconds, we provide a level-1 description that outlines the events in that segment. This description considers: frames from the current clip and historical context, which includes all recent level-1 descriptions not yet summarized into a level-2 description and the latest level-2 description.
+
+\item {\it Level-2 Description}: Every 30 seconds, we creat a level-2 summary of the entire video plot up to that point. This is based on the last three level-1 descriptions, covering the most recent 30 seconds; and the latest level-2 description.
+
+\item {\it Level-3 Description}: At the video's end, we generate a level-3 description to encapsulate the entire video. The inputs for this description are the recent level-1 descriptions not yet summarized, covering the last moments of the plot after the recent summary; and the latest level-2 description.
+\end{itemize}
+
+\begin{figure}[t!]
+    \centering
+    \includegraphics[width=0.95\textwidth]{figures/question_type.pdf}
+    \caption{Question types for video question answering in data creation. For each type, we provide its name and an example question.}
+ \label{fig:question_type}
+\end{figure}
+
+\subsection{Video Question Answering}
+\paragraph{Question Type definition}
+In addition to detailed video descriptions, our dataset includes a variety of question-answer pairs designed for complex interactions. This setup improves the video understanding model's ability to handle real-life queries. We refer to public video question-answering benchmarks~\citep{xiao2021next,yu2019activityqa,Khattak2024cvrres,liu2024tempcompass} to organize these questions into 16 specific categories, as shown in Fig.~\ref{fig:question_type}.
+
+\paragraph{Automated Generation}
+Given a detailed video description, we use GPT-4o to generate at most one question-answer pair for each type of question. The prompts include: (1) The task definition for the current question type. (2) In-context examples for this type, which include three video descriptions and their three question-answer pairs of this specific type. (3) The detailed video description for the current video.
+We instruct GPT-4o to return \textit{None} if it cannot generate question-answer pairs for a specific question type.
+
+\paragraph{Filtering.}
+To filter out the generated question-answer pairs, we apply the following strategy: (1) remove duplicates using the sentence-transformer~\citep{reimers-2020-multilingual-sentence-bert}, (2) discard answers that begin with phrases like ``does not specify,'' ``does not mention,'' ``does not specifically,'' ``does not depict,'' or ``does not show.''
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=0.95\textwidth]{figures/llava_video_dataset_task.pdf}
+\caption{One example to illustrate the video instruction-following data.}
+\label{fig:annotation_example}
+\end{figure}
+
+\subsection{Dataset Statistics}
+\paragraph{Overview.} 
+We carefully select from our collected data sources to form a balanced and comprehensive collection, resulting in a total of 178K videos and 1.3M instruction-following samples. This includes 178K captions, 960K open-ended QAs, and 196K multiple-choice QAs. 
+
+\begin{figure}[t]
+\begin{minipage}[b]{0.95\textwidth}
+\centering
+    \includegraphics[width=\textwidth]{figures/ov_plot.pdf}
+\end{minipage}
+
+\begin{minipage}[b]{0.95\textwidth}
+\centering
+\tabstyle{2pt}
+\fontsize{8pt}{10pt}\selectfont
+\begin{tabular}{l|ccc||l|ccc}
+    \midrule
+    \textbf{Dataset} &
+    \textbf{\#Caption} &
+    \textbf{\#Open-Ended} &
+    \textbf{\#Multi-Choice} &
+    \textbf{Dataset} &
+    \textbf{\#Caption} &
+    \textbf{\#Open-Ended} &
+    \textbf{\#Multi-Choice}\\
+    \midrule
+    \makecell[l]{VidOR} &
+    \tikz[baseline=0.05em] \fill [color={rgb,255: red,229; green,240; blue,219}] (0,0) rectangle (0.75em,0.75em); 4,018 &
+    \tikz[baseline=0.05em] \fill [color={rgb,255: red,247; green,230; blue,216}] (0,0) rectangle (0.75em,0.75em); 19,875 &
+    \tikz[baseline=0.05em] \fill [color={rgb,255: red,220; green,227; blue,242}] (0,0) rectangle (0.75em,0.75em); 4,773 & 
+    \makecell[l]{Sthsth2} &
+    \tikz[baseline=0.05em] \fill [color={rgb,255: red,185; green,215; blue,210}] (0,0) rectangle (0.75em,0.75em); 8,700 & 
+    \tikz[baseline=0.05em] \fill [color={rgb,255: red,200; green,194; blue,190}] (0,0) rectangle (0.75em,0.75em); 0 &
+    \tikz[baseline=0.05em] \fill [color={rgb,255: red,216; green,166; blue,166}] (0,0) rectangle (0.75em,0.75em); 0 \\
+    \makecell[l]{YouCook2} &
+    \tikz[baseline=0.05em] \fill [color={rgb,255: red,169; green,193; blue,217}] (0,0) rectangle (0.75em,0.75em); 7,411 &
+    \tikz[baseline=0.05em] \fill [color={rgb,255: red,182; green,184; blue,214}] (0,0) rectangle (0.75em,0.75em); 32,143 &
+    \tikz[baseline=0.05em] \fill [color={rgb,255: red,185; green,215; blue,210}] (0,0) rectangle (0.75em,0.75em); 5,776 &
+    \makecell[l]{Ego4D} &
+    \tikz[baseline=0.05em] \fill [color={rgb,255: red,226; green,194; blue,198}] (0,0) rectangle (0.75em,0.75em); 1,065 &
+    \tikz[baseline=0.05em] \fill [color={rgb,255: red,222; green,205; blue,180}] (0,0) rectangle (0.75em,0.75em); 5,912 &
+    \tikz[baseline=0.05em] \fill [color={rgb,255: red,229; green,240; blue,219}] (0,0) rectangle (0.75em,0.75em); 520 \\
+    \makecell[l]{Charades} &
+    \tikz[baseline=0.05em] \fill [color={rgb,255: red,200; green,194; blue,190}] (0,0) rectangle (0.75em,0.75em); 9,803 &
+    \tikz[baseline=0.05em] \fill [color={rgb,255: red,216; green,166; blue,166}] (0,0) rectangle (0.75em,0.75em); 48,187 &
+    \tikz[baseline=0.05em] \fill [color={rgb,255: red,226; green,194; blue,198}] (0,0) rectangle (0.75em,0.75em); 13,401  &
+    \makecell[l]{InternVid-10M} &
+    \tikz[baseline=0.05em] \fill [color={rgb,255: red,247; green,230; blue,216}] (0,0) rectangle (0.75em,0.75em); 45,000 &
+    \tikz[baseline=0.05em] \fill [color={rgb,255: red,220; green,227; blue,242}] (0,0) rectangle (0.75em,0.75em); 245,840 &
+    \tikz[baseline=0.05em] \fill [color={rgb,255: red,169; green,193; blue,217}] (0,0) rectangle (0.75em,0.75em); 48,246 \\
+    \makecell[l]{ActivityNet} &
+    \tikz[baseline=0.05em] \fill [color={rgb,255: red,222; green,205; blue,180}] (0,0) rectangle (0.75em,0.75em); 7,953 &
+    \tikz[baseline=0.05em] \fill [color={rgb,255: red,229; green,240; blue,219}] (0,0) rectangle (0.75em,0.75em); 44,100 &
+    \tikz[baseline=0.05em] \fill [color={rgb,255: red,247; green,230; blue,216}] (0,0) rectangle (0.75em,0.75em); 12,771 &
+     \makecell[l]{HD-VILA-100M} &
+    \tikz[baseline=0.05em] \fill [color={rgb,255: red,182; green,184; blue,214}] (0,0) rectangle (0.75em,0.75em); 48,260 &
+    \tikz[baseline=0.05em] \fill [color={rgb,255: red,185; green,215; blue,210}] (0,0) rectangle (0.75em,0.75em); 263,652 &
+    \tikz[baseline=0.05em] \fill [color={rgb,255: red,200; green,194; blue,190}] (0,0) rectangle (0.75em,0.75em); 51,743 \\
+    \makecell[l]{Kinetics-700} &
+    \tikz[baseline=0.05em] \fill [color={rgb,255: red,220; green,227; blue,242}] (0,0) rectangle (0.75em,0.75em); 34,998 &
+    \tikz[baseline=0.05em] \fill [color={rgb,255: red,169; green,193; blue,217}] (0,0) rectangle (0.75em,0.75em); 0 &
+    \tikz[baseline=0.05em] \fill [color={rgb,255: red,182; green,184; blue,214}] (0,0) rectangle (0.75em,0.75em); 0 &
+    \makecell[l]{VIDAL} &
+    \tikz[baseline=0.05em] \fill [color={rgb,255: red,216; green,166; blue,166}] (0,0) rectangle (0.75em,0.75em); 55,000 &
+    \tikz[baseline=0.05em] \fill [color={rgb,255: red,226; green,194; blue,198}] (0,0) rectangle (0.75em,0.75em); 300,472 &
+    \tikz[baseline=0.05em] \fill [color={rgb,255: red,222; green,205; blue,180}] (0,0) rectangle (0.75em,0.75em); 58,968 \\ \bottomrule
+\end{tabular}
+\end{minipage}
+\caption{Distribution of data across different datasets and question types (Caption, Open-ended, and Multi-Choice).}
+\label{fig:ov_plot}
+\end{figure}
+
+\begin{figure}[t!]
+\centering
+\includegraphics[width=\textwidth]{figures/dataset_distribution.pdf}
+\caption{ (Left) Visualization of the video duration. (Middle) Visualization of the number of words in the video caption. (Right) Visualization of caption length versus video duration.}
+\label{fig:dataset_distribution}
+\end{figure}
+\begin{figure}[t!]
+\centering
+\includegraphics[width=0.95\textwidth]{figures/video_category.pdf}
+\caption{(Left) Display of YouTube Shorts across four video categories. (Right) Distribution of 5 uniformly chosen video categories. }
+\label{fig:video_category}
+\end{figure}
+
+We present the distribution in Figure~\ref{fig:dataset_distribution}. Our dataset shows a balanced mix across different video sources, providing a varied content selection. For each task type (caption, open-ended question, multiple-choice question), VIDAL (YouTube Shorts) has the highest share at 24.8\%, 31.1\%, and 30.1\% respectively. It is followed by HD-VILA-100M (21.7\%, 27.5\%, 26.4\%) and InternVid-10M (20.3\%, 25.6\%, 24.6\%).
+
+Figure~\ref{fig:dataset_distribution} (Left) illustrates the distrubtion of the video duration. Video lengths range from 0s to 180s, with each length category containing at least 600 videos. Videos shorter than 50 seconds are numerous, mainly because all videos from VIDAL (24.8\% of the dataset), which contains YouTube Shorts with lengths under 45 seconds. 
+Figure~\ref{fig:dataset_distribution} (Middle) illustrates the distribution on the number of words for the synthetic captions.
+Figure~\ref{fig:dataset_distribution} (Right) shows how video length correlates with the length of captions. Generally, longer videos feature longer captions.
+
+For each video in~\DataName, referencing InsTag~\citep{lu2023instag}, we employ an in-house tagging model to categorize the video content. Figure~\ref{fig:video_category} displays the distribution of ten uniformly sampled video categories, showcasing examples from four of these categories. Among all videos, ``comedy'' predominates, primarily because YouTube Shorts is one of the most common sources in our dataset. Comedy is a typical genre that tends to attract high view counts—videos with large viewerships are more likely to be collected, as indicated in Table~\ref{fig:video_data_source}. Additionally, our dataset includes some domains less represented in current video-language datasets, such as computer games.
+
+\begin{table}[t]
+\tabstyle{5pt}
+\centering
+\small
+\caption{\textbf{Comparison of \DataName~and other video-language datasets}. Average FPS represents the average number of frames per second that are used to prompt GPT-4o/GPT-4V for annotation. \ding{72} VIDAL, WebVid, ActivityNet. \ding{110} Panda-70M, Pexels, Pixabay, Mixkit, BDD100K, Ego4d.  \ding{74} HD-VILA-100M, Kinetics-700M, Ego4D, VidOR, InternVid, YouCook2, ActivityNet, Sth-sthv2, VIDAL, Charades.}
+\begin{tabular}{l|cccccccc}
+\toprule
+\multirow{2}{*}{} & \multirow{2}{*}{Text} & Video & \multirow{2}{*}{\#Video} & Total Video  & Average & \multirow{2}{*}{\#Caption} & \#OE & \#MC \\ 
+& & Source & & Length &  FPS & &  QA &  QA \\  \midrule
+LLaVA-Hound & GPT-4V  & \ding{72} & 900K  & 3Khr              & 0.008                      & 900K & 900K &0               \\
+ShareGPT4Video & GPT-4V & \ding{110} & 40K  & 0.2Khr                & 0.15                         & 40K &0 &0               \\
+\rowcolor{front-color}
+\DataName   & GPT-4o  & \ding{74} & 178K  & 2Khr             & 1                        & 178K& 960K & 196K \\ \bottomrule
+\end{tabular}
+\label{tab:dataset_comparison}
+\end{table}
+
+\paragraph{Dataset Comparison}
+We provide a comparison of high-quality instruction following video-language datasets, with a focus on synthetic data created with strong AI models, as shown in Table~\ref{tab:dataset_comparison}. 
+$(i)$   \textit{A broad collection of dynamic videos.} In terms of video sources, although LLaVA-Hound~\citep{zhang2024direct} contains the largest number of videos, 44\% of its video data are sourced from WebVid~\citep{Bain21}, where most videos are static. ShareGPT4Video~\citep{chen2024sharegpt4video} includes 30\% of its videos from Pexels, Pixabay, and Mixkit, which are aesthetically good but also mostly static. Additionally, the majority of its videos come from Panda-70M, which are short clips from longer videos---suggesting simpler plots. In contrast, we carefully select video sources that offer dynamic, untrimmed videos with complex plots, which are crucial for developing a powerful video understanding model.\footnote{Example videos: \href{https://ak.picdn.net/shutterstock/videos/21179416/preview/stock-footage-aerial-shot-winter-forest.mp4}{WebVid},\href{https://pixabay.com/videos/plane-modelling-miniature-lockheed-134519/}{Pixabay},\href{https://www.pexels.com/video/a-bird-is-standing-on-the-beach-27916646/}{Pexels},\href{https://mixkit.co/free-stock-video/a-young-woman-clad-in-snugly-black-sportswear-doing-lunges-52112/}{Mixkit}.}
+$(ii)$ \textit{High frames per second}. Regarding frame sampling in language annotations, the proposed datasest considers 1 FPS, while other datasets consider much lower FPS.  LLaVA-Hound uniformly samples 10 frames from videos of any length. The average FPS is 0.008, which may miss some fine details. ShareGPT4Video picks key frames using CLIP~\citep{radford2021learning} based on frame uniqueness. This method might also miss subtle changes in the video because CLIP embeddings do not capture fine-grained dynamics well. Our method samples FPS=1 without using key frame selection algorithms, ensuring the detailed temproal information can be expressed in annotations and high coverage. 
+$(iii)$   \textit{Diverse tasks.} The proposed dataset considers three common task types, including caption, free-form and closed-form QA, while existing datasets only consider a subset. Meanwhile, the quality and numbers of samples in our dataset is higher.
+
+ 
+
+\section{Experiments}
+We conducted evaluations for the LLaVA-Video models across all benchmarks using LMMs-Eval~\citep{zhang2024lmms} to ensure standardization and reproducibility. To fairly compare with other leading video LMMs, we primarily used results from original papers. When results were not available, we integrated the models into LMMs-Eval and assessed them under consistent settings. Following LLaVA-OneVision~\citep{li2024llavaonevision}, we employed SigLIP~\citep{zhai2023sigmoid} as our vision encoder, and Qwen2~\citep{yang2024qwen2} as the LLM. The LLaVA-Video model builds on the single-image (SI) stage checkpoint from the LLaVA-OneVision model~\citep{li2024llavaonevision}, which was trained using only image data. 
+
+\paragraph{Video Representations}
+Following the classic SlowFast idea in video representations~\citep{feichtenhofer2019slowfast,xu2024slowfast,huang2024lita}, we develop \textit{\MethodName{}} to optimize the balance between the number of frames and the count of visual tokens, within the budget of the limited context window in LLM and GPU memory for video representation. Please refer to Appendix~\ref{app:visual_representations} for detailed information. Specifically, we represent each video as a sequence with maximum $T$ frames. Each frame is represented in $M$ tokens. we categorize the frames into two groups, based on the a strike rate $s$, where the every $s$ frames are uniformly selected to form the \textit{slow} frame group, and the rest of the frames are consdiered as the \textit{fast} frame group. Note that a special case $s=1$ leads to only one group, reducing the SlowFast representation to the original simple representation. For each group, we apply different pooling rate using Pytorch function pooling $\mathtt{avg\_pool2d}()$.  $p \times p$ pooling and $2p \times 2p$ pooling for slow and fast frames, respectively. To summarize, we paramterize the video representation configuration as $\Vcal = (T, M, s, p)$. The total number of tokens is \(
+\#tokens = \left\lfloor T/s \right\rfloor \times \left\lfloor M/p^2 \right\rfloor + \left( T - \left\lfloor T/s \right\rfloor \right) \times \left\lfloor M/p^2 \right\rfloor
+\)
+
+\paragraph{Evaluation Benchmarks.} For full evaluation, we consdier 11 video benchmarks. conducted tests across various video captioning , video open-ended question-answering and video multiple-choice question-answering benchmarks, including ActivityNet-QA~\citep{yu2019activityqa}, which features human-annotated action-related QA pairs from the ActivityNet dataset. We also utilized LongVideoBench~\citep{wu2024longvideobench}, EgoSchema \citep{mangalam2024egoschema}, and MLVU~\citep{zhou2024mlvu} for long video understanding, PerceptionTest~\citep{patraucean2023perception} for assessing fine-grained perception skills, and VideoMME~\citep{fu2024videomme} and NExT-QA~\citep{xiao2021next} for diverse video domains and durations. Additional tests included VideoDetailCaption~\citep{videodetail2024} Dream-1K~\citep{wang2024tarsierrecipestrainingevaluating} for detailed video descriptions and Video-ChatGPT \citep{Maaz2023VideoChatGPT} for visual chat.
+
+For ablation studies in .~\ref{sec;subsec:dataset_ablation} and Sec.~\ref{sec;subsec:dataset_comparison}, we conduct evaluation across 4 datasets. NExT-QA~\citep{xiao2021next} and PerceptionTest~\citep{patraucean2023perception}, which use training data from the \DataName{}, are treated as in-domain datasets. Conversely, VideoMME~\citep{fu2024videomme} and EgoSchema~\citep{mangalam2024egoschema} are considegreen zero-shot datasets. 
+
+ \subsection{Overall Results}
+
+We fine-tune LLaVA-OneVision (SI) on the joint dataset of video and image data. Specifically, we added video data from the \DataName{} dataset and four public datasets: 
+ActivityNet-QA~\citep{yu2019activityqa}, NExT-QA~\citep{xiao2021next}, PerceptionTest~\citep{patraucean2023perception}, and LLaVA-Hound-255K~\citep{zhang2024direct}, focusing on videos shorter than three minutes. These datasets were selected to improve our model’s performance, contributing to a total of 1.6 million video-language samples, which include 193,510 video descriptions, 1,241,412 open-ended questions, and 215,625 multiple-choice questions. Remarkably, 92.2\% of the video descriptions, 77.4\% of the open-ended questions, and 90.9\% of the multiple-choice questions were newly annotated. Additionally, we used 1.1 million image-language pairs from the LLaVA-OneVision model \citep{li2024llavaonevision}. 
+We consider the same video representation configurations for the training and inference stages. On 128 NVIDIA H100 GPUs, the video representations for LLaVA-Video-7B and LLaVA-Video-72B are $\Vcal = (64, 679, 1, 2)$ and $\Vcal = (64, 679, 3, 2)$, respectively.
+
+ 
+\begin{table}[t!]
+\tabstyle{1pt}
+\centering
+\small
+\caption{\ModelName{} performance on video benchmarks. We report the score out of 5 for VideoDC, VideoChatGPT while other results are reported in accuracy. All results are reported as 0-shot accuracy. *indicates that the training set has been observed in our data mixture.}
+\begin{tabular}{@{}lcc|cc|cccccccc@{}}
+    \toprule
+     & \multicolumn{2}{c}{\scriptsize{Caption}} & \multicolumn{2}{c}{\scriptsize{Open-Ended Q\&A}} & \multicolumn{7}{c}{\scriptsize{Multi-Choice Q\&A}}  \\   
+    \multirow{2}{*}{\textbf{Model}} & \rotatebox{90}{\textbf{\scriptsize{VideoDC}}} & \rotatebox{90}{\textbf{\scriptsize{Dream-1K}}} & \rotatebox{90}{\textbf{\scriptsize{ActNet-QA}}} & \rotatebox{90}{\textbf{\scriptsize{VideoChatGPT}}} & \rotatebox{90}{\textbf{\scriptsize{EgoSchema}}} & \rotatebox{90}{\textbf{\scriptsize{MLVU}}} & \rotatebox{90}{\textbf{\scriptsize{MVBench}}} & \rotatebox{90}{\textbf{\scriptsize{NExT-QA}}} & \rotatebox{90}{\textbf{\scriptsize{PerceptionTest}}}  & \rotatebox{90}{\textbf{\scriptsize{LongVideoBench}}} &\rotatebox{90} 
+    {\textbf{\scriptsize{VideoMME}}} \\ \cmidrule(l){2-12} 
+    & test & test & test & test & test & m-avg & test & mc & val   & val & wo/w-subs \\ \midrule
+    \multicolumn{11}{l}{\textit{Proprietary models}} \\
+    \rowcolor{Gray}
+    GPT-4V~\citep{openai2023gpt4v} & 4.00 & 34.4 & 57.0 & 4.06 & - & 49.2 & 43.5 & - & -   & 61.3 & 59.9/63.3 \\
+    \rowcolor{Gray}
+    GPT-4o~\citep{openai2024gpt4o} & - & 39.2 & - & - & - & 64.6 & - & - & -    & 66.7 & 71.9/77.2 \\
+    \rowcolor{Gray}
+    Gemini-1.5-Flash~\citep{team2023gemini} & - & 34.8 & 55.3 & - & 65.7 & - & -  & - & -   & 61.6  & 70.3/75.0 \\
+    \rowcolor{Gray}
+    Gemini-1.5-Pro~\citep{team2023gemini} & -  & 36.2 & 57.5 & - & 72.2 & - & -  & - & -  & 64.0 & 75.0/81.3 \\ \midrule 
+    \multicolumn{11}{l}{\textit{Open-source models}} \\
+    VILA-40B~\citep{lin2024vila} & 3.37 & 33.2 & 58.0 & 3.36 & 58.0 & - & - & 67.9 & 54.0  & -  & 60.1/61.1 \\
+    PLLaVA-34B~\citep{xu2024pllava} & -  & 28.2 & 60.9 & 3.48  & - & - & 58.1  & - & - & 53.2 & - \\    
+    LongVA-7B~\citep{zhang2024long} & 3.14 & - & 50.0 & 3.20 & - & 56.3 & - & 68.3 & -  & -  & 52.6/54.3 \\
+    IXC-2.5-7B~\citep{zhang2024internlm} & - & - & 52.8 & 3.46 & - & 37.3 & 69.1 & 71.0 & 34.4    & - & 55.8/58.8 \\   
+    LLaVA-OV-7B~\citep{li2024llavaonevision} & 3.75 & 31.7 & 56.6 & 3.51 & 60.1 & 64.7 & 56.7 & 79.4* & 57.1    & 56.5 & 58.2/61.5 \\
+    VideoLLaMA2-72B~\citep{cheng2024videollama2advancingspatialtemporal} & - & 27.1 & 55.2 & 3.16  & 63.9 & 61.2 & 62.0 & - & -  & - & 61.4/63.1 \\ 
+    LLaVA-OV-72B~\citep{li2024llavaonevision} & 3.60 & 33.2 & 62.3 & 3.62  & 62.0 & 68.0 & 59.4 & 80.2* & 66.9  & 61.3 & 66.2/69.5 \\ \midrule 
+    \rowcolor{front-color}
+    \ModelName{}-7B & 3.66 & 32.5 & 56.5* & 3.52 & 57.3  & 70.8 & 58.6 & 83.2* & 67.9*   & 58.2 & 63.3/69.7 \\ 
+    \rowcolor{front-color}
+    \ModelName{}-72B & 3.73 & 34.0 & 63.4*  & 3.62 & 65.6 & 74.4 & 64.1 & 85.4* & 74.3*  & 61.9 & 70.5/76.9 \\ 
+    \bottomrule
+    \end{tabular}%
+\label{tab:video-bench}
+\end{table}
+
+In Table~\ref{tab:video-bench}, we compare the performance of different models on various video benchmarks. The 72B model performs as well as the commercial, closed-source model Gemini-1.5-Flash~\citep{team2023gemini}, highlighting the effectiveness of open-source efforts in achieving comparable results. The \ModelName{}-7B model outperforms the previous top model, LLaVA-OV-7B, in seven out of ten datasets. Analysis of individual datasets shows some noteworthy trends. For instance, on benchmarks like MLVU, LongVideoBench, and VideoMME, which primarily use video data from YouTube, this improvement may be due to the inclusion of extensive YouTube data in \DataName{}, as illustrated in Fig.~\ref{fig:ov_plot}. Additionally, the improvement on ActivityNet-QA is small; this could be because many questions in ActivityNet-QA, such as ``What’s the color of the ball?'' can be answered by viewing a single frame. The visibility of the ball from the beginning to the end of the video means understanding the video sequence is unnecessary, so \DataName{} offers little advantage in this context.
+We find that \ModelName{}-7B is notably weaker in the specialized task of EgoSchema, an ego-centric dataset. This weakness may be due to a significant reduction in the proportion of ego-centric data in the training dataset of \ModelName{}. However, this impact is less pronounced in larger models, as demonstrated by the \ModelName{}-72B model's superior performance over LLaVA-OV-72B in EgoSchema.
+
+\subsection{Dataset Ablation}
+\label{sec;subsec:dataset_ablation}
+Note that the training set for \ModelName{} includes six datasets: \DataName{}, LLaVA-Hound~\citep{zhang2024direct}, NExT-QA~\citep{xiao2021next}, ActivityNet-QA~\citep{yu2019activityqa}, PerceptionTest~\citep{patraucean2023perception}, and image data from LLaVA-OneVision~\citep{li2024llavaonevision}. In this section, we conduct ablation studies to assess the impact of each dataset. We separately fine-tune the LLaVA-OneVision (SI) model for each experimental setting, progressively adding datasets to the baseline. We use a video representation defined by $\Vcal = (64, 679, 1, 2)$
+
+The results are presented in Table~\ref{tab:dataset_ablation}. Initially, we used a basic model trained solely on the LLaVA-Hound dataset as our baseline. Compared to this baseline, adding the \DataName{} dataset significantly improved performance, enhancing scores in both in-domain and out-of-domain tasks. Specifically, we observed a 31.9-point increase in NExT-QA scores and a 9.1-point rise in VideoMME scores. Furthermore, including the PerceptionTest dataset significantly enhanced its associated task. Additionally, integrating high-quality image data provided modest benefits on EgoSchema.
+
+\begin{table}[t!]
+\tabstyle{15pt}
+\centering
+\small
+\caption{Ablation study on the \ModelName{} model with various configurations of training data. Three Q\&A datasets indicate: NExT-QA, ActivityNet-QA and PerceptionTest.}
+\begin{tabular}{@{}l|llll@{}}
+    \toprule
+        & \multicolumn{2}{c}{in-domain} & \multicolumn{2}{c}{out-of-domain} \\   
+
+      \multirow{2}{*}{Method}  &
+    \textbf{NExT-QA} & \textbf{PerceptionTest} & 
+    \textbf{EgoSchema} & 
+    \textbf{VideoMME} \\ \cmidrule(l){2-5} 
+      &    mc & val  & test & wo \\ \midrule
+     LLaVA-Hound  & 48.2 & 51.4 & 51.0 & 54.1 \\
+     +\DataName{} & 80.1  & 57.1  & 56.5   & 63.2   \\ 
+     
+     +Three Q\&A datasets & 80.1 & 69.0   & 55.6  & 61.9   \\
+
+     +LLaVA-OV (images) & 83.2  & 67.9  & 57.3   & 63.4   \\
+    \bottomrule
+\end{tabular}
+
+\label{tab:dataset_ablation}
+\end{table}
+
+\subsection{Dataset Comparison}
+\label{sec;subsec:dataset_comparison}
+We conduct two ablation studies to further analyze our dataset and training strategy. As shown in Table~\ref{tab:dataset_comparison_exp}, we compared three datasets where the language annotations are from GPT-4V/GPT-4o. For each experiment, we fine-tune the LLaVA-OneVision (SI) model separately on each specific dataset setting, utilizing a video representation defined by $\Vcal = (64, 679, 1, 2)$.
+
+Two group of experiments are considered to assess the data quality of \DataName{} compare to LLaVA-Hound and ShareGPT4Video. In the first group, to compare \DataName{} with LLaVA-Hound, we randomly selected 900K open-ended questions to match the number in LLaVA-Hound. We included all captions and did not sample the multiple-choice questions. In the second group, comparing \DataName{} to ShareGPT4Video, we randomly sampled 40K video captions to align with those in ShareGPT4Video. Since ShareGPT4Video lacks open-ended and multiple-choice questions, we supplemented with annotations from NExT-QA, PerceptionTest, and ActivityNet-QA. 
+In the first group of Table~\ref{tab:dataset_comparison_exp}, we compare \DataName{} with LLaVA-Hound. Although LLaVA-Hound has more captions than \DataName{}, our results are still better. As shown in Table~\ref{tab:dataset_comparison}, despite LLaVA-Hound annotates more videos, its quality is limited due to two main issues: (1) Static video: Its primary video source is WebVid~\citep{Bain21}, which tends to have relatively static content. (2) Sparse sampling: Although it includes data sources with dynamic videos, its sampling rate of 10 frames per video leads to annotations that do not fully capture the complete plot of the video. This underscores that the quality of video instruction-following data is more important than its quantity. Additionally, the second experiment group in Table~\ref{tab:dataset_comparison_exp} shows that the model trained with \DataName{} outperforms that of ShareGPT4Video,  highlighting the superiority of our data's quality.
+
+\begin{table}[t!]
+\tabstyle{3pt}
+\centering
+\small
+\caption{Comparison of \DataName{} and other video instruction-following datasets.}
+\begin{tabular}{@{}llll|llll@{}}
+    \toprule
+       & & & & \multicolumn{2}{c}{in-domain} & \multicolumn{2}{c}{out-of-domain} \\   
+     &
+      \multirow{3}{*}{\textbf{\#Caption}} &
+    \multirow{3}{*}{\textbf{\#OE}} &
+    \multirow{3}{*}{\textbf{\#MC}} &
+    \textbf{NExT-QA} & \textbf{PerceptionTest} & 
+    \textbf{EgoSchema} & 
+    \textbf{VideoMME} \\ \cmidrule(l){5-8} 
+      & &  &   & mc & val  & test & wo \\ \midrule
+    LLaVA-Hound & 900K & 900k & 0 & 64.4 & 51.4 & 51.0 & 51.0 \\  
+    \DataName{} & 178K & 900k & 0 & 73.2 \textcolor{green}{\scriptsize (+8.8)} & 55.9 \textcolor{green}{\scriptsize (+4.5)} & 49.8 \textcolor{red}{\scriptsize (-1.2)} & 59.6 \textcolor{green}{\scriptsize (+8.6)} \\
+  \midrule
+    ShareGPT4Video & 40K & 40K & 19K & 69.6 & 55.2 & 58.9 & 51.0 \\  
+    \DataName{} & 40K & 40K & 19K & 75.8 \textcolor{green}{\scriptsize (+6.2)} & 55.4 \textcolor{green}{\scriptsize (+0.2)} & 55.8 \textcolor{red}{\scriptsize (-3.1)} & 53.5 \textcolor{green}{\scriptsize (+2.5)} \\
+    \bottomrule
+    \end{tabular}%
+\label{tab:dataset_comparison_exp}
+\end{table}
+
+\section{Conclusion}
+This study introduces the \DataName{} dataset, a high-quality synthetic dataset for video-language instruction-following. It is favored for its dense frame sampling rate in longer, untrimmed videos, covering diverse tasks such as captioning, open-ended and multi-choice QA. By training on the joint dataset of \DataName{} with existing visual instruction tuning data, we developed a new model family, \ModelName{}, which also considers video representation to effectively use GPU resources. This allows us to include more frames in the training process. The experimental results have demonstrated the effectiveness of the proposed synthetic dataset, and \ModelName{} models have achieved excellent performance on a wide range of video benchmarks.
+
+\clearpage
+
+\end{document}

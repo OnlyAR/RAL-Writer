@@ -1,0 +1,345 @@
+\title{TabTransformer: Tabular Data Modeling \\ Using Contextual Embeddings}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+We propose TabTransformer, a novel deep tabular data modeling architecture for supervised and semi-supervised learning. The TabTransformer is built upon self-attention based Transformers.
+The Transformer layers transform the embeddings of categorical features into robust contextual embeddings to achieve higher prediction accuracy.
+Through extensive experiments on fifteen publicly available datasets,
+we show that 
+the TabTransformer outperforms the
+state-of-the-art deep learning methods for tabular data
+by at least $1.0\%$ on mean AUC, and matches the performance of tree-based ensemble models.
+Furthermore, 
+we demonstrate that the contextual embeddings learned from TabTransformer are highly robust against both missing and noisy data features, and provide better interpretability.
+Lastly, for the semi-supervised setting we develop an unsupervised pre-training procedure to learn data-driven contextual embeddings, resulting in an average $2.1\%$ AUC lift over the state-of-the-art methods.% for tabular data.
+\end{abstract}
+
+\section{Introduction}
+Tabular data is the most common data type in many real-world applications such as recommender systems \citep{cheng2016wide}, online advertising \citep{song_autoint_2019}, and portfolio optimization \citep{ban2018machine}. Many machine learning competitions such as Kaggle and KDD Cup are primarily designed to solve problems in tabular domain. 
+
+The state-of-the-art for modeling tabular data is tree-based ensemble methods such as the gradient boosted decision trees (GBDT) \citep{chen2016xgboost, prokhorenkova2018catboost}. This is in contrast to modeling image and text data where 
+all the existing competitive models are based on deep learning \citep{sandler2018mobilenetv2, Devlin2019BERTPO}. 
+The tree-based ensemble models can achieve competitive prediction accuracy, are fast to train and easy to interpret. These benefits make them highly favourable among machine learning practitioners. However,
+the tree-based models have several limitations in comparison to deep learning models. 
+(a) They are not suitable for continual training from streaming data, and do not allow efficient end-to-end learning of image/text encoders in presence of multi-modality along with tabular data. 
+(b) In their basic form they are not suitable for state-of-the-art semi-supervised learning methods. This is due to the fact that the basic decision tree learner does not produce reliable probability estimation to its predictions  \citep{Tanha2017SemisupervisedSF}.
+(c) The state-of-the-art deep learning methods \citep{Devlin2019BERTPO} to handle missing and noisy data features do not apply to them. Also, robustness of tree-based models has not been studied much in literature. 
+
+A classical and popular model that is trained using gradient descent and hence allows end-to-end learning of image/text encoders is multi-layer perceptron (MLP). %When handling data with categorical variables, each value of a categorical variable is typically matched to a learned embedding, and these embeddings are passed, along with the numeric variables, to the feed forward network. 
+The MLPs usually learn parametric embeddings to encode categorical data features. But due  to  their  shallow  architecture and context-free embeddings,  they  have  the  following limitations: 
+(a) neither the model nor the learned embeddings are interpretable; (b) it is not robust against missing and noisy data (Section \ref{subsec: The Robustness}); 
+(c) for semi-supervised learning, they do not achieve competitive performance (Section \ref{subsec: semi-supervised-learning}). %and are not amenable to state-of-the-art masked self-supervised pre-training. \xh{I would delete ``masked self-supervised learing'' part as nobody admits this is state of the art and we don't talk about that in previous section}
+Most importantly, MLPs do not match the performance of tree-based models such as GBDT on most of the datasets \citep{arik2019tabnet}. To bridge this performance gap between MLP and GBDT, researchers have proposed various deep learning models \citep{song_autoint_2019, cheng2016wide, arik2019tabnet, guo_deepfm_2018}. Although these deep learning models achieve comparable prediction accuracy, 
+they do not address all the limitations of GBDT and MLP.  
+Furthermore, their comparisons are done in a limited setting of a handful of datasets. In particular, in Section~\ref{subsec: supervised-learning} we show that when compared to standard GBDT on a large collection of datasets, GBDT perform significantly better than these recent models. %\zk{just added this last sentence - please delete it if it's too much}
+
+In this paper, we propose TabTransformer to address the limitations of MLPs and existing deep learning models, while bridging the performance gap between MLP and GBDT. We establish performance gain of TabTransformer through extensive experiments on fifteen publicly available datasets. 
+
+The TabTransformer is built upon Transformers \citep{vaswani2017attention} to learn efficient contextual embeddings of categorical features. 
+Different from tabular domain, the application of embeddings has been studied extensively in NLP. 
+The use of embeddings to encode words in a dense low dimensional space is prevalent in natural language processing. Beginning from Word2Vec \citep{rong2014word2vec} with the context-free word embeddings to BERT \citep{Devlin2019BERTPO} which provides the contextual word-token embeddings, embeddings have been widely studied and applied in practice in NLP. In comparison to context-free embeddings, the contextual embedding based models \cite{mikolov2011extensions, huang2015bidirectional, Devlin2019BERTPO} have achieved tremendous success. In particular, self-attention based Transformers \citep{vaswani2017attention} have become a standard component of NLP models to achieve state-of-the-art performance. The effectiveness and interpretability of contextual embeddings generated by Transformers have been also well studied \citep{coenen2019visualizing, brunner2019validity}.
+
+Motivated by the successful applications of Transformers in NLP,
+we adapt them %to use 
+in tabular domain. 
+In particular, TabTransformer applies a sequence of multi-head attention-based Transformer layers on parametric embeddings to transform them into contextual embeddings, bridging the performance gap between baseline MLP and GBDT models. We investigate the effectiveness and interpretability of the resulting contextual embeddings generated by the Transformers. We find that highly correlated features (including feature pairs in the same column and cross column) result in embedding vectors that are close together in Euclidean distance,
+whereas no such pattern exists in context-free embeddings learned in a baseline MLP model. We also study the robustness of the TabTransformer against random missing and noisy data. The contextual embeddings make them highly robust in comparison to MLPs. %that use context-free embeddings. 
+
+Furthermore, many existing deep learning models for tabular data are designed for supervised learning scenario but few are for semi-supervised leanring (SSL). Unfortunately, the state-of-art SSL models developed in computer vision \citep{voulodimos2018deep, kendall2017uncertainties} and NLP \citep{vaswani2017attention, Devlin2019BERTPO} cannot be easily extended to tabular domain. Motivated by such challenges, we exploit pre-training methodologies from the language models and propose a semi-supervised learning approach for pre-training Transformers of our TabTransformer model using unlabeled data. 
+
+One of the key benefits of our proposed method for semi-supervised learning is the two independent training phases: 
+a costly pre-training phase on unlabeled data and a lightweight fine-tuning phase on labeled data. 
+This differs from many state-of-the-art semi-supervised methods \citep{chapelle2009semi, oliver2018realistic, stretcu_graph_2019} that require a single training job including both the labeled and unlabeled data. 
+The separated training procedure benefits the scenario where the model needs to be pretrained once but fine-tuned multiple times for multiple target variables.
+This scenario is in fact quite common in the industrial setting as companies tend to have one large dataset (e.g.\ describing customers/products) and are interested in applying multiple analyses on this data. %\zk{added a sentence to motivate the single pre-training, multiple fine-tuning option}
+To summarize, we provide the following contributions: 
+\begin{enumerate}
+\item We propose TabTransformer, an architecture that provides and exploits contextual embeddings of categorical features. We provide extensive empirical evidence showing TabTransformer
+is superior to both a baseline MLP and recent deep networks for tabular data while matching the performance of tree-based ensemble models (GBDT).
+
+\item We investigate the resulting contextual embeddings and highlight their interpretability, contrasted to parametric context-free embeddings achieved by existing art.
+
+\item We demonstrate the robustness of TabTransformer against noisy and missing data. %\zk{deleted `in comparison to MLPs' TMI for the intro}
+
+\item We provide and extensively study a two-phase pre-training then fine-tune procedure for tabular data, beating the state-of-the-art performance of semi-supervised learning methods.
+\end{enumerate}
+
+\section{The TabTransformer}\label{sec:TabTransformer}
+The TabTransformer architecture comprises a column embedding layer, a stack of $N$ Transformer layers, and a multi-layer perceptron. Each Transformer layer \citep{vaswani2017attention} consists of a multi-head self-attention layer followed by a position-wise feed-forward layer. The architecture of TabTransformer is shown below in Figure \ref{fig:architecture}.
+\begin{figure}[h]
+\centering
+\includegraphics[width=0.9\columnwidth]{TabIllustration2.png} 
+\caption{The architecture of TabTransformer.}
+\label{fig:architecture}
+\end{figure}
+
+Let $(\bm{x}, y)$ denote a feature-target pair,  where $\bm{x} \equiv \{\bm{x}_{\text{cat}}, \bm{x}_{\text{cont}}\}$. The $\bm{x}_{\text{cat}}$ denotes all the categorical features and $\bm{x}_{\text{cont}} \in \mathbb{R}^{c}$ denotes all of the $c$ continuous features. Let $\bm{x}_{\text{cat}} \equiv \{x_1, x_2, \cdots, x_m\}$ with each $x_i$ being a categorical feature, for $i \in \{1,\cdots, m\}$. 
+
+We embed each of the $x_i$ categorical features into a parametric embedding of dimension $d$ using \textit{Column embedding}, which is explained below in detail. Let $\bm{e}_{{\phi}_i}(x_i) \in \mathbb{R}^d$ for $i \in \{1,\cdots,m\}$ be the embedding of the $x_i$ feature, and $\bm{E}_{\phi}(\bm{x}_{\text{cat}}) = \{\bm{e}_{{\phi}_1}(x_1),\cdots,  \bm{e}_{{\phi}_m}(x_m)\}$ be the set of embeddings for all the categorical features. 
+
+Next, these parametric embeddings $\bm{E}_{\phi}(\bm{x}_{\text{cat}})$ are inputted to the first Transformer layer. The output of the first Transformer layer is inputted to the second layer Transformer, and so forth.
+Each parametric embedding is transformed into contextual embedding when outputted from the top layer Transformer, through successive aggregation of context from other embeddings. We denote the sequence of Transformer layers as a function $f_{\theta}$. The function $f_{\theta}$ operates on parametric embeddings $\{\bm{e}_{{\phi}_1}(x_1),\cdots, \bm{e}_{{\phi}_m}(x_m)\}$ and returns the corresponding contextual embeddings $\{\bm{h}_1,\cdots, \bm{h}_m\}$ where $\bm{h}_i\in \mathbb{R}^d$ for $i \in \{1,\cdots, m\}$.
+
+The contextual embeddings $\{\bm{h}_1,\cdots, \bm{h}_m\}$ are concatenated along with the continuous features $\bm{x}_{\text{cont}}$ to form a vector of dimension $(d\times m + c)$. This vector is inputted to an MLP, denoted by $g_{\bm{\psi}}$, to predict the target $y$. Let $H$ be the cross-entropy for classification tasks and mean square error for regression tasks. We minimize the following loss function $\mathcal{L}(\bm{x}, y)$ to learn all the TabTransformer parameters in an end-to-end learning by the first-order gradient methods. The TabTransformer parameters include $\bm{\phi}$ for column embedding, $\bm{\theta}$ for Transformer layers, and $\bm{\psi}$ for the top MLP layer.
+\begin{align}
+\label{equaton: supervised-loss}
+\mathcal{L}(\bm{x}, y) \equiv H( g_{\bm{\psi}}(f_{\bm{\bm{\theta}
+}}(\bm{E}_{\phi}(\bm{x}_{\text{cat}})), \bm{x}_{\text{cont}}), y)\,.
+\end{align}
+Below, we explain the Transformer layers and column embedding.
+
+\subsubsection{Transformer.} A Transformer \citep{vaswani2017attention} consists of a multi-head self-attention layer followed by a position-wise feed-forward layer, with element-wise addition and layer-normalization being done after each layer.
+A self-attention layer comprises three parametric matrices - Key, Query and Value. Each input embedding is projected on to these matrices, to generate their key, query and value vectors. 
+Formally, let $K \in \mathbb{R}^{m \times k}$, $Q \in \mathbb{R}^{m \times k}$ and $V \in \mathbb{R}^{m \times v}$ be the matrices comprising key, query and value vectors of all the embeddings, respectively, and $m$ be the number of embeddings inputted to the Transformer, $k$ and $v$ be the dimensions of the key and value vectors, respectively. Every input embedding attends to all other embeddings through a Attention head, which is computed as follows:
+\begin{align}
+    \text{Attention}(K, Q, V) = A \cdot V,  
+\end{align}
+where $A = \text{softmax}({(QK^T)}/{\sqrt{k}})$. For each embedding, the attention matrix $A \in \mathbb{R}^{m \times m}$ calculates how much it attends to other embeddings, thus transforming the embedding into contextual one. The output of the attention head of dimension $v$ is projected back to the embedding of dimension $d$ through a fully connected layer, which in turn is passed through two position-wise feed-forward layers. The first layer expands the embedding to four times its size and the second layer projects it back to its original size. 
+
+\subsubsection{Column embedding.} For each categorical feature (column) $i$, we have an embedding lookup table $\bm{e}_{{\phi}_i}(.)$, for $i \in \{1,2,...,m\}$. For $i$th feature with $d_i$ classes, the embedding table $\bm{e}_{{\phi}_i}(.)$ has $(d_{i}+1)$ embeddings where the additional embedding corresponds to a missing value.
+The embedding for the encoded value $x_i = j \in [0, 1, 2, .., d_i]$ is $\bm{e}_{{\phi}_i}(j) = [\bm{c}_{\phi_i}, \bm{w}_{\phi_{ij}}]$, where $\bm{c}_{\phi_i} \in \mathbb{R}^\ell, \bm{w}_{\phi_{ij}} \in \mathbb{R}^{d-\ell}$.
+The dimension of $\bm{c}_{\phi_i}$, $\ell$, is a hyper-parameter. The unique identifier $\bm{c}_{\phi_i} \in \mathbb{R}^\ell$ distinguishes the classes in column $i$ from those in the other columns. 
+
+The use of unique identifier is new and is particularly designed for tabular data. 
+Rather in language modeling, embeddings are element-wisely added with the positional encoding of the word in the sentence. Since, in tabular data, there is no ordering of the features, we do not use positional encodings. 
+An ablation study on different embedding strategies is given in Appendix \ref{app:ablation}. The strategies include both different choices for $\ell,d$ and element-wise adding the unique identifier and feature-value specific embeddings rather than concatenating them.
+
+\subsubsection{Pre-training the Embeddings.}
+The contextual embeddings explained above are learned in end-to-end supervised training using labeled examples. For a scenario, when there are a few labeled examples and a large number of unlabeled examples, 
+we introduce a pre-training procedure %\citep{Devlin2019BERTPO, clark_electra_2020} 
+to train the Transformer layers using unlabeled data. This is followed by fine-tuning of the pre-trained Transformer layers along with the top MLP layer using the labeled data. For fine-tuning, we use the supervised loss defined in Equation \eqref{equaton: supervised-loss}. 
+
+We explore two different types of pre-training procedures, the masked language modeling (MLM) \citep{Devlin2019BERTPO} and the replaced token detection (RTD) \citep{clark_electra_2020}. Given an input $\bm{x}_{\text{cat}} = \{x_1, x_2, ..., x_m\}$, MLM randomly selects $k \%$ features from index $1$ to $m$ and masks them as missing. % $\bm{p} = [p_1, p_2, ..., p_k]$, where $p_i$ indicates column index. 
+The Transformer layers along with the column embeddings are trained by minimizing cross-entropy loss of a multi-class classifier that tries to predict the original features of the masked features, from the contextual embedding outputted from the top-layer Transformer.
+
+Instead of masking features, RTD replaces the original feature by a random value of that feature. Here, the loss is minimized for a binary classifier that tries to predict whether or not the feature has been replaced. 
+The RTD procedure as proposed in \cite{clark_electra_2020} uses auxiliary generator for sampling a subset of features that a feature should be replaced with. The reason they used an auxiliary encoder network as the generator is that there are tens of thousands of tokens in language data and a uniformly random token is too easy to detect. In contrast, (a) the number of classes within each categorical feature is typically limited; (b) a different binary classifier is defined for each column rather than a shared one, as each column has its own embedding lookup table.
+We name the two pre-training methods as TabTransformer-MLM and TabTransformer-RTD. In our experiments, the replacement value $k$ is set to $30$. An ablation study on $k$ is given in Appendix \ref{app:ablation}.
+
+\section{Experiments} \label{sec:experiments}
+
+\subsubsection{Data.} We evaluate TabTransformer and baseline models on $15$ publicly available binary classification datasets from the UCI repository \citep{UCI}, the AutoML Challenge \citep{automlchallenges}, and Kaggle \citep{kaggle_inc_state_2017} for both supervised and semi-supervised learning. Each dataset is divided into five cross-validation splits. The  training/validation/testing proportion of the data for each split are $65/15/20\%$. The number of categorical features across dataset ranges from $2$ to $136$. In the semi-supervised experiments, for each dataset and split, the first $p$  observations in the training data are marked as the labeled data and the remaining training data as the unlabeled set. The value of $p$ is chosen as $50$, $200$, and $500$, corresponding to $3$ different scenarios.
+In the supervised experiments, each training dataset is fully labeled. Summary statistics of the all the datasets are provided in Table \ref{tab:dataset_info}, \ref{sup:tab:dataset_urls} in Appendix \ref{sup:experiment_results}.
+
+\subsubsection{Setup.} For the TabTransformer, the hidden (embedding) dimension, the number of layers and the number of attention heads are fixed to $32$, $6$, and $8$ respectively.  The MLP layer sizes are set to $\{4\times l, 2\times l\}$, where $l$ is the size of its input.
+For hyperparameter optimization (HPO), each model is given $20$ HPO rounds for each cross-validation split.
+For evaluation metrics, we use the Area under the curve (AUC) \citep{bradley1997use}.
+Note, the pre-training is only applied in semi-supervised scenario. We do not find much benefit in using it when the entire data is labeled. Its benefit is evident when there is a large number of unlabeled examples and a few labeled examples. Since in this scenario the pre-training provides a representation of the data that could not have been learned based only on the labeled examples.
+
+The experiment section is organized as follows. In Section \ref{subsec: The Effectiveness}, we first demonstrate the effectiveness of the attention-based Transformer by comparing our model with the one without the Transformers (equivalently an MLP model). In Section \ref{subsec: The Robustness}, we illustrate the robustness of TabTransformer against noisy and missing data. Finally, extensive evaluation on various methods are conducted in Section \ref{subsec: supervised-learning} for supervised learning, and in Section \ref{subsec: semi-supervised-learning} for semi-supervised learning.
+
+\subsection{The Effectiveness of the Transformer Layers} \label{subsec: The Effectiveness}
+First, a comparison between TabTransformers and the baseline MLP is conducted in a supervised learning scenario. We remove the Transformer layers $f_{\bm{\theta}}$ from the architecture, fix the rest of the components, and compare it with the original TabTransformer. The model without the attention-based Transformer layers is equivalently an MLP. The dimension of embeddings $d$ for categorical features is set as $32$ for both models. The comparison results over $15$ datasets are presented in Table \ref{tab:ab test}. The TabTransformer with the Transformer layers outperforms the baseline MLP on $14$ out of $15$ datasets with an average $1.0\%$ gain in AUC. %For experiment details, see Section \ref{sec:experiments}. 
+
+\begin{table}
+\caption{Comparison between TabTransfomers and the baseline MLP. The evaluation metric is AUC in percentage.}
+\centering
+\label{tab:ab test}
+\setlength{\tabcolsep}{4pt}
+\scalebox{0.87}{
+\begin{tabular}{lccc}
+\toprule
+Dataset  &  Baseline MLP &  TabTransformer & Gain (\%) \\
+\midrule
+albert & 74.0 & 75.7 & \bf 1.7\\
+
+1995\_income   &    90.5   &          90.6  & \bf 0.1\\ 
+dota2games & 63.1 & 63.3 & \bf 0.2 \\
+hcdr\_main & 74.3 & 75.1 & \bf 0.8\\
+adult          &    72.5  &  73.7    & \bf 1.2  \\
+bank\_marketing &                         92.9 &                         93.4  & \bf 0.5 \\
+blastchar &        83.9 &           83.5  & -0.4 \\ 
+insurance\_co &         69.7 &       74.4  & \bf 4.7 \\
+jasmine &    85.1 &   85.3 & \bf 0.2\\
+online\_shoppers &                        91.9 &                         92.7 & \bf 0.8\\
+ philippine &                        82.1 &                         83.4  & \bf 1.3\\
+ qsar\_bio &                         91.0 &                        91.8 & \bf 0.8\\
+  seismicbumps &                73.5 &                       75.1 & \bf 1.6\\
+  shrutime &                         84.6 &                         85.6 & \bf 1.0\\
+  spambase &                         98.4 &                        98.5  & \bf 0.1\\
+\bottomrule
+\end{tabular}}
+\end{table}
+
+Next, we take contextual embeddings from different layers of the Transformer and compute a t-SNE plot \citep{maaten2008visualizing} to visualize their similarity in function space. More precisely, for each dataset we 
+take its test data, 
+pass their categorical features into a trained TabTransformer, and extract all contextual embeddings (across all columns) from a certain layer of the Transformer. The t-SNE algorithm is then used to reduce each embedding to a 2D point in the t-SNE plot. Figure \ref{fig:tsne-embeddings} (left) shows the 2D visualization of embeddings from the last layer of the Transformer for dataset \textit{bank\_marketing}. Each marker in the plot represents an average of 2D points over the test data points for a certain class. We can see that semantically similar classes are close with each other and form clusters in the embedding space. Each cluster is annotated by a set of labels. For example, we find that all of the client-based features (color markers) such as job, education level and martial status stay close in the center and non-client based features (gray markers) such as month (last contact month of the year), day (last contact day of the week) lie outside the central area; in the bottom cluster the embedding of owning a housing loan stays close with that of being default; over the left cluster, embeddings of being a student, martial status as single, not having a housing loan, and education level as tertiary get together; and in the right cluster, education levels are closely associated with the occupation types \citep{eduationjob}.
+In Figure \ref{fig:tsne-embeddings}, the center and right plots are t-SNE plots of embeddings before being passed through the Transformer and the context-free embeddings from MLP, respectively. For the embeddings before being passed into the Transformer, it starts to distinguish the non-client based features (gray markers) from the client-based features (color markers). For the embeddings from MLP, we do not observe such pattern and many categorical features which are not semantically similar are grouped together, as indicated by the annotation in the plot.
+
+\begin{figure*}[t]
+\centering
+\includegraphics[width=0.95\textwidth]{tsne_embedding_2_submission_night.png} % Reduce the figure size so that it is slightly narrower than the column. Don't use precise values for figure width.This setup will avoid overfull boxes.
+\caption{t-SNE plots of learned embeddings for categorical features on dataset \textit{BankMarketing}. \textbf{Left}: TabTransformer-the embeddings generated from the last layer of the attention-based Transformer. \textbf{Center}: TabTransformer-the embeddings before being passed into the attention-based Transformer. \textbf{Right}: The embeddings learned from MLP.}
+\label{fig:tsne-embeddings}
+\end{figure*}
+
+In addition to prove the effectiveness of Transformer layers, on the test data we take all of the contextual embeddings from each Transformer layer of a trained TabTransformer, use the embeddings from each layer along with the continuous variables as features, and separately fit a linear model with target $y$. Since all of the experimental datasets are for binary classification, the linear model is logistic regression. 
+The motivation for this evaluation is defining the success of a simple linear model as a measure of quality for the learned embeddings.
+
+For each dataset and each layer, an average of CV-score in AUC on the test data is computed. The evaluation is conducted on the entire test data with number of data points over 9000. Figure \ref{fig:linear-embedding} presents results for dataset 
+\textit{BankMarketing}, \textit{Adult}, and \textit{QSAR\_Bio}. For each line, each prediction score is normalized by the ``best score" from an end-to-end trained TabTransformer for the corresponding dataset. We also explore the average and maximum pooling strategy \citep{howard2018universal} rather than concatenation of embeddings as the features for the linear model. The upward pattern clearly shows that embeddings becomes more effective as the Transformer layer progresses. In contrast, the embeddings from MLP (the single black markers) perform worse with a linear model. Furthermore, the last value in each line close to $1.0$ indicates that a linear model with the last layer of embeddings as features can achieve reliable accuracy, which confirms our assumption. 
+
+\begin{figure}[h]
+\centering
+\includegraphics[width=0.9\columnwidth]{quant-trend-3-mlp.png} % Reduce the figure size so that it is slightly narrower than the column. Don't use precise values for figure width.This setup will avoid overfull boxes.
+\caption{Predictions of liner models using features as the embeddings extracted from different Transformer layers in TabTransformer. Layer $0$ corresponds to the embeddings before being passed into the Transformer layers. For each dataset, each prediction score is normalized by the ``best score" from an end-to-end trained TabTransformer.}
+\label{fig:linear-embedding}
+\end{figure}
+
+\subsection{The Robustness of TabTransformer} \label{subsec: The Robustness}
+
+We further demonstrate the robustness of TabTransformer on the noisy data and data with missing values, against the baseline MLP. We consider these two scenarios only on categorical features to specifically prove the robustness of contextual embeddings from the Transformer layers. 
+
+\subsubsection{Noisy Data.} On the test examples, we firstly contaminate the data by replacing a certain number of values by randomly generated ones from the corresponding columns (features). Next, the noisy data are passed into a trained TabTransformer to compute a prediction AUC score. Results on a set of 3 different dataets are presented in Figure \ref{fig:contamination}. As the noisy rate increases, TabTransformer performs better in prediction accuracy and thus is more robust than MLP. In particular notice the \emph{Blastchar} dataset where the performance is near identical with no noise, yet as the noise increases, TabTransformer becomes significantly more performant compared to the baseline.
+We conjecture that the robustness comes from the contextual property of the embeddings. Despite a feature being noisy, it draws information from the correct features allowing for a certain amount of correction.
+
+\subsubsection{Data with Missing Values.} Similarly, on the test data we artificially select a number of values to be missing and send the data with missing values to a trained TabTransformer to compute the prediction score. There are two options to handle the embeddings of missing values: (1) Use the average learned embeddings over all classes in the corresponding column; (2) the embedding for the class of missing value, the additional embedding for each column mentioned in Section ~\ref{sec:TabTransformer}. Since the benchmark datasets do not contain enough missing values to effectively train the embedding in option (2), we use the average embedding in (1) for imputation. Results on the same 3 datasets are presented in Figure \ref{fig:missing}. We can see the same patterns of the noisy data case, i.e.\ that the TabTransformer shows better stability than MLP in handling missing values.
+
+\begin{figure}[h]
+\centering
+\includegraphics[width=0.9\columnwidth]{corruption-plot.png} % Reduce the figure size so that it is slightly narrower than the column. Don't use precise values for figure width.This setup will avoid overfull boxes.
+\caption{Performance of TabTransformer and MLP with noisy data. For each dataset, each prediction score is normalized by the score of TabTransformer at $0$ noise. 
+}
+\label{fig:contamination}
+\end{figure}
+
+\begin{figure}[h]
+\centering
+\includegraphics[width=0.9\columnwidth]{missing-data-plot.png} % Reduce the figure size so that it is slightly narrower than the column. Don't use precise values for figure width.This setup will avoid overfull boxes.
+\caption{Performance of TabTransformer and MLP under missing data scenario. For each dataset, each prediction score is normalized by the score of TabTransformer trained without missing values. 
+}
+\label{fig:missing}
+\end{figure}
+
+\subsection{Supervised Learning}\label{subsec: supervised-learning}
+
+Here we compare the performance of TabTransformer against following four categories of methods: (a) Logistic regression and GBDT (b) MLP and a sparse MLP following \cite{morcos_one_2019} (c) TabNet model of \citet{arik2019tabnet} (d) and the Variational Information Bottleneck model (VIB) of \citet{alemi_deep_2016}. 
+
+Results are summarized in Table \ref{tab:supervised_result}. TabTransformer, MLP, and GBDT are the top 3 performers. The TabTransformer outperforms the baseline MLP with an average 1.0\% gain and perform comparable with the GBDT. Furthermore, the TabTransformer is significantly better than TabNet and VIB, the recent deep networks for tabular data. For experiment and model details, see Appendix \ref{appendix:model_details}. The models' performances on each individual dataset are presented in Table \ref{tab:supervised-result-auroc1} and \ref{tab:supervised-result-auroc2} in Appendix \ref{sup:experiment_results}. 
+
+\begin{table}
+\caption{Model performance in supervised learning. The evaluation metric is mean $\pm$ standard deviation of AUC score over the 15 datasets for each model.
+Larger the number, better the result. The top 2 numbers are bold. %\zk{explain the $\pm$ it's one standard error right?} %\zk{Also: (1) MLP shouldn't be highlighted, its outside the confidence. (2) What about the RED score or some average of normalized score? The standard deviation there will be much smaller} \xh{re: we delelte the RED score as that score shows GBDT is way better.}
+}
+\centering
+\label{tab:supervised_result}
+\setlength{\tabcolsep}{4pt}
+\begin{tabular}{lc}
+\toprule
+Model Name  & Mean AUC (\%) \\
+\midrule
+TabTransformer & $\mathbf{82.8} \pm 0.4$ \\
+MLP & $81.8 \pm 0.4$ \\
+GBDT & $\mathbf{82.9}  \pm 0.4$\\
+Sparse MLP & $81.4 \pm 0.4$ \\
+Logistic Regression & $ 80.4 \pm 0.4$ \\
+TabNet & $77.1 \pm 0.5 $ \\
+VIB & $80.5 \pm 0.4 $ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Semi-supervised Learning}\label{subsec: semi-supervised-learning}
+Lastly, we evaluate the TabTransformer under the semi-supervised learning scenario where few labeled training examples are available together with a significant number of unlabeled samples. Specifically, we compare our pretrained and then fine-tuned TabTransformer-RTD/MLM against following semi-supervised models: (a) Entropy Regularization (ER) \citep{grandvalet2006entropy} combined with MLP and TabTransformer (b) Pseudo Labeling (PL) \citep{lee2013pseudo} combined with MLP, TabTransformer, and GBDT \citep{JainGBDTPseudolabel} (c)  MLP (DAE): an unsupervised pre-training method designed for deep models on tabular data: the swap noise Denoising AutoEncoder \citep{jahrer_2018}. 
+
+The pre-training models TabTransformer-MLM, TabTransformer-RTD and MLP (DAE)
+are firstly pretrained on the entire unlabeled training data and then fine-tuned on labeled data. The semi-supervised learning methods, Pseudo Labeling and Entropy Regularization, are trained on the mix of labeled and unlabeled training data.
+To better present results, we split the set of $15$ datasets into two subsets. The first set includes $6$ datasets with more than $30$K data points and the second set includes remaining $9$ datasets. 
+
+The results are presented in Table \ref{tab:semi_supervised_result_morethan_30000} and Table \ref{tab:semi_supervised_result_lessthan_30000}. When the number of unlabeled data is large, Table \ref{tab:semi_supervised_result_morethan_30000} shows that our TabTransformer-RTD and TabTransformer-MLM significantly outperform all the other competitors. Particularly, TabTransformer-RTD/MLM improves over all the other competitors by at least $1.2\%$, $2.0\%$ and $2.1\%$ on mean AUC for the scenario of $50$, $200$, and $500$ labeled data points respectively. The Transformer-based semi-supervised learning methods TabTransformer (ER) and TabTransformer (PL) and the tree-based semi-supervised learning method GBDT (PL) perform worse than the average of all the models. When the number of unlabeled data becomes smaller, as shown in Table \ref{tab:semi_supervised_result_lessthan_30000}, TabTransformer-RTD still outperforms most of its competitors but with a marginal improvement.
+
+Furthermore, we observe that when the number of unlabeled data is small as shown in Table \ref{tab:semi_supervised_result_lessthan_30000}, TabTransformer-RTD performs better than TabTransformer-MLM, thanks to its easier pre-training task (a binary classification) than that of MLM (a multi-class classification).
+This is consistent with the finding of the ELECTRA paper \citep{clark_electra_2020}. In Table \ref{tab:semi_supervised_result_lessthan_30000}, with only $50$ labeled data points, MLP (ER) and MLP (PL) beat our TabTransformer-RTD/MLM. This can be attributed to the fact that there is room for improvement in our fine-tuning procedure. In particular, our approach allows to obtain informative embeddings but does not allow the weights of the classifier itself to be trained with unlabelled data. Since this issue does not occur for ER and PL, they obtain an advantage in extremely small labelled set. We point out however that this only means that the methods are complementary and mention that a possible follow up could combine the best of all approaches. %\zk{added this explanation for why we fail on 50 points - see if it makes sense}
+
+Both evaluation results, Table \ref{tab:semi_supervised_result_morethan_30000} and Table \ref{tab:semi_supervised_result_lessthan_30000}, show that our 
+TabTransformer-RTD and Transformers-MLM models are promising in extracting useful information from unlabeled data to help supervised training, and are particularly useful when the size of unlabeled data is large. For model performance on each individual dataset see Table \ref{sup:tab:semisup-result-auroc-50-1}, \ref{sup:tab:semisup-result-auroc-50-2},
+\ref{sup:tab:semisup-result-auroc-200-1}, \ref{sup:tab:semisup-result-auroc-200-2},
+\ref{tab:semisup-result-auroc-500-1}, \ref{tab:semisup-result-auroc-500-2}
+in Appendix \ref{sup:experiment_results}.
+
+\begin{table}[t]
+\caption{Semi-supervised learning results for $8$ datasets each with {more than ${30}$K}  data points, for different number of labeled data points. Evaluation metrics are mean AUC in percentage. Larger the number, better the result.}
+\centering
+\label{tab:semi_supervised_result_morethan_30000}
+\setlength{\tabcolsep}{6pt}
+\scalebox{0.85}{
+\begin{tabular}{lccc}
+\toprule
+\# Labeled data & $50$ & $200$ & $500$ \\
+\midrule
+TabTransformer-RTD &   $66.6 \pm 0.6$    & $70.9 \pm 0.6$    &    $\mathbf{73.1} \pm  0.6$  \\
+TabTransformer-MLM &    $\mathbf{66.8} \pm 0.6$    &   $\mathbf{71.0} \pm 0.6$  &  $72.9 \pm 0.6$    \\
+MLP (ER) & $65.6 \pm 0.6$   & $69.0 \pm 0.6$  & $71.0 \pm 0.6$  \\
+MLP (PL) & $65.4 \pm 0.6$  & $68.8 \pm 0.6$ & $71.0 \pm 0.6$   \\
+TabTransformer (ER) & $62.7 \pm 0.6$  & $67.1 \pm 0.6$  & $69.3 \pm 0.6$ \\
+TabTransformer (PL) & $63.6 \pm 0.6$   & $67.3 \pm 0.7$  &  $69.3 \pm 0.6$ \\
+MLP (DAE) &     $65.2 \pm 0.5$      &  $68.5 \pm 0.6$  &   $71.0 \pm 0.6$  \\
+GBDT (PL)& $56.5 \pm 0.5$  & $63.1 \pm 0.6$  &  $66.5 \pm 0.7$ \\
+\bottomrule
+\end{tabular}}
+\end{table}
+
+\begin{table}[t]
+\caption{Semi-supervised learning results for $12$ datasets each with {less than ${30}$K}  data points, for different number of labeled data points. Evaluation metrics are mean AUC in percentage. Larger the number, better the result.} 
+\centering
+\label{tab:semi_supervised_result_lessthan_30000}
+\setlength{\tabcolsep}{6pt}
+\scalebox{0.87}{
+\begin{tabular}{lccc}
+\toprule
+\# Labeled data & $50$ & $200$ & $500$ \\
+\midrule
+TabTransformer-RTD &   $78.6 \pm 0.6$    & $\mathbf{81.6} \pm 0.5$    &  $ \mathbf{83.4} \pm 0.5$    \\
+TabTransformer-MLM &    $78.5 \pm 0.6$   &   $81.0 \pm 0.6$  &    $82.4 \pm 0.5$ \\
+MLP (ER) & $\mathbf{79.4} \pm 0.6$   & $81.1 \pm 0.6$   & $82.3 \pm 0.6$ \\
+MLP (PL) & $79.1 \pm 0.6$   & $81.1 \pm 0.6$ & $82.0 \pm 0.6$   \\
+TabTransformer (ER) & $77.9 \pm 0.6$  & $81.2 \pm 0.6$ &  $82.1 \pm 0.6$  \\
+TabTransformer (PL) & $77.8 \pm 0.6$  & $81.0 \pm 0.6$ &  $ 82.1 \pm 0.6$  \\
+MLP (DAE) &     $78.5 \pm 0.7$       &  $80.7 \pm 0.6$   &   $82.2 \pm 0.6$  \\
+GBDT (PL)& $73.4 \pm 0.7$  & $78.8 \pm 0.6$   &  $81.3 \pm 0.6$ \\
+\bottomrule
+\end{tabular}}
+
+\end{table}
+
+\section{Related Work}
+\textbf{Supervised learning.} Standard MLPs have been applied to tabular data for many years \citep{taxipaper}.
+For deep models designed specifically for tabular data, %many ``deep versions'' of non-deep-learning-based machine learning algorithms have been proposed.
+there are deep versions of factorization machines \citep{guo_deepfm_2018,xiao_attentional_2017}, Transformers-based methods  \citep{song_autoint_2019,li_interpretable_2020,sun_deepenfm_2019}, and deep versions of decision-tree-based algorithms \citep{ke2019tabnn, yang2018deep}. In particular, \citep{song_autoint_2019} applies one layer of multi-head attention on embeddings to learn higher order features. The higher order features are concatenated and inputted to a fully connected layer to make the final prediction. \citep{li_interpretable_2020} use self-attention layers and track the attention scores to obtain feature importance scores. \citep{sun_deepenfm_2019} combine the Factorization Machine model with transformer mechanism. All 3 papers are focused on recommendation systems making it hard to have a clear comparison with this paper.
+Other models have been designed around the purported properties of tabular data such as low-order and sparse feature interactions. These include Deep \& Cross Networks \citep{Wang2017DeepC},
+Wide \& Deep Networks \citep{cheng2016wide}, TabNets \citep{arik2019tabnet}, and AdaNet \citep{cortes2016adanet}. %\zk{Are we mentioning AdaNet anywhere? If not, we should https://arxiv.org/abs/1607.01097 Its using boosting + MLPs}
+
+\textbf{Semi-supervised learning.} \cite{izmailov_semi-supervised_2019} give a semi-supervised method based on density estimation and evaluate their approach on tabular data. %They maximize log likelihood of a density model via Gaussian mixture of normalizing flows. 
+{\em Pseudo labeling} \citep{lee2013pseudo} is a simple, efficient and popular baseline method. 
+The Pseudo labeling uses the current
+network to infer pseudo-labels of unlabeled examples, by choosing the most confident class. These pseudo-labels are treated like human-provided labels in the cross entropy loss. 
+{\em Label propagation}
+\citep{zhur2002learning},
+\citep{iscen2019label}
+is a similar approach where a node’s labels propagate to all nodes according to their proximity,
+and are used by the training model as if they were the true labels. Another standard method in semi-supervised learning is {\em entropy regularization}
+\citep{grandvalet2005semi, sajjadi2016regularization}. It adds average per-sample entropy for the unlabeled examples to the original loss function for the labeled
+examples. Another classical approach of semi-supervised learning is co-training \citep{nigam2000analyzing}. However, the recent approaches - entropy regularization and pseudo labeling - are typically better and more popular. A succinct review of semi-supervised learning methods in general can be found in \citep{oliver_realistic_2019, chappelle2010semi}.
+
+\section{Conclusion}
+We proposed TabTransformer, a novel deep tabular data modeling architecture for supervised and semi-supervised learning. We provide extensive empirical evidence showing TabTransformer significantly outperforms MLP and recent deep networks for tabular data while matching the performance of tree-based ensemble models (GBDT). 
+We provide and extensively study a two-phase pre-training then fine-tune procedure for tabular data, beating the state-of-the-art performance of semi-supervised learning methods.
+TabTransformer shows promising results for robustness against noisy and missing data, and interpretability of the contextual embeddings. For future work, it would be interesting to investigate them in detail. 
+
+\newpage
+\clearpage
+\begin{quote}
+\begin{small}
+\end{small}
+\end{quote}
+
+\newpage
+\clearpage
+
+\newpage
+\clearpage
+
+\end{document}

@@ -1,0 +1,434 @@
+\title{Efficient Tool Use with Chain-of-Abstraction Reasoning}
+
+\begin{document}
+
+\maketitle
+\renewcommand{\thefootnote}{\fnsymbol{footnote}}
+\footnotetext[1]{Work done during internship at FAIR.}
+\footnotetext[2]{Equal Supervision.}
+\renewcommand{\thefootnote}{\arabic{footnote}}
+\begin{abstract}
+To achieve faithful reasoning that aligns with human expectations, large language models (LLMs) need to ground their reasoning to real-world knowledge (\eg{}, web facts, math and physical rules).
+Tools help LLMs access this external knowledge, but there remains challenges for fine-tuning LLM agents (\eg{}, Toolformer) to invoke tools in multi-step reasoning problems, where inter-connected tool calls require holistic and efficient tool usage planning.
+
+In this work, we propose a new method for LLMs to better leverage tools in multi-step reasoning.
+Our method, Chain-of-Abstraction (CoA), trains LLMs to first decode reasoning chains with abstract placeholders, and then call domain tools to reify each reasoning chain by filling in specific knowledge.
+This planning with abstract chains enables LLMs to learn more general reasoning strategies, which are robust to shifts of domain knowledge (\eg{}, math results) relevant to different reasoning questions.
+It also allows LLMs to perform decoding and calling of external tools in parallel, which avoids the inference delay caused by waiting for tool responses.
+In mathematical reasoning and Wiki QA domains, we show that our method consistently outperforms previous chain-of-thought and tool-augmented baselines on both in-distribution and out-of-distribution test sets, with an average $\sim6\%$ absolute QA accuracy improvement.
+LLM agents trained with our method also show more efficient tool use, with inference speed being on average $\sim$$1.4\times$ faster than baseline tool-augmented LLMs.
+\end{abstract}
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=1.0\columnwidth]{pics/method-decouple.pdf}
+\caption{Overview of chain-of-abstraction reasoning with tools. Given a domain question (green scroll), a LLM is fine-tuned to first generate an abstract multi-step reasoning chain (blue bubble), and then call external tools to reify the chain with domain-specific knowledge (orange label). The final answer (yellow bubble) is obtained based on the reified chain of reasoning.}
+\label{method_overview}
+\end{figure}
+
+\section{Introduction}
+Recent large language models (LLMs; \citealp{touvron2023llama2,anil2023palm2,openai2023gpt4}), have made progress at interpreting and executing instructions \citep{wei2021finetuned,chung2022scaling}, but still make errors when recalling and composing world knowledge for their responses, \eg{}, making unfactual statements \citep{maynez2020faithfulness,ji2023survey}, incorrect calculations \citep{patel2021nlp}, etc. %Instances of erroneous or implausible responses frequently arise when LLMs are tasked with multi-step reasoning processes.\footnote{Verified by our analysis in \S\ref{math_qa_exp}} 
+Using auxiliary tools (\eg{}, a search engine to provide credible facts, a calculator for accurate math operations, etc.) at inference time can mitigate some of these errors, motivating tool-augmented language models that integrate external API calls into their output generations \citep{parisi2022talm,schick2023toolformer,hao2023toolkengpt}.
+
+However, we show that current tool-augmented LLMs, \eg{}, Toolformer \citep{schick2023toolformer}, struggle to reliably and efficiently leverage tools in multi-step reasoning.
+In particular, tool calls in multi-step reasoning tasks are often interleaved (\ie{}, the response of an API call is often part of the query of a subsequent call; as shown in Figure~\ref{method_overview}).
+Without explicitly modeling these interconnections in reasoning chains, LLMs do not learn effective planning for tool use, which leads to less accurate reasoning with tools.\footnote{as verified by our analysis in \S\ref{results_analysis}}
+Meanwhile, interleaving text generation with API calls also introduces inefficient inference ``waiting times,'' where the model must wait for the response from the API call before resuming the decoding process. This inefficiency becomes more significant in multi-step reasoning scenarios, when multiple rounds of API calls are typically required for each reasoning process.
+
+In this work, we propose \textbf{C}hain-\textbf{o}f-\textbf{A}bstraction (\textbf{CoA}) reasoning, a robust and efficient method for LLMs to perform multi-step reasoning with tools.
+As shown in Figure~\ref{method_overview}, LLMs are fine-tuned with a goal of making reasoning chains with abstract placeholders.
+The placeholders do not affect LLMs' reasoning flow, and are subsequently infilled with specific knowledge retrieved from specialized tools, to ground the final answer generations.
+Planning abstract chain of reasoning encourages LLMs to inter-connect multiple tool calls and adopt more feasible reasoning strategies, which are robust to the variation of domain knowledge involved in each reasoning process, \eg{}, specific calculation results.
+Unlike previous methods where LLM decoding and API calls are executed in an interleaved manner, our method leverages tools to infill knowledge \textbf{once} after the whole chain of reasoning is generated.
+This enables more efficient decoding across multiple examples (\eg, as in a stream) because CoA traces for subsequent examples can be decoded while tool calls are made for the preceding ones, amortizing overall inference time.
+We develop a simple pipeline to build fine-tuning data for models to learn CoA, where we first prompt LLMs to re-write existing responses to instructions as abstract chains, and then use domain tools to check the validity of re-writing, as shown in Figure~\ref{method_rewrite}.
+
+After training LLMs to learn CoA reasoning, we evaluate the finetuned models on two representative multi-step reasoning domains, including mathematical reasoning \citep{cobbe2021training,miao2020diverse,patel2021nlp,koncel2016mawps}, and Wikipedia (Wiki) QA \citep{yang2018hotpotqa,berant2013semantic,kwiatkowski2019natural,joshi2017triviaqa} that involves reasoning on factual descriptive knowledge.
+We show that our method boosts LLMs' performances, with average $\sim$$7.5\%$ and $4.5\%$ absolute accuracy improvements on math and Wiki QA, respectively.
+These improvements are consistent across both in-distribution
+and (zero-shot) out-of-distribution test sets, and are especially pronounced on questions that require complex chain-of-thought reasoning.\footnote{\eg{}, more than 3 steps of math derivations} 
+Meanwhile, our method also uses tools more efficiently than previous augmentation methods, with average $\sim$$1.47\times$ and $1.33\times$ faster inference speeds on math and Wiki QA tasks, respectively.
+Finally, extensive human evaluation demonstrates that our method guides LLMs to learn more accurate reasoning, which leads to $\sim8\%$ fewer reasoning errors.
+
+\section{Related Work}
+
+\paragraph{Tool-Augmented LLMs}
+There is growing interest in augmenting LLMs using external tools.
+Considerable work has tried to adapt LLMs as tool-using reasoners through in-context learning, demonstrating promising performance improvements in various applications, \eg{}, math problem solving \citep{gao2023pal,chen2022program}, biomedical question answering \citep{jin2023genegpt} and self-critiquing \citep{gou2023critic}.
+Nevertheless, guiding LLMs to effectively use tools using in-context demonstrations is challenging, which requires elaborate task-specific prompt engineering and is restricted by the model's instruction following ability \citep{jacovi2023comprehensive}. Noticing the limitations of in-context learning, several works teach LLMs to learn the usage of tools by fine-tuning \citep{parisi2022talm,schick2023toolformer,hao2023toolkengpt}, which more robustly improves LLMs' performance.
+However, all above approaches adopt sequential interactions with tools throughout reasoning, slowing the inference speed as a function of the latency of the tool (or API) and the number of API calls that are made.
+
+Some other prior works focus on using LLMs for multi-step reasoning with other modules.
+In particular, ReAct \citep{yao2023react} and FireAct \citep{chen2023fireact} integrate LLMs with tools into a closed loop of thought, action and observation steps.
+This verbose reasoning loop slows down the LLM decoding, and still incorporates tools via sequential interactions, resulting in inefficient inference.
+Another line of work, Program of Thoughts \citep{chen2022program}, DECLARATIVE \citep{he2023solving} and PAL \citep{gao2023pal} prompt LLMs to generate program-based reasoning and interact with code executors, which however heavily rely on closed source coding models, \ie{}, Codex \citep{chen2021evaluating}, and are restricted to procedural arithmetic reasoning.
+Building on these works, CoA proposes a framework to convert natural language reasoning traces into abstract representations, and uses the abstract reasoning traces as fine-tuning data to improve tool-augmented LLMs.
+CoA also accelerates tool-augmented reasoning, by holistically planning the CoA traces and calling tools only once at inference time.
+
+\paragraph{Tool Usage Planning}
+Several previous works research tool usage planning in LLMs.
+Specifically, HuggingGPT \citep{shen2023hugginggpt}, Chameleon \citep{lu2023chameleon}, OpenAGI \citep{ge2023openagi} and MetaTool \citep{huang2023metatool} focus on planning the high-level sequence of using multiple tools to address multi-domain mixed tasks.
+Similarly, LATM \citep{cai2023large}, ML-BENCH \citep{liu2023ml} and Gorilla \citep{patil2023gorilla} aim at planning program-level integration of multiple APIs for designing scripts of procedural tasks, \eg{}, a script for training a model described by a GitHub repository.
+ToolChain* \citep{zhuang2023toolchain} combines the planning of tool usage with tree-search-based reasoning \citep{yao2023tree,hao2023reasoning}, which is especially useful for procedural tasks \citep{xu2023tool,cobbe2021training}.
+Different from above work, we focus on the planning of general chain-of-thought \citep{wei2022chain} reasoning with awareness of domain specialized tools.
+
+\section{Method}
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=1.0\columnwidth]{pics/method-rewrite.pdf}
+\caption{Illustration of gold data re-writing for fine-tuning data construction. Given a pair of domain question (green scroll) and gold answer (yellow scroll), an LLM is prompted to re-write the gold answer as a reasoning chain with abstract variables (purple bubble). Then, domain specialized tools validate the correctness of the re-writing by checking whether the abstract chain can be reified to get the final answer (orange label).
+}
+\label{method_rewrite}
+\end{figure}
+
+\paragraph{Chain-of-Abstraction (CoA) Reasoning}
+
+Our method decouples the general reasoning of LLMs from domain-specific knowledge obtained from external tools.
+Figure~\ref{method_overview} shows an overview of our method.
+In particular, we first fine-tune LLMs to generate reasoning chains with abstract placeholders, \eg{}, $y1$, $y2$ and $y3$,\footnote{We also test placeholders in single-character format, \eg{}, $x$, $y$ and $z$, but these led to sub-optimal results.} as shown in Figure~\ref{method_overview}.
+In the second stage, we reify each reasoning chain by replacing placeholders with domain-specific knowledge obtained from external tools, \eg{}, calculation results from a calculator, relevant articles retrieved from web search engine, etc.
+Finally, the question is answered based on the reified reasoning chain.
+
+Note that since the LLMs are trained to generate abstract chain of reasoning instead of regular chain-of-thought (CoT) reasoning with explicit values, this enables LLMs to focus on learning general and holistic reasoning strategies without needing to generate instance-specific knowledge for the model's parameters.  
+Moreover, decoupling general reasoning and domain-specific knowledge enables LLM decoding to proceed and switch between different samples in parallel with API calling (via a pipeline), \ie{}, LLM can start generating the next abstract chain while the tool fills the current chain, which speeds up the overall inference process.
+
+\paragraph{Fine-tuning Data Construction}
+
+To construct chain-of-abstraction (CoA) data for fine-tuning LLMs, we collect question answering (QA) samples from existing open-source QA datasets \citep{cobbe2021training,miao2020diverse,yang2018hotpotqa}, and prompt LLaMa-70B \citep{touvron2023llama} to re-write the answer of each sampled question, as shown in Figure~\ref{method_rewrite}.
+Specifically, we prompt LLaMa-70B to label the spans in gold answers that correspond to knowledge operations (\eg{}, math derivations, statements based on Wikipedia references) and then to re-write the sentences with labeled spans as fillable CoA traces, where the operation results are replaced with abstract placeholders.
+For example, the two derivations in the example in Figure~\ref{method_rewrite} are re-written as ``[$20 + 35 = y1$]" and ``[$90 - y1 = y2$]", respectively.
+
+Note that an intermediate knowledge operation result may appear multiple times in an answer, \eg{}, in Figure~\ref{method_rewrite}, the first equation's result $55$ is used in the second equation.
+We prompt LLaMa-70B to replace all occurrences of the same intermediate result with the same placeholder, thereby explicitly connecting the multiple reasoning steps.
+To ensure that the re-written data is accurate, we use domain-specialized tools to verify the correctness of each CoA reasoning trace.\footnote{Detailed implementations of reasoning chain verification are described in Sec.~\ref{ss:math} and \ref{ss:wikiqa}.}
+Specifically, we use the tools to execute the labeled operations in each CoA, and only keep questions whose CoA can be infilled with valid results by the tools.
+
+\section{Experimental Settings}
+We conduct our experiments on two representative domains: mathematical reasoning and Wikipedia (Wiki) QA, which involves commonsense and logical reasoning on factual descriptive knowledge.
+
+\subsection{Mathematical Reasoning}
+\label{ss:math}
+Given a math question, the QA system needs to generate a natural language solution to the problem with step-by-step arithmetic derivations (as demonstrated in the left column of Figure~\ref{method_overview}).
+We assume that the derivations involved in the solution are the specialized knowledge operations required in this domain, which are labeled in square brackets with derivation results being replaced by abstract placeholders, e.g., ``[$20 + 35 = y1$]".
+
+\paragraph{Datasets}
+We construct most of our fine-tuning CoA data by re-writing the GSM8K \citep{cobbe2021training} training set, which contains 7473 linguistically diverse grade school math problems.
+As GSM8K dataset focuses on multi-step reasoning, it lacks coverage of single-step arithmetic problems, so we also re-write an additional set of 691 single-step math problems from the ASDiv \citep{miao2020diverse} dataset.
+Across these re-written datasets, we find that $\sim76.6\%$ of the CoA reasoning traces generated by LLaMa-70B are verified by our equation solver (described below). 
+Table~\ref{tab:ft-data-math} shows the reasoning step distribution (\ie{}, number of derivations) of our constructed fine-tuning data.
+
+\begin{table}[t]
+\centering
+\resizebox{1.0\columnwidth}{!}{
+\smallskip\begin{tabular}{lccccccc}
+\toprule
+\multirow{2}*{\textbf{Source}}  &  \multicolumn{7}{c}{\textbf{Reasoning Step}}   \\
+                                        \cmidrule(lr){2-8}
+                                        &  1  &   2  &   3  &  4  &  5  &  $>$5 & All \\
+\toprule
+GSM8K               &  8  & 1540 & 1648 & 1164 & 666  & 553 & 5579 \\
+ASDiv               & 677 &   0  &   0  &   0  &   0  &  0  & 677  \\
+\bottomrule
+\end{tabular}
+}
+\caption{Reasoning step distribution of correctly re-written reasoning chains in math domain.}
+\label{tab:ft-data-math}
+\end{table}
+
+For an in-distribution evaluation, we test models on GSM8K and ASDiv, containing 1319 and 2305 testing problems.
+To further test the models' generalization ability, we also conduct zero-shot evaluation on other representative math datasets, including SVAMP \citep{patel2021nlp} and MAWPS \citep{koncel2016mawps}, which contain 1000 and 2065 testing samples, respectively.\footnote{For the MAWPS benchmark, we test on the 395, 508, 562 and 600 math problems from AddSub, SingleEq, SingleOp and MultiArith portions, respectively.}
+
+\paragraph{Domain Tool}
+We use an equation solver to perform the arithmetic derivations required in the math domain.
+Our equation solver first extracts the derivations labeled in the CoA reasoning, e.g., ``[$20 + 35 = y1$]" and ``[$90 - y1 = y2$]", and combines all derivations into a system of equations.
+Then the system of equations is solved by the SymPy toolkit,\footnote{\url{https://www.sympy.org/en/index.html}} to get the true value of each variable (\ie{}, the value of the abstract placeholder).
+Finally, our equation solver returns the reified chain of reasoning by replacing all the variables with their solved true values (including the final answer).
+
+\begin{table}[t]
+\centering
+\resizebox{1.0\columnwidth}{!}{
+\smallskip\begin{tabular}{ll}
+\toprule
+\multirow{2}*{\textbf{Question}} & The director of the romantic comedy ``Big Stone Gap'' is based in \\
+& what New York city? \\
+\midrule
+\textbf{Answer} & Greenwich Village \\
+\midrule
+\multirow{3}*{\textbf{Wikipedia}} & Big Stone Gap (film) > Big Stone Gap is a 2014 American romantic \\
+\multirow{3}*{\textbf{References}} & comedy film directed by Adriana Trigiani. \\
+ & Adriana Trigiani > Adriana Trigiani is an Italian American film \\
+ & director based in Greenwich Village. \\
+\midrule
+\multirow{3}*{\textbf{CoA Trace}} & Find the [director of romantic comedy ``Big Stone Gap'' -Wiki-> y1]. \\
+& The name of this film's director is [y1 -NER(person)-> y2]. \\
+& Then determine [y2 in what New York city -Wiki-> y3]. \\
+\bottomrule
+\end{tabular}
+}
+\caption{Example of CoA fine-tuning data construction in Wiki QA domain.}
+\label{tab:rewrite_example_wiki}
+\end{table}
+
+\subsection{Wikipedia QA}
+\label{ss:wikiqa}
+Given a question based on Wikipedia knowledge, the model needs to first identify Wikipedia articles as references related to the question, and then reason on key knowledge in the reference articles to answer the question (as shown in the right column of Figure~\ref{method_overview}).
+We assume that the specialized knowledge operation in this domain is the retrieval of relevant Wikipedia articles and important named-entities, which are re-written as Wikipedia searching (WikiSearch) and named-entity recognition (NER)\footnote{We use NER to extract entities from the article that bridge the former WikiSearch results to the latter WikiSearch queries.} queries.
+Table~\ref{tab:rewrite_example_wiki} shows an example of a re-written CoA trace for Wiki QA.
+
+\paragraph{Datasets}
+We use the HotpotQA \citep{yang2018hotpotqa} dataset to construct our fine-tuning CoA data in the Wiki QA domain.
+HotpotQA contains 113K multi-hop QA examples, each labeled with two Wikipedia articles that provide supporting knowledge.
+Among the 90447 training QA pairs, we identify 72991 as \textbf{Bridge} QA pairs, where an intermediate entity must be identified to link the answer to the question, as shown in Table~\ref{tab:rewrite_example_wiki}.
+The remaining 17456 are \textbf{Comparison} QA pairs, where the attributes of two entities are compared, \eg{}, ``Are Randal Kleiser and Kyle Schickner of the same nationality?''.
+We prompt LLaMa-70B to re-write these training QAs into CoAs with WikiSearch and NER queries, and verify each CoA with our domain tools (described below), by checking whether all the articles returned by the WikiSearch queries match one of the titles in the gold articles.
+Finally, 8956 Bridge QAs and 5405 Comparison QAs are used as fine-tuning data, whose re-written CoAs pass the verification.\footnote{Compared to mathematical reasoning, generating CoA data for Wiki QA requires more complex tool use that combines WikiSearch and NER models, leading to a lower re-writing success rate ($\sim15.9\%$).}
+For Wiki QA, we note that besides training a LLM to produce CoA data using WikiSearch, we also fine-tune a second LLM to learn to generate the final gold answer based on a correctly reified CoA reasoning trace.
+
+We evaluate models on the HotpotQA development set, which contains 5918 Bridge QA pairs and 1487 Comparison QA pairs. Similar to the mathematical reasoning domain, we also conduct zero-shot evaluation on other open-domain QA datasets: WebQuestions (WQ; \citealp{berant2013semantic}), NaturalQuestions (NQ; \citealp{kwiatkowski2019natural}) and TriviaQA \citep{joshi2017triviaqa}, which contain 2032, 3610 and 17944 test questions, respectively.
+
+\paragraph{Domain Tools}
+The specialized tools required for Wiki QA include a Wikipedia search engine to retrieve reference articles, and a NER toolkit to extract entities that bridge multi-step searching queries.
+We follow Toolformer \citep{schick2023toolformer} and implement a Wikipedia search engine as a BM25 retriever \citep{robertson1995okapi,baeza1999modern} that indexes the Wikipedia dump from the KILT benchmark \citep{petroni2021kilt}.
+We use the BM25 retriever to search the top-10 articles relevant to the input query, and then re-rank the articles based on their Sentence-BERT \citep{reimers2019sentence} embedding cosine similarity with the question.
+After re-ranking, the top-$1$ article is selected to be the final search result.
+
+We use SpaCy\footnote{\url{https://spacy.io/models/en}} (\texttt{en\_core\_web\_sm}) as the NER toolkit to extract named entities.
+To simplify NER, we aggregate the numerous SpaCy NER types into 6 general classes, as shown in Table~\ref{tab:ner_aggr}.
+If multiple named entities are recognized, we input each recognized entity to the subsequent WikiSearch query, and select the entity whose subsequent search result has the highest Sentence-BERT embedding cosine similarity with the question.
+
+\begin{table}[t]
+\centering
+\resizebox{1.0\columnwidth}{!}{
+\smallskip\begin{tabular}{cl}
+\toprule
+\textbf{General}  &  \multirow{2}*{\textbf{SpaCy NER Types included in each General Class}}   \\
+\textbf{Class}  &  \\
+\toprule
+person  & PERSON  \\
+group  & NORP, ORG, LANGUAGE \\
+location  & GPE, FAC, LOC \\
+culture & EVENT, WORK\_OF\_ART, LAW, PRODUCT \\
+date  & DATE, TIME \\
+numeral & CARDINAL, PERCENT, MONEY, QUANTITY, ORDINAL \\
+\bottomrule
+\end{tabular}
+}
+\caption{Aggregation of SpaCy NER types.}
+\label{tab:ner_aggr}
+\end{table}
+
+\begin{table*}[t]
+\centering
+\resizebox{1.0\textwidth}{!}{
+\smallskip\begin{tabular}{ll@{~}ccccccccc}
+\toprule
+\multirow{2}*{\textbf{Model}} & \multirow{2}*{\textbf{Method}} & \multirow{1.8}*{\textbf{Use}} & \multirow{2}*{\textbf{GSM8K}} & \multirow{2}*{\textbf{ASDiv}} & \multirow{2}*{\textbf{SVAMP}} & \multicolumn{5}{c}{\textbf{MAWPS}} \\
+            \cmidrule(lr){7-11}
+ &  & \textbf{Tool} &  &  &  & \textbf{AddSub} & \textbf{SingleEQ} & \textbf{SingleOp} & \textbf{MultiArith} & \textbf{All} \\
+\toprule
+\multirow{4}*{\textbf{LLaMa-2}} & CoT-FSP & \multirow{2}*{\xmark} & 16.38 & 47.85 & 38.40 & 52.41 & 63.39 & 82.03 & 43.33 & 60.53 \\
+\multirow{4}*{\textbf{-7B}} & CoT-FT &  & \underline{35.33} & \underline{57.18} & \underline{48.20} & \underline{66.08} & \underline{74.41} & \underline{85.23} & \underline{65.00} & \underline{73.03}  \\
+            \cmidrule(lr){2-11}
+            & Toolformer & \multirow{2}*{\cmark} & 17.59 & 48.55 & 37.10 & 47.34 & 58.46 & 79.54 & 50.67 & 59.81 \\
+            & CoA  &  & \textbf{37.83}$^{\ast}$ & \textbf{57.61} & \textbf{51.70}$^{\ast}$ & \textbf{72.15}$^{\ast}$ & \textbf{82.48}$^{\ast}$ & \textbf{86.48}$^{\ast}$ & \textbf{73.17}$^{\ast}$ & \textbf{78.89}$^{\ast}$ \\
+\midrule
+\multirow{5}*{\textbf{LLaMa-2}} & CoT-FSP  & \multirow{3}*{\xmark} & 24.03 & 54.14 & 51.30 & \underline{71.90} & 72.44 & 85.41 & 74.00 & 76.32 \\
+\multirow{5}*{\textbf{-Chat-7B}}  & CoT-FT &  & 35.41 & 59.00 & 46.90 & 58.23 & 72.24 & 85.41 & 73.00 & 73.37  \\
+  & CoA (no Tool) &  & 35.03 & 58.79 & \underline{51.50} & 68.10 & \underline{74.21} & \underline{86.48} & \underline{77.67} & \underline{77.38} \\
+  \cmidrule(lr){2-11}
+  & Toolformer  & \multirow{3}*{\cmark} & 23.65 & 50.85 & 48.80 & 61.01 & 69.09 & 81.85 & 68.50 & 70.85  \\
+  & Toolformer - Math &  & \underline{36.01} & \underline{59.18} & 47.60 & 58.99 & 72.44 & 85.94 & 75.50 & 74.43 \\
+ & CoA  &  & \textbf{38.29}$^{\ast}$ & \textbf{59.57} & \textbf{54.20}$^{\ast}$ & \textbf{72.41} & \textbf{81.89}$^{\ast}$ & \textbf{88.26}$^{\ast}$ & \textbf{83.00}$^{\ast}$ & \textbf{82.13}$^{\ast}$ \\
+\midrule
+\multirow{4}*{\textbf{LLaMa-2}} & CoT-FSP  & \multirow{2}*{\xmark} & 56.18 & 65.94 & 70.60 & 86.08 & 89.17 & \underline{92.88} & 84.50 & 88.23 \\
+\multirow{4}*{\textbf{-Chat-70B}} & CoT-FT  &  & 60.50 & 70.24 & 70.40 & 81.52 & 87.60 & 92.35 & 89.17 & 88.18  \\
+  \cmidrule(lr){2-11}
+                                 & Toolformer & \multirow{3}*{\cmark} & 52.54 & 69.07 & \textbf{73.60} & \textbf{86.84} & 89.76 & 91.46 & 81.50 & 87.26 \\
+             & Toolformer - Math &  & \underline{61.03} & \underline{70.59} & 73.20 & 85.57 & \underline{91.34} & 91.99 & \underline{92.00} & \underline{90.60} \\
+            & CoA  &  & \textbf{62.32}$^{\ast}$ & \textbf{71.89}$^{\ast}$ & \underline{73.40} & \underline{86.33} & \textbf{94.49}$^{\ast}$ & \textbf{93.06} & \textbf{92.33} & \textbf{91.91}$^{\ast}$ \\
+\bottomrule
+\end{tabular}
+}
+\caption{Evaluation results on LLaMa-2 and LLaMa-2-Chat for mathematical reasoning. ``All'' denotes the averaged results on four MAWPS portions. Exact match rate to the final gold answer (\ie{}, accuracy) is reported. 
+For each base model, the best and second-best results are \textbf{bolded} and \underline{underlined}, respectively. The best results labeled with $^{\ast}$ are significantly better than their corresponding second-best results, with the significant test p-value $< 0.05$.
+}
+\label{tab:math_results}
+\end{table*}
+
+\subsection{Baselines}
+
+We apply our \textbf{CoA} reasoning method to both 7B and 70B LLaMa models, and test various model versions including the first version of LLaMa \citep{touvron2023llama} and the more advanced LLaMa-2 and LLaMa-2-Chat \citep{touvron2023llama2}.
+We compare our method to several baselines, including: a) few-shot prompting using 8 randomly sampled QA exemplars from the original (\ie{}, not re-written) chain-of-thought data (\textbf{CoT-FSP}), b) fine-tuning with original chain-of-thought data (\textbf{CoT-FT})\footnote{Note that in Wiki QA domain, the HotpotQA data used for prompting or fine-tuning baselines is pre-processed to contain both gold Wikipedia articles (serving as chain-of-thought explanations) and the final answer.}, and c) \textbf{Toolformer} \cite{schick2023toolformer} which fine-tunes LLMs on CCNet \citep{wenzek2020ccnet} texts augmented with API calls.
+For evaluation on Wiki QA, we also compared our method with \textbf{FireAct} \citep{chen2023fireact}, which fine-tunes LLMs on HotpotQA ReAct \citep{yao2023react} trajectories distilled from GPT-4 \citep{openai2023gpt4}.
+
+\section{Results and Analysis}
+\label{results_analysis}
+\subsection{Mathematical Reasoning}
+\label{math_qa_exp}
+Table~\ref{tab:math_results} shows the evaluation results for the LLaMa-2 and LLaMa-2-Chat models.\footnote{We include similar evaluation results for the original LLaMa model (7B) in Appendix \ref{apdx:full_results}.}
+On the GSM8K and ASDiv datasets, our CoA method outperforms the few-shot baseline CoT-FSP and the regular fine-tuning baseline CoT-FT, demonstrating that CoA fine-tuning with tool augmentation is more effective in adapting LLMs to multi-step reasoning tasks.
+Similarly, when evaluated on out-of-distribution datasets, SVAMP and MAWPS, CoA also consistently outperforms the baselines.
+Interestingly, for these out-of-distribution datasets, CoT-FT lags further behind CoA, particularly for 7B models, showing that CoA reasoning yields more distributionally robust reasoning performance.
+
+Our CoA method also surpasses the tool-augmented baseline Toolformer, which implies that planning the abstract variables in CoA can improve the accuracy of reasoning with tools.
+However, as Toolformer is not originally trained with in-domain fine-tuning data,\footnote{Toolformer is fine-tuned on CCNet data, which may not contain rich mathematical reasoning samples.} we also fine-tune a new version of Toolformer with the chain-of-thought data from GSM8K and ASDiv, denoted as \textbf{Toolformer - Math} in Table~\ref{tab:math_results}.
+We also observe that CoA performs better than Toolformer - Math, confirming that the introduction of abstract variables enables more robust tool use compared to direct integration of API calls within chain-of-thought reasoning.
+
+\paragraph{Ablation Study}
+We verify that the robust generalization performance of our CoA method does not merely benefit from using additional tools, by fine-tuning another LLM to solve the equation (from the same model backbone), rather than calling the equation solver, denoted as \textbf{CoA (no Tool)} in Table~\ref{tab:math_results}. 
+We find that CoA (no Tool) performs consistently worse than CoA across all datasets, confirming that using specialized tools enables LLM agents to conduct more precise operations, rather than directly solving the same operations.
+However, CoA (no Tool) still outperforms all baseline methods on zero-shot generalization to SVAMP and MAWPS datasets, implying that learning abstract reasoning chains also contributes to better robustness of CoA, perhaps due to better planning of multiple reasoning steps indexed by abstract variables.
+
+\paragraph{Reasoning Steps}
+Our findings suggest that the benefits of chain-of-abstraction reasoning are most pronounced when problems require long reasoning chains to be solved. Figure~\ref{math_heatmap} shows the stratified performance of three models on GSM8K QA, relative to the number of reasoning steps in the predicted and gold reasoning chains. 
+Compared to the few-shot CoT-FSP, CoA produces reasoning chains that more often match the length of the gold reasoning chains, as reflected by the heat-map statistics (left column) being more aggregated around the diagonal (comparable to CoT-FT).
+At the same time, we observe that models achieve better QA accuracy when the number of reasoning steps in their generated answers are aligned with the gold references (\ie{}, the diagonal of heat-maps in right column).
+Above results show that fine-tuned models are better at learning to produce reasoning chains that match the true reasoning chain for the problem.
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=1.0\columnwidth]{pics/math-heatmap.pdf}
+\caption{GSM8K evaluation results on LLaMa-2-Chat-7B \wrt{} the number of reasoning steps in the predicted and gold reasoning chain. (Left) The number of test examples that belong to each stratum. (Right) The corresponding model accuracy (\%) for those examples. Non-diagonal cells with fewer than 15 examples are ignored.}
+\label{math_heatmap}
+\end{figure}
+
+\begin{table}[t]
+\centering
+\resizebox{0.75\columnwidth}{!}{
+\begin{tabular}{lcc}
+\toprule
+\multirow{2}*{\textbf{Method}}  &  \multicolumn{2}{c}{\textbf{Error Rate}}   \\
+                                \cmidrule(lr){2-3}
+                                &  Arithmetic  &   Reasoning   \\
+\toprule
+CoT-FSP         & 17.3 & 70.3   \\
+CoT-FT          & 25.2 & 67.8   \\
+\midrule
+CoA & \textbf{0.0} & \textbf{60.4} \\ % the illness case of variable misuse is also labeld to have reasoning errors, so 60.4 is not changed.
+\bottomrule
+\end{tabular}
+}
+\caption{Human evaluation results of arithmetic and reasoning error rates on 200 GSM8K test samples. Models developed based on LLaMa-2-Chat-7B are presented.}
+\label{tab:human_eval}
+\end{table}
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=1.0\columnwidth]{pics/efficiency_lines.pdf}
+\caption{Wall-clock inference time on GSM8K (seeded with LLaMa-2-Chat-7B). Average time of answering a question is measured (in seconds) \wrt{} the number of gold reasoning steps required for the question.}
+\label{efficiency_lines}
+\end{figure}
+
+\begin{table}[t]
+\centering
+\begin{tabular}{lc}
+\toprule
+\textbf{Method}  &  \textbf{Accuracy}   \\
+\toprule
+CoT-FSP       & 27.90 \\
+CoT-FT        & 39.12 \\
+Toolformer    & 24.56 \\
+Toolformer - Math & 35.25 \\
+CoA & \textbf{40.79} \\
+\bottomrule
+\end{tabular}
+\caption{
+Evaluation results on GSM8K with self-consistency decoding (seeded with LLaMa-2-Chat-7B). Each model uses majority voting to aggregate the answers of 16 sampled reasoning chains
+}
+\label{tab:self_consistency}
+\end{table}
+
+\begin{table*}[t]
+\centering
+\resizebox{1.0\textwidth}{!}{
+\smallskip\begin{tabular}{llcccccccc}
+\toprule
+\multirow{2}*{\textbf{Model}} & \multirow{2}*{\textbf{Method}} & \multirow{1.8}*{\textbf{Use}}  & \multicolumn{4}{c}{\textbf{HotpotQA}} & \multirow{2}*{\textbf{WQ}} & \multirow{2}*{\textbf{NQ}} & \multirow{2}*{\textbf{TriviaQA}} \\
+            \cmidrule(lr){4-7}
+ & & \textbf{Tool} & \textbf{Bridge} & \textbf{Comparison} & \textbf{Both} & \textbf{Time} &  &  &   \\
+\toprule
+\multirow{6}*{\textbf{LLaMa-2}}  & CoT-FSP  & \multirow{2}*{\xmark} & 11.69 & 45.46 & 18.47 & 2.074 & 34.65 & 30.91 & 53.48 \\
+\multirow{6}*{\textbf{-Chat-7B}} & CoT-FT   &  & 14.24 & \underline{56.69} & 22.77 & \underline{1.937} & 33.51 & 25.40 & 51.05 \\
+    \cmidrule(lr){2-10}
+                                  & Toolformer  & \multirow{4}*{\cmark} & 12.99 & 44.59 & 20.00 & 2.350 & \underline{36.22} & 30.22 & 54.15 \\
+                                  & Toolformer - Wiki &  & 15.68 & 56.42 & 23.86 & 2.301 & \textbf{36.61} & 32.96 & \underline{55.08} \\
+                                  & FireAct   &  & \underline{19.18} & 54.14 & \underline{26.20} & 2.706 & 36.02 & \underline{35.87} & 52.96 \\
+                                & CoA  &  & \textbf{21.00}$^{\ast}$ & \textbf{56.96} & \textbf{28.22}$^{\ast}$ & \textbf{1.896} & 35.97 & \textbf{38.67}$^{\ast}$ & \textbf{57.90}$^{\ast}$ \\
+\midrule
+\multirow{4}*{\textbf{LLaMa-2}}  & CoT-FSP   & \multirow{2}*{\xmark} & 21.39 & 56.62 & 28.47 & 6.668 & 34.89 & 37.42 & 63.61 \\
+\multirow{4}*{\textbf{-Chat-70B}} & CoT-FT   &  & 23.84 & \underline{63.95} & 31.90 & \underline{6.401} & 34.15 & 39.75 & 62.28 \\
+    \cmidrule(lr){2-10}
+                                & Toolformer & \multirow{3}*{\cmark} & 22.24 & 56.09 & 29.04 & 6.888 & \underline{37.16} & 40.42 & 64.31 \\
+                                & Toolformer - Wiki &  & \underline{26.38} & 63.82 & \underline{33.90} & 6.855 & \textbf{37.70} & \underline{41.25} & \underline{66.64} \\
+                                & CoA &  & \textbf{27.61}$^{\ast}$ & \textbf{64.09} & \textbf{34.94}$^{\ast}$ & \textbf{6.369} & 36.37 & \textbf{43.57}$^{\ast}$ & \textbf{69.08}$^{\ast}$ \\
+\bottomrule
+\end{tabular}
+}
+\caption{Wiki QA evaluation results on LLaMa-2-Chat-based models. ``Both'' denotes the overall evaluation results on both bridge and comparison portions of HotpotQA. ``Time'' denotes the average seconds that each agent needs to answer a question in HotpotQA. Exact match rate to the final gold answer (\ie{}, accuracy) is reported.
+For each base model, the best and second-best results are \textbf{bolded} and \underline{underlined}, respectively. The best results labeled with $^{\ast}$ are significantly better than their corresponding second-best results, with the significant test p-value $< 0.05$.
+}
+\label{tab:wiki_results}
+\end{table*}
+
+Interestingly, we find that CoA, compared to CoT-FT, achieves higher performance especially on questions that require more reasoning steps.
+In the right column of Figure~\ref{math_heatmap}, CoA's improvement over CoT-FT is more pronounced on questions with more than $3$ steps in the gold reasoning chain (highlighted with red squares). 
+This indicates that the model trained with CoA has more robust long chain-of-thought reasoning capability, which is learned from planning with abstractions.
+
+\paragraph{Human Evaluation}
+To more comprehensively verify that CoA improves both knowledge operation (\ie{}, arithmetic by using tools) and reasoning accuracy, we conduct a human evaluation on different model answers to 200 randomly sampled GSM8K test questions. 
+Specifically, given a GSM8K question and a model's answer to the question, we ask human workers to judge whether the answer contains any arithmetic errors (\eg{}, wrong calculations, invalid equations) or reasoning errors unrelated to math derivations (\eg{}, misunderstanding of the question, improper strategy for solving the question), and report how often the model makes these two kinds of errors.
+In Table~\ref{tab:human_eval}, we find that CoA effectively reduces arithmetic errors to zero, due to the use of equation solver to perform accurate calculations.
+More importantly, our method also makes fewer reasoning errors compared to the baselines, verifying that CoA fine-tuning guides the model to learn more accurate reasoning through the holistic planning of abstract reasoning chains.
+By contrast, ordinary fine-tuning (\ie, CoT-FT) produces a more limited reasoning improvement compared to the few-shot CoT-FSP, while also failing to suppress arithmetic errors.
+
+\paragraph{Inference Efficiency}
+Importantly, we find that the performance benefits of CoA reasoning do not come with increased computational costs.
+In Figure~\ref{efficiency_lines}, we show the average time (seconds) that CoA and baseline agents (seeded with LLaMa-2-Chat-7B) needs to answer a question \wrt{} required gold reasoning steps.
+Compared to the CoT baselines, CoA requires less time than the few-shot baseline CoT-FSP, whose generation needs to be conditioned on additional examples.
+However, CoA is slightly less inference-efficient compared to CoT-FT, likely due to the decoding of additional tokens (\eg{}, ``['' and ``]'') for the abstract statements.
+
+Compared to Toolformer, CoA has a lower and flatter inference time curve, indicating better scaling as the number of reasoning steps increases.
+This difference arises because CoA decouples the generation of (abstract) reasoning chains from the retrieval of knowledge (\ie{}, tool use), allowing full reasoning chains to be decoded before any tool is called.
+This procedure amortizes inference costs in two ways. 
+First, tool calls are made after the CoA trace has been decoded, enabling parallel tool calls for the same trace (\eg, using an equation solver once rather than multiple calls to a calculator), and avoiding the time delay caused by waiting for external API responses. Consequently, the model fine-tuned with CoA is more efficient at multi-step reasoning, especially when the number of reasoning steps (\ie{}, tool calls) increases.
+Second, across multiple examples, the model can generate the CoA trace of the next example while tool calls are made for the preceding one, parallelizing CoA decoding and tools calls across examples.
+
+\paragraph{Self-Consistency Decoding}
+Besides of greedy decoding, we also test more advanced inference strategy, \ie{}, self-consistency \citep{wang2022self} decoding, on our CoA reasoning method.
+We test all methods on the GSM8K dataset seeded with LLaMa-2-Chat-7B.
+Each method samples 16 reasoning chains and uses majority voting to aggregate the 16 answers derived by the reasoning chains, to get the final answer.
+For the hyperparameters of sampling, we set the temperature, top-k and top-p as 1.0, 40 and 0.5, respectively.
+Table~\ref{tab:self_consistency} shows our evaluation results.
+We find that our CoA method consistently outperforms all baseline methods when shifting from greedy decoding to self-consistency decoding.
+This shows that our method also has better potential to be generalized to different LLM decoding schemes.
+
+\subsection{Wiki QA}
+\label{wiki_qa_exp}
+Table~\ref{tab:wiki_results} shows our Wiki QA results using LLaMa-2-Chat models.\footnote{We include similar evaluation results on LLaMa-2-7B in Appendix \ref{apdx:full_results}.}
+Similar to mathematical reasoning, we fine-tune a new version of Toolformer with in-domain chain-of-thought data from HotpotQA, denoted as \textbf{Toolformer - Wiki}.
+On HotpotQA, CoA achieves higher exact match rates with the gold reference compared to the few-shot or fine-tuning baselines.
+In particular, CoA outperforms all baselines on the more challenging bridge-type QAs, where two steps of reasoning over Wikipedia knowledge are \textit{consecutively} entangled, \ie{}, cannot be performed independently in parallel as in comparison-type QAs. 
+Compared to FireAct fine-tuning, CoA also achieves better performance on both bridge and comparison QAs, without requiring data distilled from closed source GPT-4.
+
+As with mathematical reasoning, CoA agents also perform more efficient inference than Toolformer and FireAct agents when answering HotpotQA questions.
+We also find that CoA is more efficient (\textbf{Time} column) than both CoT-FSP and CoT-FT, as CoA does not require few-shot examples as additional inputs and does not need to generate long Wiki articles, which are instead provided by the search engine.
+Finally, CoA improves over the baseline methods in zero-shot generalization experiments on other Wiki QA datasets, outperforming all baselines on NaturalQuestions and TriviaQA, and matching the best baselines on WebQuestions.
+
+\section{Conclusion}
+In this work, we propose to decouple the general reasoning of LLM agents from specialized knowledge obtained via external tools.
+Our method, chain-of-abstraction (CoA), encourages LLMs to learn the planning of abstract multi-step reasoning, which are more robust to out-of-distribution knowledge shifts.
+CoA also achieves a more efficient pipeline for tool usage that significantly improves the speed of tool-augmented multi-step reasoning.
+The simple, yet effective, implementations of our method on two diverse tasks (\ie{}, math reasoning and open-domain QA) demonstrate its potential for being adapted to new reasoning scenarios.
+
+\section*{Limitations}
+We acknowledge a few limitations in our work.
+First, datasets used for testing our method cannot have exhaustive coverage of all real-world reasoning scenarios.
+We instead consider two representative reasoning domains, \ie{}, mathematical reasoning and general open-domain (Wikipedia) QA, and use English as a primary language in our testing.
+Furthermore, our method is tested on the setting of fine-tuning the full LLMs, which requires considerable computational resources, while more efficient model training schemes, \eg{}, LoRA \citep{hu2021lora}, can be applied in future work.
+
+\section*{Acknowledgements}
+We thank Beatriz Borges, Gail Weiss, Syrielle Montariol, Li Mi and Zeming Chen for reading and providing comments on drafts of this paper.
+Antoine Bosselut gratefully acknowledges the support of the Swiss National Science Foundation (No. 215390), Innosuisse (PFFS-21-29), the EPFL Science Seed Fund, the EPFL Center for Imaging, Sony Group Corporation, and the Allen Institute for AI.
+
+\end{document}

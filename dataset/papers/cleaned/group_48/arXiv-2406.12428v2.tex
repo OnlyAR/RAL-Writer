@@ -1,0 +1,310 @@
+\title{PSLM: Parallel Generation of Text and Speech with LLMs\\for Low-Latency Spoken Dialogue Systems}
+
+\begin{document}
+
+\renewcommand{\arraystretch}{0.8}
+\setlength{\abovedisplayskip}{5pt}
+\setlength{\belowdisplayskip}{5pt}
+
+\maketitle
+\begin{abstract}
+Multimodal language models that process both text and speech have a potential for applications in spoken dialogue systems.
+However, current models face two major challenges in response generation latency: 
+(1) generating a spoken response requires the prior generation of a written response, and
+(2) speech sequences are significantly longer than text sequences.
+This study addresses these issues by extending the input and output sequences of the language model to support the parallel generation of text and speech.
+Our experiments on spoken question answering tasks demonstrate that our approach improves latency while maintaining the quality of response content.
+Additionally, we show that latency can be further reduced by generating speech in multiple sequences.
+Demo samples are available at \url{https://rinnakk.github.io/research/publications/PSLM}.
+\end{abstract}
+
+\section{Introduction}
+
+Spoken dialogue systems have been developed for many years to achieve natural human-computer interaction~\citep{mctear2002spoken,jokinen2009spoken,hongshen2017survey}.
+Traditionally, these systems consist of several components: Automatic Speech Recognition (ASR), Response Generation (RG), and Text-to-Speech (TTS).
+Various methods for RG have been proposed with the advancements in Large Language Models (LLMs)~\citep{wang2023survey,yi2024survey}.
+More recently, the application of LLMs to ASR~(e.g., \citealt{wang2023viola,hono-etal-2024-integrating,fathullah2024prompting}) and TTS~\citep{wang2023viola,hao2023boosting} has attracted much attention, leading to the development of multimodal LLMs capable of end-to-end spoken language communication~\citep{zhang-etal-2023-speechgpt,nachmani2024spoken}.
+
+\citet{zhang-etal-2023-speechgpt} proposed SpeechGPT, an LLM that receives speech questions (SQ) as speech tokens, which are discrete representations extracted from raw waveforms, and sequentially generates text questions (TQ), text answers (TA), and speech answers (SA).
+\Figref{fig:overview} (a) illustrates their approach called Chain-of-Modality (CoM) prompting.
+Spectron~\citep{nachmani2024spoken} follows this prompting style but directly handles speech spectrograms.
+Although these methods can generate high-quality responses, they face two major challenges in terms of response latency.
+First, generating SA requires the prior generation of TQ and TA.
+Second, speech sequences are much longer than text sequences\footnote{Actual sequence lengths are provided in \Appref{app:seq_len}.}.
+
+\begin{figure}[t]
+  \includegraphics[width=\columnwidth]{fig/overview.pdf}
+  \vspace{-10pt}
+  \caption{(a) Chain-of-Modality prompting necessitates generating text questions (TQ) and text answers (TA) from speech questions (SQ) before producing speech answers (SA). (b) Our Parallel Speech Language Model (\prop) enables the parallel decoding of TA and SA, reducing overall latency. (c) Introducing multiple speech streams further accelerates the generation of SA.}
+  \label{fig:overview}
+  \vspace{-10pt}
+\end{figure}
+
+In this study, we propose Parallel Speech Language Model (PSLM), an LLM with multiple input-output sequences to handle both text and speech tokens, enabling their parallel generation.
+To emphasize their parallel processing capabilities, we will refer to these sequences as ``streams''.
+As described in \Figref{fig:overview} (b), PSLM begins to generate SA immediately after the end of SQ tokens, which can reduce overall latency.
+This leads to our first research question (\textbf{RQ1}): Can PSLM improve latency while maintaining the response quality achieved by CoM prompting?
+Additionally, we address the second challenge by introducing multiple speech streams to decode multiple speech tokens in a single step, as described in \Figref{fig:overview} (c).
+This brings us to the second research question (\textbf{RQ2}): Do multiple speech streams sacrifice the response quality?
+Addressing these questions will pave the way for more advanced and responsive applications of spoken dialogue systems.
+
+\section{PSLM}
+
+\subsection{Speech Discretization}
+\label{sec:preliminary}
+
+\paragraph{Speech Tokenization}
+Extracting discrete speech tokens from raw waveforms enables language models to handle speech in the same manner as text tokens. 
+Self-supervised learning has been widely used for speech tokenization due to its ability to extract spoken content from raw waveforms~(e.g., \citealt{rubenstein2023audiopalm,chou-etal-2023-toward,hassid2023twist}).
+Following \citet{zhang-etal-2023-speechgpt}, we employ Hidden-Unit BERT (HuBERT)~\citep{hsu2021hubert} for speech tokenization.
+
+\paragraph{Speech Detokenization}
+In contrast to text tokenization, which is uniquely recoverable, speech tokenization largely discards the information of raw waveforms.
+Two major approaches have been proposed to solve this problem.
+The first approach uses a neural vocoder for directly reconstructing raw waveforms from speech tokens~(e.g., \citealt{zhang-etal-2023-speechgpt,chou-etal-2023-toward,hassid2023twist}).
+The second approach uses a pretrained neural audio codec, which requires an additional module to predict the codec's tokens~(e.g., \citealt{rubenstein2023audiopalm,zhang2024speechgptgen}).
+We adopt the first approach to reduce overall latency using HiFi-GAN~\citep{kong2020hifigan}, a non-autoregressive neural vocoder that efficiently generates high-fidelity waveforms.
+
+\subsection{Integrating LMs with a Speech Stream}
+
+PSLM is built on top of a pretrained decoder-only Transformer~\citep{vaswani2017transformer}.
+\revise{An overview of the PSLM architecture is provided in \Figref{fig:architecture}.}
+We add new input embedding and output projection layers to process speech tokens, while the structure of the intermediate Transformer layers remains unchanged.
+\revise{The embeddings of text and speech tokens are summed before being fed to the Transformer layers.
+The hidden features from the final Transformer layer are passed to two output projection layers to calculate the logits of the next text and speech tokens.}
+We randomly initialize the weights of new embedding and projection layers.
+
+A challenge of joint text-speech modeling lies in the mismatch in their lengths.
+In this study, we simply right-pad TQ and TA sequences with special \texttt{[TEXT-PAD]} tokens to align their lengths with those of the SQ and SA sequences, respectively.
+\revise{
+In a preliminary experiment on the CoM-based architecture, we attempted to generate text tokens and their corresponding speech tokens alternatively in a similar manner to ELLA-V~\citep{song2024ellav}; however, this approach led to frequent mispronunciation.
+This is mainly because, in our case, the text is represented by tokens rather than phonemes; in some languages, the pronunciation of a character often changes according to subsequent characters, and a certain amount of lookahead is necessary to achieve accurate pronunciation.
+In contrast, our alignment strategy allows the model to focus on text token generation initially and then refer to the generated text when producing the majority of speech tokens, leading to more accurate pronunciation.
+} 
+
+Our \prop is trained by minimizing the sum of cross entropy losses for each stream.
+We include prompt tokens, comprising TQ and SQ, in the loss calculation.
+During inference, \prop receives these prompt tokens and generates TA and SA in parallel.
+\revise{Text and speech tokens are sampled independently from their respective distributions.}
+
+\begin{figure}[t]
+  \includegraphics[width=\columnwidth]{fig/architecture.pdf}
+  \vspace{-20pt}
+  \caption{\revise{Architecture of PSLM.}}
+  \label{fig:architecture}
+  \vspace{-10pt}
+\end{figure}
+
+\subsection{Introducing Multiple Speech Streams}
+
+For further acceleration, we introduce multiple speech streams to \prop.
+Assume that \prop has $1 + S$ streams, one for text tokens and $S$ for speech tokens.
+\revise{Given the original speech token sequence of length $N$, the $s$-th speech stream consists of the speech tokens with indices $s, s+S, s+2S, ..., s+MS$, where $s\in \{1,\ldots,S\}$ and $M=\lfloor N/S \rfloor - 1$.
+Compared to simply increasing the batch size, where the system's throughput improves but the latency for each instance remains unchanged, our approach reduces the sequence length handled by the Transformer layers to $1/S$, leading to an approximate $S$-fold speedup even in the single-instance scenario.}
+
+During training, simply summing the cross entropy losses for each stream makes the loss of text tokens less dominant, leading to poor text generation quality.
+Therefore, we introduce a weighted loss, where we multiply the loss for speech streams by $1/S$ to balance the weight of losses for text and speech streams.
+
+\subsection{Streaming Inference with HiFi-GAN}
+Following \citet{chen2022streaming}, we use HiFi-GAN for streaming inference; specifically, we provide partial speech tokens to generate waveform fragments.
+In this study, we use non-causal convolution to maintain high speech quality.
+Therefore, the first speech fragment can be generated once $N_\textrm{offset} = \lfloor R / 2 \rfloor + 1$ tokens are decoded, where $R$ denotes the receptive field of HiFi-GAN.
+Implementation details can be found in \Appref{app:hifigan}.
+
+\subsection{Overall Latency}
+\label{sec:latency}
+We define latency as the delay between the end of the user's utterance and the system's initial response.
+The latency of conventional CoM-based systems $L_\textrm{CoM}$ can be represented as follows:
+\begin{align}
+    L_\textrm{CoM} &= D_\textrm{s2t} + D_\textrm{SQ} + \frac{N_\textrm{dec}}{P} + D_\textrm{t2s} \\
+    N_\textrm{dec} &= N_\textrm{TQ} + N_\textrm{TA} + N_\textrm{offset}
+    \label{eq:latency_com}
+\end{align}
+where $D_\textrm{s2t}$, $D_\textrm{SQ}$, and $D_\textrm{t2s}$ denote the delays of speech tokenization, the prefill phase in LMs, and speech detokenization, respectively; $N_\textrm{TQ}$ and $N_\textrm{TA}$ denote the number of tokens in TQ and TA, respectively; and $P$ denotes the tokens per second (TPS) during the decode phase in LMs.
+
+Our \prop eliminates the need for generating TQ and TA beforehand, although it requires to run external ASR to obtain TQ.
+Hence, its latency $L_\textrm{\prop}$ can be represented as follows:
+\begin{align}
+    L_\textrm{\prop} = D_\textrm{ASR} + D_\textrm{SQ} + \frac{N_\textrm{offset}}{P\cdot S} + D_\textrm{t2s}
+    \label{eq:latency_pslm}
+\end{align}
+where $D_\textrm{ASR}$ denotes the ASR delay.
+Here $D_\textrm{s2t}$ is omitted because speech tokenization can be performed in parallel with ASR.
+
+\section{Experimental Setup}
+\subsection{Dataset}
+We used an internal dataset comprising 1.8M written QA pairs for training \revise{all models.}
+\revise{Since some of these samples, which were primarily crawled from the internet, were deemed unsuitable for evaluation, we used a publicly available Japanese dataset~\citep{megagonlabs_instruction_ja} for evaluation.
+This dataset was manually reviewed and consists of 669 diverse written QA pairs.
+We further filtered the evaluation set by excluding samples whose TQ or TA exceeded 140 characters, the maximum number of characters observed in the training set.
+The final evaluation set contained 396 samples.}
+For both \revise{the training and evaluation} sets, we constructed a spoken question answering (SQA) dataset by synthesizing SQ and SA using a well-trained single-speaker TTS system based on VITS~\citep{kim2021vits}.
+
+\subsection{Configuration}
+\label{sec:config}
+\paragraph{Tokenization and Detokenization}
+For text tokenization, we used the tokenizer with a vocabulary size of 151,936 from rinna/nekomata-7b\footnote{\url{https://huggingface.co/rinna/nekomata-7b}}.
+For speech tokenization, we applied $k$-means clustering with $k=512$ to 12-th layer features from rinna/japanese-hubert-base\footnote{\url{https://huggingface.co/rinna/japanese-hubert-base}}~\citep{sawada2024release}, obtaining 50 speech tokens per second.
+For speech detokenization, we trained discrete unit-based HiFi-GAN~\citep{polyak2021speech} using pairs of synthesized speech waveforms of SQ and SA and their corresponding speech tokens.
+For ASR, Whisper large-v3~\citep{radford2023robust} with faster-whisper\footnote{\url{https://github.com/SYSTRAN/faster-whisper}} was used throughout our experiments.
+
+\paragraph{Language Modeling}
+We used rinna/nekomata-7b, a 32-layer 4096-hidden-size Transformer LM that was continuously pretrained from Qwen-7B~\citep{bai2023qwen} on Japanese text, as the backbone of our models.
+We implemented our models using the GPT-NeoX library~\citep{gpt-neox-library}.
+Unless otherwise noted, models were trained for 50k steps with a batch size of 16 on 8 NVIDIA A100 GPUs using an Adam optimizer~\citep{kingma2015adam} with a peak learning rate set to 1e-5.
+During inference, we set the temperature to 0.8 and applied top-$k$ and top-$p$ sampling with $k=60$ and $p=0.8$.
+
+\subsection{Baselines}
+
+\label{sec:baselines}
+We involved three CoM-based baselines, which share the model weights but differ in their prompts during decoding: (1) \method{CoM-SQ} receives only SQ, (2) \method{CoM-ASR} receives SQ and transcribed TQ, and (3) \method{CoM} receives SQ and gold TQ.
+\revise{In our preliminary experiments, the three-stage training~\citep{zhang-etal-2023-speechgpt} was not effective in our configuration; thus, we trained the model using the same configuration as described in \Secref{sec:config}.}
+
+\subsection{Evaluation Metrics}
+\label{sec:metrics}
+\paragraph{ChatGPT Scores}
+We used OpenAI's GPT-3.5 Turbo API to evaluate response quality on a 5-point scale from 1 (bad) to 5 (excellent).
+The prompt is described in \Appref{app:prompt}.
+We report the scores for TA and the transcription of SA as T-score and S-score, respectively.
+
+\paragraph{Character Error Rate (CER)}
+We calculated the character error rate between the generated TA and the transcription of SA to assess their alignment.
+
+\paragraph{Failure Rate (FR)}
+We counted failure cases such as (1) no \texttt{[EOS]} token was generated before the total sequence length reached 2048, or (2) tokens were generated in the wrong modality, i.e., speech tokens in TQ and TA, or text tokens in SA. 
+
+\paragraph{Latency}
+We simulated latency according to Equations \ref{eq:latency_com} and \ref{eq:latency_pslm} for each sample in the evaluation set, and reported the median values.
+\revise{We set $D_\textrm{s2t} = 0.05$, $D_\textrm{SQ} = 0.05$, $D_\textrm{ASR} = 0.2$, and $D_\textrm{t2s} = 0.01$ based on measurements taken on a single NVIDIA A100 GPU.
+For the TPS value $P$, the actual TPS varies depending on computing resources and optimization; 70 TPS was achieved with vLLM~\citep{kwon2023vllm} optimization, and 25 TPS without it.
+Meanwhile, for streaming inference with HiFi-GAN, LMs need to generate 50 speech tokens per second.
+Therefore, we set $P$ to 50 in our simulations to match this requirement.}
+
+\begin{table*}[t]
+\caption{Automatic evaluation results. T-score and S-score represent the ChatGPT-based score for TA and transcribed SA, respectively. FR denotes the failure rate. Latency values in parentheses represent inputs involving gold TQ.}
+\vspace{-5pt}
+\label{tbl:auto_eval}
+\begin{center}
+\small
+\begin{tabular}{l|l|l|ccccc}
+\toprule
+\textbf{Method} & \textbf{Input modality} & \textbf{Output Modality} & \textbf{T-score}$\uparrow$ & \textbf{S-score}$\uparrow$ & \textbf{FR}$\downarrow$ & \textbf{CER}$\downarrow$ & \textbf{Latency [s]}$\downarrow$\\
+\midrule
+\method{Ground Truth} & --- & --- & 4.00$\pm$0.02 & 3.58$\pm$0.06 & --- & 7.35 & ---\\ \midrule
+
+\method{CoM} & SQ $\rightarrow$ TQ (Gold) & TA $\rightarrow$ SA & 3.50$\pm$0.09 & 3.27$\pm$0.09 & 12.12 & 6.28 & (0.67) \\
+\method{\prop} & SQ, TQ (Gold) & TA, SA & 3.50$\pm$0.08 & 3.22$\pm$0.09 & 5.05 & 5.25 & (0.34) \\\midrule
+
+\method{CoM-SQ} & SQ & TQ $\rightarrow$ TA $\rightarrow$ SA & 3.12$\pm$0.11 & 2.94$\pm$0.10 & 15.91 & 7.83 & 1.03 \\
+\method{CoM-ASR} & SQ $\rightarrow$ TQ (ASR) & TA $\rightarrow$ SA & 3.27$\pm$0.10 & 3.07$\pm$0.09 & 13.13 & 6.18 & 0.92 \\
+\method{\prop-ASR} & SQ, TQ (ASR) & TA, SA & 3.34$\pm$0.09 & 3.05$\pm$0.10 & 6.31 & 6.05 & 0.54 \\ \midrule
+
+\method{\prop-2x} & SQ, TQ (Gold) & TA, SA & 3.50$\pm$0.08 & 3.20$\pm$0.09 & 4.29 & 6.39 & (0.20) \\
+\method{\prop-3x} & SQ, TQ (Gold) & TA, SA & 3.28$\pm$0.10 & 2.99$\pm$0.10 & 7.07 & 6.09 & (0.15) \\
+\bottomrule
+\end{tabular}
+\end{center}
+\vspace{-5pt}
+\end{table*}
+
+\paragraph{Human Rating}
+We also conducted two subjective evaluations: one for text and the other for speech.
+In the text evaluation, we presented pairs of gold TQ and generated TA, \revise{and raters evaluated the naturalness of TA based on the same criteria used in the ChatGPT-based evaluation (Text Naturalness).}
+In the speech evaluation, we presented gold SQ and generated SA successively, along with their TQ and TA, and asked the raters to evaluate (1) how natural the SA is as the speech of the TA \revise{(Speech Naturalness)}, and (2) whether the response is fast enough \revise{(Speed Score)}.
+\revise{For better reproducibility, we provide the actual instruction used for speech evaluation in \Appref{app:speecheval_instruction}.}
+The duration of silence between SQ and SA was simulated in the manner described in \Secref{sec:latency}, except for the Ground Truth where the silence duration was set to 200ms, the average turn-taking gap in human conversation~\citep{levinson2015timing}.
+Scores were rated on a 5-point scale.
+Fifty samples were randomly chosen from the evaluation set, and twenty in-house workers rated twenty samples each.
+
+\section{Results and Discussion}
+\subsection{Automatic Evaluation}
+\label{sec:auto_eval}
+
+\paragraph{Comparison with Baselines}
+To answer \textbf{RQ1}, we compared the proposed method in two conditions, \method{\prop} and \method{\prop-ASR}, with the baselines described in \Secref{sec:baselines}.
+\method{\prop} receives SQ and gold TQ, while \method{\prop-ASR} receives SQ and transcribed TQ.
+\Tblref{tbl:auto_eval} summarizes the results.
+When gold TQ was given, \method{\prop} achieved comparable scores to \method{CoM} and significantly improved latency.
+A similar trend was observed under more practical conditions where gold TQ was not available (\method{\prop-ASR} vs. \method{CoM-ASR}).
+However, their scores were lower than those with gold TQ, and \method{CoM-SQ} faced greater degradation.
+These results suggest that ASR performance is crucial for response quality, and \method{CoM-SQ} seems to have produced more ASR errors than Whisper.
+Nevertheless, we conclude that PSLM maintains the response quality of CoM (\textbf{RQ1}).
+We also found that \prop-based methods achieved lower FRs than CoM-based ones.
+Each stream of \prop is dedicated to a single modality, which could have reduced the failures in generation.
+Furthermore, methods other than \method{CoM-SQ} marked lower CERs than \method{Ground Truth}.
+From this result, we confirmed that both CoM and \prop can generate appropriate SA corresponding to TA.
+
+\paragraph{Multiple Speech Streams}
+To answer \textbf{RQ2}, we trained \prop variants with two (\method{-2x}) or three (\method{-3x}) speech streams\footnote{\method{PSLM-3x} was trained with a batch size of 4 due to the increased number of parameters.}.
+\method{PSLM-2x} achieved comparable scores to \method{PSLM}, whereas \method{PSLM-3x} demonstrated significant degradation.
+From these results, we conclude that speech tokens can be decoded in up to two streams without quality degradation (\textbf{RQ2}).
+An ablation study can be found in \Appref{app:ablation}.
+
+\subsection{Human Evaluation}
+Considering practical applicability to SQA, we manually evaluated three methods: \method{CoM-SQ}, \method{CoM-ASR}, and \method{\prop-ASR}, which do not rely on gold TQ, along with \method{Ground-Truth}.
+\Tblref{tbl:human_eval} shows the results.
+The text response naturalness of \method{\prop-ASR} was comparable to \method{CoM-ASR} and higher than \method{CoM-SQ}, which is consistent with the automatic evaluation results.
+For speech naturalness, all methods achieved higher scores than \method{Ground-Truth}.
+This result can be attributed to two reasons: (1) SA of \method{Ground-Truth} are synthetic speech, which may include errors in pronunciation, intonation, and pauses, and (2) SA of \method{Ground-Truth} are typically longer than those of other methods, incurring that one or two unnatural parts lowered the entire score.
+Nevertheless, we confirmed that our approach can generate natural and faithful speech responses.
+For response speed evaluation, \method{\prop-ASR} achieved a significantly higher score than \method{CoM-ASR} and \method{CoM-SQ}.
+This finding verifies that the proposed method reduces latency both numerically and perceptibly.
+Detailed analysis can be found in the next subsection.
+
+\begin{table}[t]
+\caption{Human evaluation results.}
+\vspace{-5pt}
+\label{tbl:human_eval}
+\begin{center}
+\small
+\begin{tabular}{l|ccc}
+\toprule
+\textbf{Method} & \textbf{Text}$\uparrow$ & \textbf{Speech}$\uparrow$ & \textbf{Speed}$\uparrow$\\
+\midrule
+\method{Ground Truth} & 4.08$\pm$0.26 & 3.74$\pm$0.19 & 4.73$\pm$0.11 \\
+\method{CoM-SQ} & 2.44$\pm$0.29 & 4.04$\pm$0.20 & 4.07$\pm$0.23\\
+\method{CoM-ASR} & 2.90$\pm$0.30 & 3.94$\pm$0.20 & 4.17$\pm$0.22\\
+\method{\prop-ASR} & 3.08$\pm$0.27 & 4.08$\pm$0.20 & 4.57$\pm$0.13\\
+\bottomrule
+\end{tabular}
+\end{center}
+\vspace{-10pt}
+\end{table}
+
+\subsection{Detailed Latency Analysis}
+\revise{
+The sequence length of TA, or $N_\textrm{TA}$, is the most influential factor in overall latency of CoM-based systems, as TA must be generated before SA. 
+Thus, we investigated the overall latency by varying $N_\textrm{TA}$.}
+\Figref{fig:latency_vs_TAlen} shows the results.
+Due to the need for prior generation of TA, the latency of \method{CoM-SQ} and \method{CoM-ASR} increases linearly as TA length increases.
+In contrast, the latency of \method{\prop-ASR} is constant because \Eqref{eq:latency_pslm} does not include $N_\textrm{TA}$, and \method{\prop-2x-ASR} further reduces the latency.
+The gap between CoM-based and \prop-based systems is remarkable when generating long TA, highlighting the effectiveness of generating text and speech tokens in parallel.
+
+\begin{figure}[t]
+    \begin{center}
+  \includegraphics[width=\columnwidth]{fig/latency.pdf}
+    \vspace{-20pt}
+    \caption{Latency vs. TA length for different methods and tokens per second (TPS). \prop-2x-ASR (50 TPS) is omitted because its latency is identical to \prop-ASR (100 TPS).}
+    \label{fig:latency_vs_TAlen}
+    \end{center}
+    \vspace{-10pt}
+\end{figure}
+
+\section{Conclusion}
+In this study, we proposed the Parallel Speech Language Model (PSLM), an LLM capable of generating text and speech tokens in parallel with multiple input-output streams, and investigated its impact on response quality and overall latency.
+The experimental evaluations on spoken question answering demonstrated that the proposed method significantly reduces latency compared to existing methods while maintaining response quality.
+Future work includes verifying the effectiveness of the proposed method on larger datasets and real speech data.
+Additionally, extending the proposed method to multi-turn dialogues is an important research direction.
+
+\section{Limitations}
+We recognize several limitations of this study.
+First, \prop sacrifices ASR capability for faster response, requiring an external ASR module to serve as a spoken dialogue system.
+\revise{Although this dependency can complicate the system structure, it does not degrade the system's performance, provided that an appropriate ASR module is selected.
+This is supported by the fact that CoM-ASR outperformed CoM-SQ, as described in \Secref{sec:auto_eval}.} 
+Nevertheless, enabling ASR with the PSLM architecture can be an interesting research direction.
+Second, we used single-speaker synthetic speech for SQ and SA, which lacks diversity in several aspects of speech such as accent, rhythm, emotion, and timbre.
+Practical applications may require to accept voices of arbitrary speakers, which we will address in future work.
+Finally, multi-turn dialogue settings were not investigated in our experiments.
+While SpeechGPT~\citep{zhang-etal-2023-speechgpt} was not applied to multi-turn dialogue due to sequence length limitations, our models with multiple speech streams have the potential to perform multi-turn dialogue.
+
+\end{document}

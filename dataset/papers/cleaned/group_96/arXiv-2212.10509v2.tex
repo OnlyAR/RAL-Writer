@@ -1,0 +1,296 @@
+\title{\icon Interleaving Retrieval with Chain-of-Thought Reasoning\\ for Knowledge-Intensive Multi-Step Questions}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+Prompting-based large language models (LLMs) are surprisingly powerful at generating natural language reasoning steps or Chains-of-Thoughts (CoT) for multi-step question answering (QA). They struggle, however, when the necessary knowledge is either unavailable to the LLM or not up-to-date within its parameters. While using the question to retrieve relevant text from an external knowledge source helps LLMs, we observe that this one-step retrieve-and-read approach is insufficient for multi-step QA. Here, \textit{what to retrieve} depends on \textit{what has already been derived}, which in turn may depend on \textit{what was previously retrieved}. To address this, we propose IRCoT, a new approach for multi-step QA that interleaves retrieval with steps (sentences) in a CoT, guiding the retrieval with CoT and in turn using retrieved results to improve CoT. Using IRCoT with GPT3 substantially improves retrieval (up to 21 points) as well as downstream QA (up to 15 points) on four datasets: HotpotQA, 2WikiMultihopQA, MuSiQue, and IIRC. We observe similar substantial gains in out-of-distribution (OOD) settings as well as with much smaller models such as Flan-T5-large without additional training. IRCoT reduces model hallucination, resulting in factually more accurate CoT reasoning.\footnote{Code, data, and prompts are available at \url{https://github.com/stonybrooknlp/ircot}}.
+\end{abstract}
+\section{Introduction}
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=0.45\textwidth]{images/intro-figure.pdf}
+\caption{
+\iconsys interleaves chain-of-thought (CoT) generation and knowledge retrieval steps in order to guide the retrieval by CoT and vice-versa. This interleaving allows retrieving more relevant information for later reasoning steps, compared to standard retrieval using solely the question as the query.}
+\label{fig:intro-figure}
+\end{figure}
+
+Large language models are capable of answering complex questions by generating step-by-step natural language reasoning steps---so called chains of thoughts (CoT)---when prompted appropriately~\cite{cot}. This approach has been successful when all information needed to answer the question is either provided as context (e.g., algebra questions) or assumed to be present in the model's parameters (e.g., commonsense reasoning). However, for many open-domain questions, all required knowledge is not always available or up-to-date in models' parameters and it's beneficial to retrieve knowledge from external sources~\cite{internet-augmented-qa,realtime-qa}.
+
+\emph{How can we augment chain-of-thought prompting for open-domain, knowledge-intensive tasks that require complex, multi-step reasoning?}
+
+While a \textit{one-shot} retrieval from a knowledge source based solely on the question can successfully augment LMs with relevant knowledge for many factoid-based tasks~\cite{rag,realm,retro,atlas}, this strategy has clear limitations for more complex multi-step reasoning questions. For such questions, one often must retrieve partial knowledge, perform partial reasoning, retrieve additional information based on the outcome of the partial reasoning done so far, and iterate. 
+As an example, consider the question illustrated in Fig.~\ref{fig:intro-figure}, \textit{``In what country was Lost Gravity manufactured?''}. The Wikipedia document retrieved using the question (in particular, the roller coaster Lost Gravity) as the query does not mention where Lost Gravity was manufactured. Instead, one must first infer that it was manufactured by a company called Mack Rides, and then perform further retrieval, guided by the inferred company name, to obtain evidence pointing to the manufacturing country.
+
+Thus, the retrieval and reasoning steps must inform each other. Without retrieval, a model is likely to generate an incorrect reasoning step due to hallucination. Additionally, without generating the first reasoning step, the text supporting the second step can't be identified easily given the lack of lexical or even semantic overlap with the question. In other words, we need retrieved facts in order to generate factually correct reasoning steps and the reasoning steps to retrieve relevant facts.
+
+Based on this intuition, we propose an \emph{interleaving approach} to this problem, where the idea is to use retrieval to guide the chain-of-thought (CoT) reasoning steps and use CoT reasoning to guide the retrieval. Fig.~\ref{fig:intro-figure} shows an overview of our retrieval method, which we call \iconsys.\footnote{\underline{I}nterleaved \underline{R}etrieval guided by \underline{C}hain-\underline{o}f-\underline{T}hought.} We begin by retrieving a base set of paragraphs using the question as a query. Subsequently, we alternate between the following two steps: (i) \textit{extend CoT}: use the question, the paragraphs collected thus far, and the CoT sentences generated thus far to generate the next CoT sentence; (ii) \textit{expand retrieved information}: use the last CoT sentence as a query to retrieve additional paragraphs to add to the collected set. We repeat these steps till the CoT reports an answer or we reach the maximum allowed number of reasoning steps. Upon termination, all collected paragraphs are returned as the retrieval outcome. Finally, we use these as the context for answering the question via direct QA prompting~\cite{originalgpt3} or CoT prompting~\cite{cot}.
+
+We evaluate the efficacy of our system on 4 multi-step reasoning datasets under an open-domain setting: HotpotQA~\cite{hotpotqa}, 2WikiMultihopQA~\cite{xanh2020_2wikimultihop}, MuSiQue~\cite{musique}, and IIRC~\cite{iirc}. Our experiments using OpenAI GPT3 (\texttt{code-davinci-002}) \cite{originalgpt3,instructgpt3,codex} demonstrate that retrieval using \iconsys is substantially more effective than the baseline, one-step, question-based retrieval by 11-21 recall points under a fixed-budget optimal recall setup.\footnote{We explain later (in the Metric section and Footnote~\ref{footnote:retrieval-metric}) the appropriateness of this metric in our setting as opposed to more mainstream information recall metrics.} When \iconsys is used in conjunction with a prompting-based reader, it also leads to substantial improvement (up to 15 F1 points) in downstream few-shot QA performance and reduces factual errors in generated CoT by up to 50\%. Our approach also works on much smaller Flan-T5 models (11B, 3B, and 0.7B) showing similar trends. In particular, we find QA using Flan-T5-XL (3B) with \iconsys even outperforms the 58X larger GPT3 with a one-step question-based retrieval.
+Furthermore, these improvements also hold up in an out-of-distribution (OOD) setting where the demonstrations from one dataset are used when testing on another dataset.
+Lastly, we note that our QA scores exceed those reported by recent works on few-shot prompting for open-domain QA (ODQA)~\cite{decomp,selfask,react}, although a fair apples-to-apples comparison with them isn't possible (cf.~Appendix~\ref{sec:sota-differences}).
+
+In summary, our main \textbf{contribution} is a novel retrieval method, \iconsys, that leverages LMs' chain-of-thought generation capabilities to guide retrieval and uses retrieval in turn to improve CoT reasoning. We demonstrate that \iconsys:
+\begin{enumerate}[nosep]
+
+    \item improves both retrieval and few-shot QA performance on several multi-step open-domain QA datasets, in both IID and OOD settings;
+
+    \item reduces factual errors in generated CoTs; and
+
+    \item improves performance with both large-scale (175B models) as well as smaller-scale models (Flan-T5-*, $\le$11B) without any training.
+
+\end{enumerate}
+\section{Related Work}
+\label{sec:related_work}
+
+\paragraph{Prompting for Open-Domain QA.}
+
+LLMs can learn various tasks by simply using a few examples as prompts~\cite{originalgpt3}. They've also been shown to answer complex questions by producing step-by-step reasoning (chain-of-thoughts, or CoT) when prompted with a few or zero demonstrations~\cite{cot, zerocot}. Prompting has been applied to open-domain QA~\cite{internet-augmented-qa,recitationlm,Yu2022GenerateRT} but its value in improving retrieval and QA for multi-step open-domain questions remains relatively underexplored.
+
+Recently three approaches have been proposed for multi-step open-domain QA. SelfAsk~\cite{selfask} prompts LLMs to decompose a question into subquestions and answers subquestions by a call to Google Search API. DecomP~\cite{decomp} is a general framework that decomposes a task and delegates sub-tasks to appropriate sub-models. They also decompose questions but delegate retrieval to a BM25-based retriever. Both of these approaches are not developed for CoT reasoning, do not focus on the retrieval problem, and require a single-hop QA model to answer the decomposed questions. Recently proposed ReAct~\cite{react} system frames the problem as generating a sequence of reasoning and action steps. These steps are much more complex, rely on much larger models (PaLM-540B), and require fine-tuning to outperform CoT for multi-step ODQA. Furthermore, none of these works have been shown to be effective for smaller models without any training. While a direct comparison with these approaches is not straightforward (difference in knowledge corpus, LLMs, examples), we find that our ODQA performance is much higher than all their reported numbers where available (\S\ref{sec:exp-results}).
+
+\paragraph{Supervised Multi-Step Open-Domain QA.}
+Prior work has explored iterative retrieval for open-domain QA in a fully supervised setting. \citet{multi-step-retriever-reader} proposes an iterative retrieval model that retrieves using a neural query representation and then updates it based on a reading comprehension model's output. \citet{multihop-retriever-odqa} apply similar neural query reformulation idea for multihop open-domain QA. \citet{mpr} extends the widely-used Dense Passage Retrieval (DPR)~\cite{dpr} to multihop setting, which has since been improved by \citet{baleen}. \citet{wikipatretriever} leverages the graph structure induced by the entity links present in Wikipedia paragraphs to perform iterative multi-step retrieval. GoldEn (Gold Entity) retriever~\cite{golden} iteratively generates text queries based on paragraphs retrieved from an off-the-shelf retriever but requires training data for this next query generator. \citet{webgpt} used GPT3 to answer long-form questions by interacting with the browser but relied on human annotations of these interactions. All of these methods rely on supervised training on a large-scale dataset and can not be easily extended to a few-shot setting.
+\section{Chain-of-Thought-Guided Retrieval and Open-Domain QA}
+\label{sec:method}
+
+\begin{figure*}[!ht]
+\centering
+\includegraphics[width=0.95\textwidth]{images/main-figure.pdf}
+\caption{\iconsys interleaves chain-of-thought (CoT) generation and retrieval steps to guide the retrieval by CoT and vice-versa. We start by retrieving $K$ documents using the question as they query and repeat two steps alternatingly until termination. (i) \texttt{reason}-step generates next CoT sentence based on the question, so far retrieved paragraphs, and CoT sentences. (ii) \texttt{retrieve}-step retrieves $K$ more paragraphs based on the last CoT sentence. The process terminates when the generated CoT has ``answer is'' or the number of steps exceeds a threshold. The collection of all paragraphs is returned as the retrieval result on the termination.}
+\label{fig:main-figure}
+\end{figure*}
+
+Our goal is to answer a knowledge-intensive multi-step reasoning question $Q$ in a few-shot setting by using a knowledge source containing a large number of documents. To do this we follow a \texttt{retrieve-and-read} paradigm~\cite{retrieve-and-read}, where the retriever first retrieves documents from the knowledge source and the QA model reads the retrieved documents and the question to generate the final answer. Our contribution is mainly in the \texttt{retrieve} step (\S\ref{subsec:retriever}), and we use standard prompting strategies for the \texttt{read} step (\S\ref{subsec:reader}).
+
+As noted earlier, for multi-step reasoning, retrieval can help guide the next reasoning step, which in turn can inform what to retrieve next. This motivates our interleaving strategy, discussed next.
+
+\subsection{Interleaving Retrieval with Chain-of-Thought Reasoning}
+\label{subsec:retriever}
+
+Our proposed retriever method, \iconsys, can be instantiated from the following three ingredients: (i) a base retriever that can take a query and return a given number of paragraphs from a corpus or knowledge source; (ii) a language model with zero/few-shot Chain-of-Thought (CoT) generation capabilities; and (iii) a small number of annotated questions with reasoning steps explaining how to arrive at the answer in natural language (chain of thoughts) and a set of paragraphs from the knowledge source that collectively support the reasoning chain and the answer.
+
+The overview of \iconsys is given in Fig.~\ref{fig:main-figure}. We first gather a base set of paragraphs by retrieving $K$ paragraphs using the question $Q$ as the query. Then, we interleave two steps (\texttt{reason} and \texttt{retrieve}) iteratively until the termination criterion is met.
+
+The \textbf{retrieval-guided reasoning step (``Reason'')} generates the next CoT sentence using the question, the paragraphs collected thus far, and the CoT sentences generated thus far. The prompt template for the task looks as follows:
+
+\begin{small}
+\begin{verbatim}
+Wikipedia Title: <Page Title>
+<Paragraph Text>
+...
+Wikipedia Title: <Page Title>
+<Paragraph Text>
+
+Q: <Question>
+A: <CoT-Sent-1> ... <CoT-Sent-n>
+\end{verbatim}
+\end{small}
+ 
+For in-context demonstrations, we use the complete CoT in the above format. For a test instance, we show the model only the CoT sentences generated thus far and let it complete the rest. Even though the model may output multiple sentences, for each \texttt{reason-step}, we only take the first generated sentence and discard the rest.
+
+For the paragraphs in the in-context demonstrations, we use ground-truth supporting paragraphs and $M$ randomly sampled paragraphs shuffled and concatenated together in the above format. For a test instance, we show all the paragraphs collected thus far across all the previous \texttt{retrieve-step}s.
+
+If the generated CoT sentence has the ``answer is:'' string or the maximum number of steps\footnote{set to 8 in our experiments.} has been reached, we terminate the process and return all collected paragraphs as the retrieval result.
+
+The \textbf{CoT-guided retrieval step (``Retrieve'')} uses the last generated CoT sentence as a query to retrieve more paragraphs and adds them to the collected paragraphs. We cap the total number of collected paragraphs\footnote{set to 15 in our experiments.} so as to fit in at least a few demonstrations in the model's context limit.
+
+\subsection{Question Answering Reader}
+\label{subsec:reader}
+
+The QA reader answers the question using retrieved paragraphs taken from the retriever. We consider two versions of the QA reader implemented via two prompting strategies: \texttt{CoT Prompting} as proposed by \citet{cot}, Direct Prompting as proposed by \citet{originalgpt3}. For CoT prompting, we use the same template as shown in \S\ref{subsec:reader}, but at test time we ask the model to generate the full CoT from scratch. The final sentence of CoT is expected to be of the form ``answer is: ...'', so that the answer can be extracted programmatically. If it's not in that form, the full generation is returned as the answer. For Direct Prompting, we use the same template as CoT Prompting but the answer field (``A: '') contains only the final answer instead of CoT. See App.~\ref{sec:apndx-prompts} for details.
+
+\section{Experimental Setup}
+\label{sec:exp-setup}
+
+We evaluate our method on 4 multi-step QA datasets in the open-domain setting: \textbf{HotpotQA}~\cite{hotpotqa}, \textbf{2WikiMultihopQA}~\cite{xanh2020_2wikimultihop}, answerable subset of \textbf{MuSiQue}~\cite{musique}, and answerable subset of \textbf{IIRC}~\cite{iirc}. For HotpotQA, we use the Wikipedia corpus that comes with it for the open-domain setting. For each of the other three datasets, which originally come in a reading comprehension or mixed setting, we used the associated contexts to construct a corpus for our open-domain setting (see App.~\ref{sec:apndx-corpora} for details). For each dataset, we use 100 randomly sampled questions from the original development set for tuning hyperparameters, and 500 other randomly sampled questions as our test set.
+
+\subsection{Models}
+\label{subsec:exp-models}
+
+\paragraph{Retriever.} We use BM25~\cite{bm25} implemented in Elasticsearch\footnote{\url{https://www.elastic.co/}} as our base retriever. We compare two retriever systems:
+
+(i) \textbf{One-step Retriever (OneR)} uses the question as a query to retrieve $K$ paragraphs. We select $K \in \{5, 7, 9, 11, 13, 15\}$ that's best on the dev set.
+
+(ii) \textbf{\iconsys Retriever} is our method described in \S\ref{sec:method}. We use BM25 as its underlying retriever and experiment with OpenAI GPT3 (\texttt{code-davinci-002})~\cite{originalgpt3,instructgpt3,codex} and Flan-T5~\cite{flan} of different sizes as its CoT generator.
+
+For demonstrating in-context examples to these LMs, we wrote CoTs for 20 questions for all the datasets (see App. \S\ref{sec:apndx-prompts}). We then create 3 demonstration (``training'') sets by sampling 15 questions each for each dataset. For each experiment, we search for the best hyperparameters for the dev set using the first demonstration set and evaluate each demonstration set on the test set using the selected hyperparameters. We report the mean and standard deviation of these 3 results for each experiment.
+
+ At test time, we pack as many demonstrations as possible within the model's context length limit. The context limit for GPT3 (\texttt{code-davinci-002}) is 8K word pieces. Flan-T5-* doesn't have any hard limit as it uses relative position embeddings. But we limit Flan-T5's context to 6K word pieces, which is the maximum we could fit in the memory of our 80G A100 GPUs.
+
+\iconsys Retriever has one key hyperparameter: $K \in \{2, 4, 6, 8\}$, the number of paragraphs to retrieve at each step. Additionally, when creating ``training'' demonstrations for \iconsys's Reasoner module, we use gold paragraphs and a smaller number $M \in \{1, 2, 3\}$ of distractor paragraphs (\S\ref{subsec:retriever}).
+
+\textbf{Retrieval Metric:} We allow a maximum of 15 paragraphs for all retriever systems and measure the recall of the gold paragraphs among the retrieved set of paragraphs. We search for the hyperparameter $K$ (and $M$ for \iconsys) that maximizes the recall on the dev set and use it on the test set. The reported metric can thus be viewed as the \emph{fixed-budget optimal recall} for each system considered.\footnote{\label{footnote:retrieval-metric}Note that our retrieved documents are not ranked, making standard information retrieval metrics such as MAP and DCG inapplicable. Further, we can only limit the number of retrieved paragraphs \emph{per step} to $K$. Since the total number of reasoning steps varies for questions, and in some cases, we don't even obtain all $K$ paragraphs in a given step, the total number of retrieved paragraphs also varies (even though capped at 15). This makes Recall@k, Precision@k, etc., also not applicable as metrics for any given k.}
+
+\paragraph{QA Reader.} To implement the reader, we use the same LMs as used in the \texttt{reason-step} of \iconsys Retriever. We found that QA readers implemented with Flan-T5-* perform better with the Direct Prompting strategy and GPT3 performs better with CoT Prompting strategy (see App. ~\ref{sec:apndx-readers-results}). Hence we use Direct prompting strategy for QA with Flan-T5-* and CoT with GPT3 for the experiments.\footnote{\iconsys, by construction, produces a CoT as a part of its retrieval process. Thus, instead of having a separate post-hoc reader, one can also just extract the answer from the CoT generated during retrieval. However, we found this to be a suboptimal choice, so we always use a separate reader (see App.~\ref{sec:qa-reader-ablation}).}
+
+The QA reader has one hyperparameter $M$: the number of distractor paragraphs in the in-context demonstrations. We search for $M$ in $\{1, 2, 3\}$. When used in conjunction with \iconsys retriever $M$ is tied for the CoT generator and the reader.
+
+\paragraph{Open-Domain QA (ODQA) Models.} Putting retrievers and readers together, we experiment with ODQA models constructed from the various language models denoted as \textbf{OneR QA} and \textbf{\iconsys QA}. For \iconsys QA, the choice of LM for the CoT generator and the reader is kept the same. We also experiment with retriever-less QA readers \textbf{NoR QA} to assess how well LMs can answer the question from their parametric knowledge alone. To select the best hyperparameters for the ODQA model, we search for the hyperparameters $K$ and $M$ that maximize the answer F1 on the development set.
+
+IIRC is structured slightly differently from the other datasets, in that its questions are grounded in a main passage and other supporting paragraphs come from the Wikipedia pages of entities mentioned in this passage. We slightly modify the retrievers and readers to account for this (see App.~\ref{sec:apndx-iirc-special-handling}).
+
+\begin{figure*}[ht]
+\centering
+\includegraphics[width=0.95\textwidth]{images/main_retrieval_results.pdf}
+\caption{Retrieval recall for one-step retriever (OneR) and \iconsys instantiated from \texttt{Flan-T5-XXL} (left) and \texttt{GPT3} (right) models. \iconsys outperforms OneR for both models and all datasets.}
+\label{fig:main-retrieval-results}
+\end{figure*}
+
+\begin{figure*}[ht]
+\centering
+\includegraphics[width=0.95\textwidth]{images/main_qa_results.pdf}
+\caption{Answer F1 for ODQA model made using (i) no retriever (NoR QA) (ii) one-step retriever (OneR QA) and (iii) \iconsys QA instantiated from \texttt{Flan-T5-XXL} (left) and \texttt{GPT3} (right) models. \iconsys QA outperforms OneR QA and NoR QA for both models on all datasets, except for GPT3 on IIRC.}
+\label{fig:main-qa-results}
+\end{figure*}\section{Results}
+\label{sec:exp-results}
+
+\begin{figure*}[ht]
+\centering
+\includegraphics[width=0.95\textwidth]{images/ood_retrieval_results.pdf}
+\caption{Retrieval recall for OneR and IRCoT using Flan-T5-XXL (Left) and GPT3 (Right) in out-of-distribution (OOD) setting. HQ (HotpotQA), 2W (2WikiMultihopQA), MQ (MuSiQue). The result X$\rightarrow$Y indicates prompt demonstrations are from dataset X and evaluation is on dataset Y. \iconsys outperforms OneR in such an OOD setting.}
+\label{fig:ood-retrieval-results}
+\end{figure*}
+
+\begin{figure*}[ht]
+\centering
+\includegraphics[width=0.95\textwidth]{images/ood_qa_results.pdf}
+\caption{Answer F1 for NoR QA, OneR QA and IRCoT QA using Flan-T5-XXL (Left) and GPT3 (Right) in out-of-distribution (OOD) setting. HQ (HotpotQA), 2W (2WikiMultihopQA), MQ (MuSiQue). The result X$\rightarrow$Y indicates prompt demonstrations are from dataset X and evaluation is on dataset Y. \iconsys QA outperforms OneR QA and NoR QA in such OOD setting.}
+\label{fig:ood-qa-results}
+\end{figure*}
+
+\paragraph{\iconsys retrieval is better than one-step. }
+
+Fig.~\ref{fig:main-retrieval-results} compares OneR with \iconsys retrievers made from \texttt{Flan-T5-XXL} and \texttt{GPT3} LMs. For both models, \iconsys significantly outperforms one-step retrieval across all datasets. For \texttt{Flan-T5-XXL}, \iconsys improves our recall metric relative to one-step retrieval, on HotpotQA by 7.9, on 2WikiMultihopQA by 14.3, on MuSiQue by 3.5, and on IIRC by 10.2 points. For \texttt{GPT3}, this improvement is by 11.3, 22.6, 12.5, and 21.2 points, respectively.
+
+\paragraph{\iconsys QA outperforms NoR and OneR QA.}
+
+Fig.~\ref{fig:main-qa-results} compares ODQA performance using NoR, OneR and \iconsys retriever made from \texttt{Flan-T5-XXL} and \texttt{GPT3} LMs. For \texttt{Flan-T5-XXL}, \iconsys QA outperforms OneR QA on HotpotQA by 9.4, on 2WikiMultihopQA by 15.3, on MuSiQue by 5.0 and IIRC by 2.5 F1 points. For \texttt{GPT3}, the corresponding numbers (except for IIRC) are 7.1, 13.2, and 7.1 F1 points. For \texttt{GPT3}, \iconsys doesn't improve the QA score on IIRC, despite significantly improved retrieval (21 points as shown in Fig.~\ref{fig:main-retrieval-results}). This is likely because IIRC relevant knowledge may already be present in GPT3, as also evidenced by its NoR QA score being similar. For other datasets and model combinations, NoR QA is much worse than \iconsys QA, indicating the limits of the models' parametric knowledge.
+
+\begin{figure}[ht]
+\centering
+\includegraphics[width=0.475\textwidth]{images/factual_errors.pdf}
+\caption{Number of questions, out of 40, where CoT generated by GPT3 using different methods has at least 1 factual error. Factual errors: \iconsys $<$ OneR $<$ NoR.}
+\label{fig:cot-factual-errors}
+\end{figure}
+
+\begin{figure*}[ht]
+\centering
+\includegraphics[width=0.95\textwidth]{images/model_scale_retrieval_results.pdf}
+\caption{Retrieval recall for OneR (bottom) and \iconsys (top) for LMs of increasing sizes: Flan-T5 \{base (0.2B), large (0.7B), XL (3B), XXL (11B)\} and GPT3 (175B) on HotpotQA, 2WikiMultihopQA, MuSiQue. \iconsys outperforms OneR for all model sizes, including the 0.3B model, and the difference roughly grows with model size. Note: OneR doesn't use LM in its retrieval and so has a fixed score.}
+\label{fig:model-scale-retrieval-results}
+\end{figure*}
+
+\begin{figure*}[ht]
+\centering
+\includegraphics[width=0.95\textwidth]{images/model_scale_qa_results.pdf}
+\caption{Answer F1 for ODQA models made using OneR (bottom) and \iconsys (top) for LMs of increasing sizes: Flan-T5 \{base (0.2B), large (0.7B), XL (3B), XXL (11B)\} and GPT3 (175B) on HotpotQA, 2WikiMultihopQA and MuSiQue. \iconsys QA outperforms OneR QA for all model sizes except for the smallest, 0.3B. \iconsys with 3B model even outperforms OneR with 58X larger GPT3 model showing the value of improved retrieval.}
+\label{fig:model-scale-qa-results}
+\end{figure*}
+
+\paragraph{\iconsys is effective in OOD setting. }
+
+Since CoT may not always be easy to write for new datasets, we evaluate NoR, OneR, and IRCoT on generalization to new datasets, i.e. OOD setting. To do so, we use prompt demonstrations from one dataset to evaluate on another dataset.\footnote{We use the evaluation dataset's corpus for retrieval.} For all pairs of the datasets\footnote{We skip IIRC in this exploration as the task is structured a bit differently and requires special handling (see App.~\ref{sec:apndx-iirc-special-handling}).} and for both \texttt{Flan-T5-XXL} and \texttt{GPT3}, we find the same trend as in the IID setting: \iconsys retrieval outperforms OneR (Fig.~\ref{fig:ood-retrieval-results}), and IRCoT QA outperforms both OneR QA and NoR QA (Fig.~\ref{fig:ood-qa-results}).
+
+\paragraph{\iconsys generates CoT with fewer factual errors.}
+
+To assess whether our approach also improves the factuality of generated CoTs, we manually annotated CoTs generated by NoR QA, OneR QA, and IRCoT QA using GPT3 for 40 randomly sampled questions from each of the four datasets. We considered CoT to have a factual error if at least one of the facts\footnote{all sentences before the final ``answer is:'' sentence.} is not true.\footnote{Note that factual error doesn't necessarily mean the predicted answer is incorrect and vice-versa. This is because the model can generate a wrong answer despite all correct facts, and vice-versa. We also account for the possibility of answer annotation errors in the original datasets.} As Fig.~\ref{fig:cot-factual-errors} shows, NoR makes the most factual errors, OneR makes fewer, and \iconsys the least. In particular, \iconsys reduces the factual errors over OneR by 50\% on HotpotQA and 40\% on 2WikiMultihopQA.
+
+Table~\ref{table:nor-oner-cot-examples} illustrates how the CoT predictions for different methods vary qualitatively. Since NoR relies completely on parametric knowledge, it often makes a factual error in the first sentence, which derails the full CoT. OneR can retrieve relevant information closest to the question and is less likely to make such errors early on, but it still makes errors later in the CoT. IRCoT, on the other hand, is often able to prevent such errors in each step.
+
+\paragraph{\iconsys is also effective for smaller models.}
+
+To see how effective \iconsys is at different LM sizes, we show the scaling plots in Fig.~\ref{fig:model-scale-retrieval-results}.\footnote{We skip IIRC here as the smaller models are not good at identifying Wikipedia titles from a paragraph and a question which is necessary for IIRC (see App.~\ref{sec:apndx-iirc-special-handling}).} We compare the recall for OneR and \iconsys using \texttt{Flan-T5} \{base (0.2B), large (0.7B), XL (3B), XXL (11B)\}, and GPT3 \texttt{code-davinci-002} (175B). \iconsys with even the smallest model (0.2B) is better than OneR, and the performance roughly improves with the model size. This shows the CoT generation capabilities of even small models can be leveraged for improving retrieval. Furthermore, we show the effect of model size on the QA score in Fig.~\ref{fig:model-scale-qa-results}. For all sizes except the smallest (0.2B), we see \iconsys QA is better than OneR QA. Moreover, \iconsys with a 3B model even outperforms OneR and NoR with a 58X larger 175B GPT3 model in all datasets.
+
+\paragraph{\iconsys is SOTA for few-shot multistep ODQA.\footnote{\label{footnote:sota}App.~\S\ref{sec:sota-differences} reports updated SOTA numbers, including contemporaneous and newer works.}}
+
+We compare \iconsys QA with five recent approaches to using LLMs for ODQA: Internet-Augmented QA~\cite{internet-augmented-qa}, RECITE~\cite{recitationlm} ReAct~\cite{react}, SelfAsk~\cite{selfask}, and DecomP~\cite{old-decomp}. Although these are not head-to-head comparisons as different methods use different APIs, knowledge sources, and even LLMs (see App.~\ref{sec:sota-differences} for details), it is still informative to explore, in a leaderboard-style fashion, how \iconsys performs relative to the best numbers published for these recent systems.
+
+\vspace{0.1cm}
+\begin{table}[ht]
+    \centering
+    \footnotesize
+    \setlength{\tabcolsep}{2.0pt}
+    \begin{tabular}{ccccc}\toprule
+        Model &  HpQA\textsuperscript{Br}  &  HpQA & 2WikiMQA & MQ\textsuperscript{2H} \\
+        \midrule
+        InterAug      &   $-$ | $-$    &        30.3 | $-$\p{xx}   &        $-$ | $-$        &        $-$ | $-$            \\
+        RECITE        &   $-$ | $-$    &        37.1 | 48.4        &        $-$ | $-$        &        $-$ | $-$            \\
+        ReAct         &   $-$ | $-$    &        35.1 | $-$\p{xx}   &        $-$ | $-$        &        $-$ | $-$            \\
+        SelfAsk       &   $-$ | $-$    &         $-$ | $-$         &       40.1 | $-$\p{xx}   &       15.2 | $-$\p{xx}     \\
+        DecomP        &  \p{x..}$-$ | 50.0  &         $-$ | $-$         &   \p{x..}$-$ | 59.3      &       $-$ | $-$       \\
+        \midrule
+        \sys QA       &   \textbf{45.8 | 58.5}   &    \bf{49.3 | 60.7}       &   \bf{57.7 | 68.0}      &  \bf{34.2 | 43.8} \\
+        \bottomrule
+    \end{tabular}
+    \caption{Comparison with other LLM-based ODQA systems on EM and F1 scores. `$-$': score is unavailable. HpQA\textsuperscript{Br}: Bridge questions subset of HotpotQA. MQ\textsuperscript{2H}: MuSiQue 2-hop questions. \iconsys QA with GPT3 (ours) outperforms other systems by a large margin. Note: Comparisons aren't head-to-head as discussed in the text. App.~\S\ref{sec:sota-differences} reports updated SOTA numbers, including contemporaneous and newer works.
+    \label{table:extrinsic-comparison}
+    }
+\end{table}
+
+As shown in Table~\ref{table:extrinsic-comparison}, \iconsys QA significantly outperforms all of these recent systems by a large margin, setting a new state of the art in terms of what's achievable via retrieval-augmented LLMs (without supervised training).
+
+\begin{table*}[t]
+    \centering
+    \footnotesize
+    \setlength{\tabcolsep}{4.0pt}
+    \begin{tabular}{llllll}\toprule
+        & \textbf{Question} &   \textbf{Gold Facts} & \textbf{NoR QA} & \textbf{OneR QA} & \textbf{IRCoT QA} \\
+        \midrule
+
+        \multirow{2}{*}{\rotatebox[origin=c]{90}{\parbox[c]{3.0cm}{\centering HotpotQA}}}
+        & \begin{minipage}[t]{2cm} The tap dancing soloist in My Feet Keep Dancing also starred in what 1935 MGM musical? \end{minipage}
+        & \begin{minipage}[t]{3.0cm} $\Rightarrow$ The tap dancing soloist in My Feet Keep Dancing is \textcolor{blue}{Fayard Nicholas}. \\ $\Rightarrow$ Fayard Nicholas starred in the 1935 MGM musical \textcolor{blue}{An All-Colored Vaudeville Show}. \end{minipage}
+        & \begin{minipage}[t]{3.0cm} The tap dancing soloist in My Feet Keep Dancing is \textcolor{red}{Eleanor Powell}. Eleanor Powell also starred in the 1935 MGM musical \textcolor{red}{Broadway Melody} of 1936. So the answer is: Broadway Melody of 1936. \end{minipage}
+        & \begin{minipage}[t]{3.0cm} The tap dancing soloist in My Feet Keep Dancing is \textcolor{blue}{Fayard Nicholas}. Fayard Nicholas also starred in the 1935 MGM musical \textcolor{red}{Top Hat}. So the answer is: Top Hat. \end{minipage}
+        & \begin{minipage}[t]{3.0cm} The tap dancing soloist in My Feet Keep Dancing is \textcolor{blue}{Fayard Nicholas}. Fayard Nicholas starred in the 1935 MGM musical \textcolor{blue}{An All-Colored Vaudeville Show}. So the answer is: An All-Colored Vaudeville Show. \end{minipage} \\
+
+        \midrule
+
+        \multirow{1}{*}{\rotatebox[origin=c]{90}{\parbox[c]{4.0cm}{\centering 2WikiMQA}}}
+        & \begin{minipage}[t]{2cm} Who is the father-in-law of Queen Hyojeong? \end{minipage}
+        & \begin{minipage}[t]{3.0cm} $\Rightarrow$ Queen Hyojeong is the wife of \textcolor{blue}{King Heonjong of Joseon}. \\ $\Rightarrow$ King Heonjong of Joseon is the son of \textcolor{blue}{Crown Prince Hyomyeong}. \end{minipage}
+        & \begin{minipage}[t]{3.0cm} Queen Hyojeong has a husband named \textcolor{red}{King Gojong}. King Gojong has a father named \textcolor{red}{Heungseon Daewongun}. Thus, Queen Hyojeong has a father-in-law named Heungseon Daewongun. So the answer is: Heungseon Daewongun. \end{minipage}
+        & \begin{minipage}[t]{3.0cm} Queen Hyojeong is the wife of \textcolor{blue}{King Heonjong of Joseon}. King Heonjong of Joseon is the son of \textcolor{red}{King Sejo of Joseon}. Thus, King Sejo of Joseon is the father-in-law of Queen Hyojeong. So the answer is: King Sejo of Joseon. \end{minipage}
+        & \begin{minipage}[t]{3.0cm} Queen Hyojeong is the wife of \textcolor{blue}{King Heonjong of Joseon}. King Heonjong of Joseon is the son of \textcolor{blue}{Crown Prince Hyomyeong}. Thus, Crown Prince Hyomyeong is the father-in-law of Queen Hyojeong. So the answer is: Crown Prince Hyomyeong. \end{minipage} \\
+
+        \midrule
+
+        \multirow{1}{*}{\rotatebox[origin=c]{90}{\parbox[c]{3.0cm}{\centering MuSiQue}}}
+        & \begin{minipage}[t]{2cm} What is the name of the castle in the city where the performer of A Collection 1984–1989 was born? \end{minipage}
+        & \begin{minipage}[t]{3.0cm} $\Rightarrow$ A Collection 1984–1989 was performed by \textcolor{blue}{Jane Siberry}. \\ $\Rightarrow$ Jane Siberry was born in \textcolor{blue}{Toronto}. \\ $\Rightarrow$ The castle in Toronto is the \textcolor{blue}{Casa Loma}. \end{minipage}
+        & \begin{minipage}[t]{3.0cm} The performer of A Collection 1984–1989 is \textcolor{red}{The The}. The The was born in \textcolor{red}{London}. The name of the castle in London is the \textcolor{red}{Tower of London}. So the answer is: the Tower of London. \end{minipage}
+        & \begin{minipage}[t]{3.0cm} A Collection 1984–1989 was performed by \textcolor{blue}{Jane Siberry}. Jane Siberry was born in \textcolor{blue}{Toronto}. The castle in Toronto is \textcolor{red}{Peqin Castle}. So the answer is: Peqin Castle. \end{minipage}
+        & \begin{minipage}[t]{3.0cm} A Collection 1984–1989 was performed by \textcolor{blue}{Jane Siberry}. Jane Siberry was born in \textcolor{blue}{Toronto}. The castle in Toronto is the \textcolor{blue}{Casa Loma}. So the answer is: Casa Loma. \end{minipage} \\
+
+        \bottomrule
+
+    \end{tabular}
+    \caption{Example CoTs generated by GPT3 with different methods. Since NoR relies on parametric knowledge, it often makes a factual error in the first sentence derailing the full CoT. OneR can retrieve relevant information closest to the question and is less likely to make such errors early on, but it still makes errors later in the CoT. As \iconsys performs retrieval after each step, it is often able to prevent such errors in each step. More examples are in App.~\ref{sec:apdx-nor-oner-cot-examples}.}
+    \label{table:nor-oner-cot-examples}
+\end{table*}
+
+\section{Conclusions}
+
+Chain-of-thought prompting has significantly improved LLMs' ability to perform multi-step reasoning. We leveraged this ability to improve retrieval, and in turn, improve QA performance for complex knowledge-intensive open-domain tasks in a few-shot setting. We argued that one-step question-based retrieval is insufficient for such tasks, and introduced \iconsys, which uses interleaved CoT reasoning and retrieval steps that guide each other step-by-step. On four datasets, \iconsys significantly improves both retrieval and QA performance when compared to one-step retrieval, for both large and relatively smaller-scale LMs. Additionally, CoTs generated by \iconsys contain fewer factual errors.
+\section*{Limitations}
+\label{sec:limitations}
+
+\iconsys relies on the base LM to have a zero or few-shot CoT-generation ability.  While this is commonly available in large LMs (over 100B), it's not as common for small LMs (under 20B), which to some extent limits \iconsys adoptability. Given the recent surge of interest~\cite{ul2,reasoningdistillation1,reasoningdistillation2}, however, smaller LMs will likely increasingly acquire such ability, making IRCoT compatible with many more LMs.
+
+\iconsys also relies on the base LM to support long inputs as multiple retrieved paragraphs need to fit in the LM's input, in addition to at least a few demonstrations of QA or CoT with paragraphs. This was supported by the models we used as \texttt{code-davinci-002} (GPT3) allows 8K tokens and Flan-T5-* uses relative position embeddings making it as extensible as the GPU memory constraints allow. Future work can explore strategies to rerank and select the retrieved paragraphs instead of passing all of them to the LM to alleviate the need for the LM to support long input.
+
+The performance gain of \iconsys retriever and QA (over OneR and ZeroR baselines) come with an additional computational cost. This is because \iconsys makes a separate call to an (L)LM for each sentence of CoT. Future work can focus on, for instance, dynamically deciding when to retrieve more information and when to perform additional reasoning with the current information.
+
+Lastly, a portion of our experiments was carried out using a commercial LLM API from OpenAI (\texttt{code-davinci-002}). This model was deprecated by OpenAI after our submission making the reproduction of these experiments challenging despite our best efforts, just like any other work using such APIs. The trends discussed in the paper (\iconsys $>$ OneR $>$ NoR), we believe, would still hold. Additionally, all our experiments using Flan-T5-*, which exhibit similar trends as that of GPT3, will remain reproducible, thanks to its publicly available model weights.
+\section*{Ethical Considerations}
+
+Language models are known to hallucinate incorrect and potentially biased information. This is especially problematic when the questions asked to it are of a sensitive nature. While retrieval-augmented approaches such as ours are expected to alleviate this issue to some extent by grounding generation in external text, this by no means solves the problem of generating biased or offensive statements. Appropriate care should thus be taken if deploying such systems in user-facing applications.
+
+All the datasets and models used in this work are publicly available with permissible licenses. HotpotQA has CC BY-SA 4.0 license\footnote{\url{https://creativecommons.org/licenses/by-sa/4.0/}}, 2WikiMultihopQA has Apache-2.0 license\footnote{\url{https://www.apache.org/licenses/LICENSE-2.0}}, MuSiQUe and IIRC have CC BY 4.0 license\footnote{\url{https://creativecommons.org/licenses/by/4.0}}, and Flan-T5-* models have Apache-2.0 license.\section*{Acknowledgments}
+
+We thank the reviewers for their valuable feedback and suggestions. We also thank OpenAI for providing access to the \texttt{code-davinci-002} API. This material is based on research supported in part by the Air Force Research Laboratory (AFRL), DARPA, for the KAIROS program under agreement number FA8750-19-2-1003, in part by the National Science Foundation under the award IIS \#2007290, and in part by an award from the Stony Brook Trustees Faculty Awards Program.
+
+\end{document}

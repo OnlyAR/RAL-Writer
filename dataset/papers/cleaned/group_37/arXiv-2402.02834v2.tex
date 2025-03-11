@@ -1,0 +1,474 @@
+\title{Shortened LLaMA: Depth Pruning for Large Language Models\\with Comparison of Retraining Methods}
+
+\begin{document}
+
+\maketitle
+\begin{abstract}
+Structured pruning of modern large language models (LLMs) has emerged as a way of decreasing their high computational needs. Width pruning reduces the size of projection weight matrices (e.g., by removing attention heads) while maintaining the number of layers. Depth pruning, in contrast, removes entire layers or blocks, while keeping the size of the remaining weights unchanged. Most current research focuses on either width-only or a blend of width and depth pruning, with little comparative analysis between the two units (width~\textit{vs.}~depth) concerning their impact on LLM inference efficiency. In this work, we show that simple depth pruning can effectively compress LLMs while achieving comparable or superior performance to recent width pruning studies. Our pruning method boosts inference speeds, especially under memory-constrained conditions that require limited batch sizes for running LLMs, where width pruning is ineffective. In retraining pruned models for quality recovery, continued pretraining on a large corpus markedly outperforms LoRA-based tuning, particularly at severe pruning ratios. We hope this work can help build compact yet capable LLMs.
+\end{abstract}
+
+\section{Introduction}
+
+The advancement of large language models (LLMs)~\cite{touvron2023llama,openai2023gpt4,chowdhery2022palm,zhang2022opt,scao2022bloom} has brought significant improvements in language-based tasks, enabling versatile applications such as powerful chatbots~\cite{bard,chatgpt}. However, the deployment of LLMs is constrained by their intensive computational demands. To make LLMs more accessible and efficient for practical use, various optimization strategies have been actively studied over recent years (see~\citet{zhu2023survey,wan2023efficient} for survey). This work focuses on \textit{structured} pruning~\cite{fang2023depgraph,li2017pruning}, which removes groups of unnecessary weights and can facilitate hardware-agnostic acceleration. 
+
+\begin{figure}[t]
+  \centering
+    \includegraphics[width=\linewidth]{fig/teaser.pdf}
+        \vspace{-0.25in}
+  \caption{Inference of pruned Vicuna-7B models on an NVIDIA H100 GPU. \uline{Left}: Compared to width pruning (W\ding{34}) of FLAP~\cite{flap} and LLM-Pruner~\cite{llmpruner}, our depth pruning (D\ding{34}) achieves faster inference. \uline{Right}: Continued pretraining is crucial for restoring the quality of heavily pruned models with fewer than 3.7B parameters, enabling our method to surpass the baselines, including SLEB~\cite{song2024sleb}. See Table~\ref{table:cpt_results} for details.} \label{fig_teaser}
+  \vspace{-0.1in}
+\end{figure}
+
+\begin{figure*}[t]
+  \centering
+    \includegraphics[width=\linewidth]{fig/gpuutil_latency.pdf}
+        \vspace{-0.23in}
+  \caption{\uline{Top}: GPU compute utilization of (a)–(c) running LLaMA-7B on different NVIDIA GPUs and that of (d) Vicuna-13B. Increasing batch sizes can enhance GPU utilization and throughput, but pushing this too far triggers OOM issues. \uline{Bottom}: Latency results ($L$: target output length). Our depth pruning (blue lines) improves generation speeds over the original models (gray), while width pruning~\cite{llmpruner} is ineffective (green). The dotted lines show that pruned models can operate with larger batch sizes that cause OOM errors for the original model. The results are obtained with pruning ratios of 27\% for the 7B model and 29\% for the 13B model.
+  }
+  \vspace{-0.1in}
+  \label{fig_gpuutil}
+\end{figure*}
+
+In the context of compressing recent LLMs, LLM-Pruner~\cite{llmpruner} and FLAP~\cite{flap} narrow the network width by pruning coupled structures (e.g., attention heads and their associated weight connections) while maintaining the number of layers. Sheared-LLaMA~\cite{xia2023sheared} reduces not only the network width but also its depth by entirely removing some layers. Despite the existence of pruning methods~\cite{xia2022structured,kurtic2023ziplm,xia2023sheared} that incorporate both width and depth aspects, there remains a gap in detailed analysis comparing these two factors (width~\textit{vs.}~depth), specifically in relation to their impact on LLM inference efficiency.
+
+In addition to substantial model sizes, LLM inference is distinguished by an autoregressive decoding mechanism, which predicts tokens one by one based on the input and the previously generated tokens. This sequential generation process often exhibits a memory-bound nature, leading to considerable underutilization of GPU compute abilities~\cite{kwon2023efficient,jin2023s}. While expanding batch sizes is a standard way to enhance GPU utilization and throughput, this approach is unfeasible for low-specification GPUs with memory constraints. We aim to improve inference speeds of LLMs, especially under hardware limitations that demand small batch sizes, where we observe that width-only pruning is inadequate.
+
+Depth pruning is often regarded as being less effective in generation performance compared to width pruning, due to the elimination of bigger and coarse units. Contrary to the prevailing view, this study reveals that depth pruning is a compelling option for compressing LLMs, and it can achieve comparable or superior performance to prior studies depending on the retraining setups. Our contributions are summarized as follows:
+
+\begin{enumerate}[itemsep=0em]
+\setlength{\leftskip}{-0.22cm}
+\vspace{-0.025in}
+\item[$\circ$] In scenarios with limited batch sizes, our work demonstrates that width pruning is difficult to attain actual speedups in LLM's autoregressive generation. This aspect has been underexplored in previous works.
+
+\vspace{-0.02in}
+\item[$\circ$] We introduce a simple yet effective method for depth pruning of LLMs by exploring various design factors. Our compact LLMs, obtained by excluding several Transformer blocks, achieve actual speedups. 
+
+\vspace{-0.02in}
+\item[$\circ$] We show that under moderate pruning ratios, our depth pruning method with LoRA retraining can rival recent width pruning studies for LLMs in zero-shot capabilities. For more aggressive pruning (over 40\% removal), intensive retraining with a full-parameter update is crucial for recovering performance.
+
+\setlength{\leftskip}{0pt}
+\end{enumerate}
+
+\begin{figure}[t]
+  \centering
+    \includegraphics[width=\linewidth]{fig/pruning_unit.pdf}
+        \vspace{-0.25in}
+    \caption{Comparison of pruning units. Width pruning reduces the size of projection weight matrices. Depth pruning removes Transformer blocks, or individual MHA and FFN modules.}\label{fig_compare_depth_width_prune}  
+  \vspace{-0.1in}
+\end{figure}
+
+\vspace{-0.2in}
+\section{Problem: Small-batch LLM Inference}
+
+Most LLMs are autoregressive models that sequentially produce tokens, based on the initial prompt and the sequence of tokens previously generated. The token-by-token generation process often involves multiplying large matrices (weights) with smaller matrices or vectors (activations). The primary bottleneck for inference efficiency is memory access operations rather than the speed of mathematical computations (referred to as `memory-bound'), leading to suboptimal use of GPU computing power~\cite{kwon2023efficient}. Though increasing batch sizes is a standard way to enhance GPU computation and throughput, it poses a risk of out-of-memory (OOM) errors (see Figure~\ref{fig_gpuutil})\footnote{Using the HF-Transformers library~\cite{wolf-etal-2020-transformers}, we ran the LLMs with 12 input tokens for 20 batched runs after 10 warm-ups. Top: Peak GPU compute utilization~\cite{nvidia_smi_query}. Bottom: Mean latency over 20 runs.} unless advanced system-level optimizations~\cite{kwon2023efficient,sheng2023flexgen} are applied.
+
+In this study, our focus is on accelerating the inference of LLMs under small-batch conditions caused by hardware restrictions. Such situations are relevant for deploying LLMs on memory-constrained local devices, which can enhance user experience and data privacy protection. We show that (i) reducing weight shapes via width pruning does not improve generation speeds and can even degrade it when the resulting weight dimensions are unsuitable for GPU capabilities, and (ii) notable speed gains are only achievable through depth pruning that excludes a number of modules entirely.
+
+\section{Method: Block Pruning} \label{method}
+
+An LLM is a stack of multiple Transformer blocks \cite{transformer}, each of which contains a pair of multi-head attention (MHA) and feed-forward network (FFN) modules (see Figure~\ref{fig_compare_depth_width_prune}). We choose this Transformer block as the prunable unit to prioritize reducing inference latency. Our approach is simple: after identifying unimportant blocks with straightforward metrics, we perform simple one-shot pruning.
+
+\subsection{Evaluation of Block-level Importance} \label{subsect_crit}
+We consider the following criteria to evaluate the significance of each block, ultimately selecting the Taylor+ and PPL metrics (see Table~\ref{table:criterion}). Specifically, the linear weight matrix is denoted as $\mathbf{W}^{k,n} = \left[W_{i,j}^{k,n}\right]$ with a size of $(d_{\mathrm{out}}, d_{\mathrm{in}})$, where $k$ represents the type of operation (e.g., a query projection in MHA or an up projection in FFN) within the $n$-th Transformer block. The weight importance scores are calculated at the output neuron level~\cite{wanda}, followed by summing\footnote{In our exploration of various aggregation strategies (i.e., sum, mean, product, and max operations), summing the scores was effective at different pruning ratios.} these scores to assess the block-level importance.
+ 
+\paragraph{Magnitude (Mag).} This metric~\cite{li2016pruning} is a fundamental baseline in the pruning literature, assuming that weights with smaller norms are less informative. For the block-level analysis, we compute $I_{\mathrm{Magnitude}}^n = \sum_k \sum_i \sum_j \left| W_{i,j}^{k,n} \right|$.
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=0.9\linewidth]{fig/block_importance.pdf}
+\vspace{-0.05in}
+\caption{Estimated importance of each Transformer block on the calibration set. We prune blocks that have lower (better) PPL scores, as their removal causes less disruption to the output.}\label{fig_ppl_crit}
+\vspace{-0.1in}
+\end{figure}
+
+\paragraph{Taylor.} Assessing the error caused by the removal of a weight parameter helps in identifying its significance. For a given calibration dataset $D$, this can be expressed as the alteration in the training loss $\mathcal{L}$~\cite{lecun1989optimal,molchanov2019importance}: $\left| \mathcal{L}(W_{i,j}^{k,n}; D) - \mathcal{L}(W_{i,j}^{k,n} = 0; D) \right| \approx \left| \frac{\partial \mathcal{L}(D)}{\partial W_{i,j}^{k,n}} W_{i,j}^{k,n} \right|$, where we omit the second-order derivatives by following~\citet{llmpruner}. We define the block score as $I_{\mathrm{Taylor}}^n = \sum_k \sum_i  \sum_j \left| \frac{\partial \mathcal{L}(D)}{\partial W_{i,j}^{k,n}} W_{i,j}^{k,n} \right|$.
+
+\paragraph{Mag+ and Taylor+.} Upon using the aforementioned metrics, the early blocks are labeled as unimportant, but their removal leads to severe performance drops. Similar to a popular heuristic~\cite{gale2019state,lee2021layeradaptive}, we preserve the first four and the last two blocks~\cite{llmpruner} by excluding them from the pruning candidates.
+
+\paragraph{Perplexity (PPL).} Redundant blocks contribute less to the model's outputs, and their removal leads to smaller degradation in PPL, a commonly used metric for language modeling tasks. In this context, we eliminate each block from the source model and monitor its influence on PPL using the calibration set $D$: $I_{\mathrm{PPL}}^n = \exp \left\{ -\frac{1}{SL} \sum_{s} \sum_{l} \log p_{\theta^{n}}(x_{l}^{(s)} | x_{<l}^{(s)}) \right\}$, where $\theta^{n}$ denotes the model without its $n$-th block, and $s = 1, \ldots, S$ and $l = 1, \ldots, L$ are the indices for sequences and tokens in $D$. The PPL can be derived from the next-token prediction loss and requires only forward-pass computation. As shown in Figure~\ref{fig_ppl_crit}, several blocks are removable with only a slight effect on the PPL metric. Pruning initial and final blocks significantly degrades the performance, which necessitates keeping them unpruned. 
+
+\subsection{One-shot Pruning}
+After sorting the block-level importance scores, we prune the less crucial blocks in a single step. Since every block has an identical configuration and it is easy to calculate the number of parameters for one block, we readily decide how many blocks should be removed to meet the target model size.
+
+Iterative pruning with intermediate updates of block importance can be applied as in SLEB~\cite{song2024sleb}. However, it requires much longer computing time than one-shot pruning as the number of blocks increases. Furthermore, we empirically observed that retraining strategies matter more than whether the pruning scheme is iterative or one-shot, especially under severe pruning ratios.
+
+\subsection{Retraining for Performance Restoration}
+Some recent studies suggest that structured pruning of LLMs can be retraining-free~\cite{song2024sleb,flap} or feasible with low retraining budgets~\cite{llmpruner}. However, the types of retraining over different pruning rates have been underexplored. Here, we compare several retraining strategies and their implications for regaining the quality of pruned models.
+
+\paragraph{Low-Rank Adaptation (LoRA).} LoRA~\cite{lora} enables the efficient refinement of LLMs with less computation. \citet{llmpruner} has applied LoRA to enhance moderately width-pruned models (e.g., with 20\% of units removed) on an instruction tuning dataset. In this work, we show that LoRA can also recover the ability of depth-pruned models; however, it does not perform well for extensive compression rates (e.g., with over 50\% removal) in either width or depth pruning.
+
+\paragraph{Continued Pretraining (CPT).} We leverage CPT, which involves updating all parameters, on a large-scale pretraining corpus. This powerful retraining is critical for severely depth-pruned models, extending its proven effectiveness for width- or hybrid-pruned models~\cite{xia2023sheared}. Though requiring greater resources than LoRA, CPT on pruned networks significantly accelerates learning and yields superior results compared to training the same architectures from random initialization.
+
+\paragraph{CPT$\Rightarrow$LoRA} Once CPT on the pretraining data is completed, LoRA with the instruction set is applied to observe whether further performance improvement can be achieved.
+
+\begin{table}[t]
+\centering
+\begin{adjustbox}{max width=\columnwidth}
+\begin{threeparttable}
+\begin{tabular}{cc|c|c|cc}
+\specialrule{.2em}{.1em}{.1em} 
+
+\multicolumn{2}{c|}{Model}         & \#Param & \#Block\textsuperscript{$\ddagger$} & \#Head\textsuperscript{$\ddagger$}    & FFN-D\textsuperscript{$\ddagger$}          \\ \hline
+\multicolumn{2}{c|}{Original 7B}   & 6.7B    & 32      & 32        & 11008          \\ \hline
+\multirow{4}{*}{35\%\textsuperscript{$\dagger$}} & Wanda-sp   & 4.5B    & 32      & 21        & 7156           \\
+                      & FLAP       & 4.5B    & 32      & 23.0{\scriptsize±8.8}  & 6781.1{\scriptsize±2440.6}  \\
+                      & LLM-Pruner & 4.4B    & 32      & 18        & 6054           \\ \cline{2-6} 
+                      & Ours       & 4.5B    & 21      & 32        & 11008          \\ 
+                      
+ 
+\specialrule{.2em}{.1em}{.1em}
+\specialrule{.2em}{.1em}{.1em}
+
+\multicolumn{2}{c|}{Original 13B}  & 13.0B   & 40      & 40        & 13824          \\ \hline
+\multirow{4}{*}{37\%\textsuperscript{$\dagger$}} & Wanda-sp   & 8.4B    & 40      & 26        & 8710           \\
+                      & FLAP       & 8.3B    & 40      & 27.5{\scriptsize±11.3} & 8326.6{\scriptsize±2874.9}  \\
+                      & LLM-Pruner & 8.2B    & 40      & 22        & 7603           \\ \cline{2-6} 
+                      & Ours       & 8.3B    & 25      & 40        & 13824          \\ 
+                      
+\specialrule{.2em}{.1em}{.1em} 
+
+\end{tabular}
+\begin{tablenotes}[para,flushleft]
+\footnotesize 
+\textsuperscript{$\dagger$}Reduction ratio for the number of parameters.
+\newline
+\textsuperscript{$\ddagger$}\#Block: \#Transformer blocks; \#Head: \#attention heads of MHA; FFN-D: intermediate size of FFN. 
+\end{tablenotes}
+\end{threeparttable}
+\end{adjustbox}
+\vspace{-0.05in}
+\caption{Examples of pruned architectures on 7B-parameter (top) and 13B-parameter (bottom) models. While Wanda-sp~\cite{wanda,flap}, FLAP~\cite{flap}, and LLM-Pruner~\cite{llmpruner} reduce the network width, our method reduces the network depth. See Table~\ref{supple_table:arch} for the details.}
+\label{table:arch_short_ver}
+
+\vspace{-0.1in}
+\end{table}
+\begin{table*}[t]
+\centering
+\begin{adjustbox}{max width=0.92\linewidth}
+\begin{threeparttable}
+\begin{tabular}{ccc|ccc|cc|cc}
+\specialrule{.2em}{.1em}{.1em} 
+
+\multicolumn{3}{c|}{}                                                                                                                              & \multicolumn{3}{c|}{Zero-shot Performance}                                                                                                                                     & \multicolumn{2}{c|}{H100 80GB\textsuperscript{$\ddagger$}}                                                                                                                                & \multicolumn{2}{c}{RTX3090 24GB\textsuperscript{$\ddagger$}}                                                                                                                              \\ \cline{4-10} 
+\multicolumn{3}{c|}{}                                                                                                                              & \multicolumn{2}{c|}{PPL↓}                                                                          &                                                                           &                                                                          &                                                                                    &                                                                          &                                                                                    \\
+\multicolumn{3}{c|}{\multirow{-3}{*}{\#Param \& Method}}                                                                                                       & WikiText2                             & \multicolumn{1}{c|}{PTB}                                   & \multirow{-2}{*}{\begin{tabular}[c]{@{}c@{}}Ave Acc↑\\ (\%)\textsuperscript{$\dagger$}
+\end{tabular}} & \multirow{-2}{*}{\begin{tabular}[c]{@{}c@{}}Latency↓\\ (s)\end{tabular}} & \multirow{-2}{*}{\begin{tabular}[c]{@{}c@{}}Throughput↑\\ (tokens/s)\end{tabular}} & \multirow{-2}{*}{\begin{tabular}[c]{@{}c@{}}Latency↓\\ (s)\end{tabular}} & \multirow{-2}{*}{\begin{tabular}[c]{@{}c@{}}Throughput↑\\ (tokens/s)\end{tabular}} \\ \hline
+\multicolumn{3}{c|}{LLaMA-7B: 6.7B (Original)}                                                                                                               & 12.6                                  & \multicolumn{1}{c|}{22.1}                                  & 66.3                                                                      & 2.4                                                                      & 53.7                                                                               & 5.1                                                                      & 25.0                                                                               \\ \hline
+                                                                                 &                         & Wanda-sp                              & 21.4                                  & \multicolumn{1}{c|}{47.2}                                  & 51.8                                                                      & 3.1                                                                      & 41.7                                                                               & 7.6                                                                      & 16.7                                                                               \\
+                                                                                 &                         & FLAP                                  & \textbf{17.0}                         & \multicolumn{1}{c|}{\textbf{30.1}}                         & 59.5                                                                      & 3.2                                                                      & 40.5                                                                               & 7.7                                                                      & 16.5                                                                               \\
+                                                                                 & \multirow{-3}{*}{W\ding{34}} & LLM-Pruner                            & 17.6                                  & \multicolumn{1}{c|}{30.4}                                  & 61.8                                                                      & 3.0                                                                      & 43.2                                                                               & 6.0                                                                      & 21.4                                                                               \\ \cline{2-10} 
+                                                                                 &                         & SLEB                                  & 18.5                                  & \multicolumn{1}{c|}{31.6}                                  & 57.6                                                                      & \textbf{1.9}                                                             & \textbf{66.0}                                                                      & \textbf{4.5}                                                             & \textbf{28.4}                                                                      \\
+                                                                                 &                         & \cellcolor[HTML]{ECF4FF}Ours: Taylor+ & \cellcolor[HTML]{ECF4FF}20.2          & \multicolumn{1}{c|}{\cellcolor[HTML]{ECF4FF}32.3}          & \cellcolor[HTML]{ECF4FF}\textbf{63.5}                                     & \cellcolor[HTML]{ECF4FF}\textbf{1.9}                                     & \cellcolor[HTML]{ECF4FF}\textbf{66.0}                                              & \cellcolor[HTML]{ECF4FF}\textbf{4.5}                                     & \cellcolor[HTML]{ECF4FF}\textbf{28.4}                                              \\
+\multirow{-6}{*}{\begin{tabular}[c]{@{}c@{}}5.5B\\ (20\%\\  Pruned)\end{tabular}} & \multirow{-3}{*}{D\ding{34}} & \cellcolor[HTML]{ECF4FF}Ours: PPL     & \cellcolor[HTML]{ECF4FF}17.7          & \multicolumn{1}{c|}{\cellcolor[HTML]{ECF4FF}30.7}          & \cellcolor[HTML]{ECF4FF}61.9                                              & \cellcolor[HTML]{ECF4FF}\textbf{1.9}                                     & \cellcolor[HTML]{ECF4FF}\textbf{66.0}                                              & \cellcolor[HTML]{ECF4FF}\textbf{4.5}                                     & \cellcolor[HTML]{ECF4FF}\textbf{28.4}                                              \\ \hline
+\hline
+                                                                                 &                         & Wanda-sp                              & 133.6                                 & \multicolumn{1}{c|}{210.1}                                 & 36.9                                                                      & 3.1                                                                      & 41.6                                                                               & 8.0                                                                      & 16.1                                                                               \\
+                                                                                 &                         & FLAP                                  & 25.6                                  & \multicolumn{1}{c|}{44.4}                                  & 52.7                                                                      & 3.2                                                                      & 40.5                                                                               & 8.1                                                                      & 15.8                                                                               \\
+                                                                                 & \multirow{-3}{*}{W\ding{34}} & LLM-Pruner                            & 24.2                                  & \multicolumn{1}{c|}{40.7}                                  & \textbf{55.5}                                                             & 2.9                                                                      & 44.4                                                                               & 6.1                                                                      & 21.1                                                                               \\ \cline{2-10} 
+                                                                                 &                         & SLEB                                  & 34.2                                  & \multicolumn{1}{c|}{49.8}                                  & 50.1                                                                      & \textbf{1.6}                                                             & \textbf{80.1}                                                                      & \textbf{3.4}                                                             & \textbf{37.8}                                                                      \\
+                                                                                 &                         & \cellcolor[HTML]{ECF4FF}Ours: Taylor+ & \cellcolor[HTML]{ECF4FF}33.2          & \multicolumn{1}{c|}{\cellcolor[HTML]{ECF4FF}58.5}          & \cellcolor[HTML]{ECF4FF}55.4                                              & \cellcolor[HTML]{ECF4FF}\textbf{1.6}                                     & \cellcolor[HTML]{ECF4FF}\textbf{80.1}                                              & \cellcolor[HTML]{ECF4FF}\textbf{3.4}                                     & \cellcolor[HTML]{ECF4FF}\textbf{37.8}                                              \\
+\multirow{-6}{*}{\begin{tabular}[c]{@{}c@{}}4.5B\\ (35\%\\Pruned)\end{tabular}} & \multirow{-3}{*}{D\ding{34}} & \cellcolor[HTML]{ECF4FF}Ours: PPL     & \cellcolor[HTML]{ECF4FF}\textbf{23.1} & \multicolumn{1}{c|}{\cellcolor[HTML]{ECF4FF}\textbf{38.8}} & \cellcolor[HTML]{ECF4FF}55.2                                              & \cellcolor[HTML]{ECF4FF}\textbf{1.6}                                     & \cellcolor[HTML]{ECF4FF}\textbf{80.1}                                              & \cellcolor[HTML]{ECF4FF}\textbf{3.4}                                     & \cellcolor[HTML]{ECF4FF}\textbf{37.8}                                              \\ 
+
+\specialrule{.2em}{.1em}{.1em} 
+
+\specialrule{.2em}{.1em}{.1em} 
+
+\multicolumn{3}{c|}{}                                                                                                                               & \multicolumn{3}{c|}{Zero-shot Performance}                                                                                                                                     & \multicolumn{2}{c|}{H100 80GB}                                                                                                                                & \multicolumn{2}{c}{RTX3090 24GB}                                                                                                                              \\ \cline{4-10} 
+\multicolumn{3}{c|}{}                                                                                                                               & \multicolumn{2}{c|}{PPL↓}                                                                          &                                                                           &                                                                          &                                                                                    &                                                                          &                                                                                    \\
+\multicolumn{3}{c|}{\multirow{-3}{*}{\#Param \& Method}}                                                                                                        & WikiText2                             & \multicolumn{1}{c|}{PTB}                                   & \multirow{-2}{*}{\begin{tabular}[c]{@{}c@{}}Ave Acc↑\\ (\%)\textsuperscript{$\dagger$}
+\end{tabular}} & \multirow{-2}{*}{\begin{tabular}[c]{@{}c@{}}Latency↓\\ (s)\end{tabular}} & \multirow{-2}{*}{\begin{tabular}[c]{@{}c@{}}Throughput↑\\ (tokens/s)\end{tabular}} & \multirow{-2}{*}{\begin{tabular}[c]{@{}c@{}}Latency↓\\ (s)\end{tabular}} & \multirow{-2}{*}{\begin{tabular}[c]{@{}c@{}}Throughput↑\\ (tokens/s)\end{tabular}} \\ \hline
+\multicolumn{3}{c|}{Vicuna-13B: 13.0B (Original)}                                                                                                        & 14.7                                  & \multicolumn{1}{c|}{51.6}                                  & 68.3                                                                      & 2.8                                                                      & 45.5                                                                               & OOM                                                                      & OOM                                                                                \\ \hline
+                                                                                  &                         & Wanda-sp                              & 19.0                                  & \multicolumn{1}{c|}{71.8}                                  & 63.6                                                                      & 3.8                                                                      & 34.1                                                                               & 9.8                                                                      & 12.9                                                                               \\
+                                                                                  &                         & FLAP                                  & 18.8                         & \multicolumn{1}{c|}{65.3}                         & 63.3                                                                      & 3.9                                                                      & 32.6                                                                               & 10.2                                                                     & 12.6                                                                               \\
+                                                                                  & \multirow{-3}{*}{W\ding{34}} & LLM-Pruner                            & \textbf{16.0}                         & \multicolumn{1}{c|}{57.0}                                  & 65.3                                                                      & 3.8                                                                      & 34.0                                                                               & 7.5                                                                      & 17.3                                                                               \\ \cline{2-10} 
+                                                                                  &                         & SLEB                                  & 20.5                                  & \multicolumn{1}{c|}{68.7}                                  & 60.4                                                                      & \textbf{2.3}                                                             & \textbf{55.7}                                                                      & \textbf{5.4}                                                             & \textbf{23.9}                                                                      \\
+                                                                                  &                         & \cellcolor[HTML]{ECF4FF}Ours: Taylor+ & \cellcolor[HTML]{ECF4FF}18.1          & \multicolumn{1}{c|}{\cellcolor[HTML]{ECF4FF}61.6}          & \cellcolor[HTML]{ECF4FF}\textbf{66.7}                                     & \cellcolor[HTML]{ECF4FF}\textbf{2.3}                                     & \cellcolor[HTML]{ECF4FF}\textbf{55.7}                                              & \cellcolor[HTML]{ECF4FF}\textbf{5.4}                                     & \cellcolor[HTML]{ECF4FF}\textbf{23.9}                                              \\
+\multirow{-6}{*}{\begin{tabular}[c]{@{}c@{}}10.5B\\ (21\%\\Pruned)\end{tabular}} & \multirow{-3}{*}{D\ding{34}} & \cellcolor[HTML]{ECF4FF}Ours: PPL     & \cellcolor[HTML]{ECF4FF}16.1          & \multicolumn{1}{c|}{\cellcolor[HTML]{ECF4FF}\textbf{56.5}} & \cellcolor[HTML]{ECF4FF}64.9                                              & \cellcolor[HTML]{ECF4FF}\textbf{2.3}                                     & \cellcolor[HTML]{ECF4FF}\textbf{55.7}                                              & \cellcolor[HTML]{ECF4FF}\textbf{5.4}                                     & \cellcolor[HTML]{ECF4FF}\textbf{23.9}                                              \\ \hline
+\hline
+                                                                                  &                         & Wanda-sp                              & 36.6                                  & \multicolumn{1}{c|}{123.5}                                 & 52.7                                                                      & 3.8                                                                      & 33.8                                                                               & 10.5                                                                     & 12.6                                                                               \\
+                                                                                  &                         & FLAP                                  & 28.7                                  & \multicolumn{1}{c|}{96.2}                                  & 58.3                                                                      & 3.9                                                                      & 32.9                                                                               & 9.7                                                                      & 13.2                                                                               \\
+                                                                                  & \multirow{-3}{*}{W\ding{34}} & LLM-Pruner                            & 22.2                                  & \multicolumn{1}{c|}{74.0}                                  & 59.7                                                            & 3.6                                                                      & 35.6                                                                               & 7.1                                                                      & 18.0                                                                               \\ \cline{2-10} 
+                                                                                  &                         & SLEB                                  & 41.6                                  & \multicolumn{1}{c|}{116.5}                                 & 49.4                                                                      & \textbf{1.8}                                                             & \textbf{69.7}                                                                      & \textbf{4.0}                                                             & \textbf{31.7}                                                                      \\
+                                                                                  &                         & \cellcolor[HTML]{ECF4FF}Ours: Taylor+ & \cellcolor[HTML]{ECF4FF}34.2          & \multicolumn{1}{c|}{\cellcolor[HTML]{ECF4FF}90.4}          & \cellcolor[HTML]{ECF4FF}\textbf{61.4}                                     & \cellcolor[HTML]{ECF4FF}\textbf{1.8}                                     & \cellcolor[HTML]{ECF4FF}\textbf{69.7}                                              & \cellcolor[HTML]{ECF4FF}\textbf{4.0}                                     & \cellcolor[HTML]{ECF4FF}\textbf{31.7}                                              \\
+\multirow{-6}{*}{\begin{tabular}[c]{@{}c@{}}8.3B\\ (37\%\\Pruned)\end{tabular}}  & \multirow{-3}{*}{D\ding{34}} & \cellcolor[HTML]{ECF4FF}Ours: PPL     & \cellcolor[HTML]{ECF4FF}\textbf{22.1} & \multicolumn{1}{c|}{\cellcolor[HTML]{ECF4FF}\textbf{73.6}} & \cellcolor[HTML]{ECF4FF}59.1                                              & \cellcolor[HTML]{ECF4FF}\textbf{1.8}                                     & \cellcolor[HTML]{ECF4FF}\textbf{69.7}                                              & \cellcolor[HTML]{ECF4FF}\textbf{4.0}                                     & \cellcolor[HTML]{ECF4FF}\textbf{31.7}                                              \\ 
+\specialrule{.2em}{.1em}{.1em} 
+\end{tabular}
+\begin{tablenotes}[para,flushleft]
+\footnotesize
+\textsuperscript{$\dagger$}Average accuracy on seven commonsense reasoning tasks. 
+\newline
+\textsuperscript{$\ddagger$}Measured with 12 input tokens, 128 output tokens, and a batch size of 1 on a single GPU.
+\end{tablenotes}
+\end{threeparttable}
+\end{adjustbox}
+\vspace{-0.05in}
+
+\caption{Results with moderate-level pruning on LLaMA-7B (top) and Vicuna-13B-v1.3 (bottom). Our depth pruning (D\ding{34}) with LoRA retraining achieves similar performance to width pruning (W\ding{34}) methods~\cite{wanda,flap,llmpruner} and outperforms the recent SLEB~\cite{song2024sleb}, while effectively accelerating LLM inference. See Table~\ref{supple_lora_results} for detailed results.} \label{table:lora_results}
+\vspace{-0.1in}
+\end{table*}
+\begin{table*}[t]
+\centering
+
+\begin{adjustbox}{max width=0.99\linewidth}
+\begin{threeparttable}
+
+\begin{tabular}{cc|cccc|cccc|cccc}
+\specialrule{.2em}{.1em}{.1em} 
+\multicolumn{2}{c|}{Metric}                                                          & \multicolumn{4}{c|}{PPL↓ on WikiText2}                                                                                                                        & \multicolumn{4}{c|}{Ave Acc↑ (\%)\textsuperscript{$\dagger$}}                                                                                                                            & \multicolumn{4}{c}{Throughput↑ (tokens/s)\textsuperscript{$\ddagger$}}                                                                                                                                                                                                                                                                                                                                                                                                 \\ \hline
+\multicolumn{2}{c|}{\#Param after Pruning\textsuperscript{$\star$}}                                           & 5.5B                                  & 3.7B                                  & 2.7B                                  & 1.5B                                  & 5.5B                                  & 3.7B                                  & 2.7B                                  & 1.5B                                  & 5.5B                                                                                                     & 3.7B                                                                                                     & 2.7B                                                                                                      & 1.5B                                                                                                      \\ \hline
+\multicolumn{1}{l}{}                        & Wanda-sp                               & 24.4                                  & 364.5                                 & 1370.1                                & 8969.3                                & 58.5                                  & 36.7                                  & 37.0                                  & 35.6                                  & 41.7                                                                                                     & 40.5                                                                                                     & 40.7                                                                                                      & 43.5                                                                                                      \\
+\multicolumn{1}{l}{}                        & FLAP                                   & 22.0                                  & 63.1                                  & 589.3                                 & 28727.9                               & 61.4                                  & 47.3                                  & 36.7                                  & 34.5                                  & 40.5                                                                                                     & 41.2                                                                                                     & 41.2                                                                                                      & 42.3                                                                                                      \\
+\multicolumn{1}{l}{\multirow{-3}{*}{W\ding{34}}} & LLM-Pruner                             & 19.6                                  & 38.8                                  & 66.4                                  & 202.9                                 & 60.1                                  & 50.1                                  & 44.3                                  & 38.4                                  & 43.2                                                                                                     & 43.4                                                                                                     & 43.9                                                                                                      & 44.8                                                                                                      \\ \hline
+                                            & SLEB                                   & 25.1                                  & 110.4                                 & 731.5                                 & 18730.8                               & 55.6                                  & 40.2                                  & 39.1                                  & 37.4                                  & \textbf{66.0}                                                                                            & \textbf{84.0}                                                                                            & \textbf{107.4}                                                                                            & \textbf{182.5}                                                                                            \\
+                                            & \cellcolor[HTML]{ECF4FF}Ours, LoRA     & \cellcolor[HTML]{ECF4FF}18.8          & \cellcolor[HTML]{ECF4FF}37.0          & \cellcolor[HTML]{ECF4FF}68.9          & \cellcolor[HTML]{ECF4FF}1002.2        & \cellcolor[HTML]{ECF4FF}60.7          & \cellcolor[HTML]{ECF4FF}47.0          & \cellcolor[HTML]{ECF4FF}40.1          & \cellcolor[HTML]{ECF4FF}37.1          & \cellcolor[HTML]{ECF4FF}                                                                                 & \cellcolor[HTML]{ECF4FF}                                                                                 & \cellcolor[HTML]{ECF4FF}                                                                                  & \cellcolor[HTML]{ECF4FF}                                                                                  \\
+                                            & \cellcolor[HTML]{ECF4FF}Ours, CPT      & \cellcolor[HTML]{ECF4FF}\textbf{14.3} & \cellcolor[HTML]{ECF4FF}\textbf{16.0} & \cellcolor[HTML]{ECF4FF}\textbf{17.1} & \cellcolor[HTML]{ECF4FF}\textbf{20.5} & \cellcolor[HTML]{ECF4FF}61.5          & \cellcolor[HTML]{ECF4FF}57.1          & \cellcolor[HTML]{ECF4FF}\textbf{55.0} & \cellcolor[HTML]{ECF4FF}\textbf{49.2} & \cellcolor[HTML]{ECF4FF}                                                                                 & \cellcolor[HTML]{ECF4FF}                                                                                 & \cellcolor[HTML]{ECF4FF}                                                                                  & \cellcolor[HTML]{ECF4FF}                                                                                  \\
+\multirow{-4}{*}{D\ding{34}}                     & \cellcolor[HTML]{ECF4FF}Ours, CPT$\Rightarrow$LoRA & \cellcolor[HTML]{ECF4FF}14.8          & \cellcolor[HTML]{ECF4FF}16.5          & \cellcolor[HTML]{ECF4FF}17.8          & \cellcolor[HTML]{ECF4FF}21.1          & \cellcolor[HTML]{ECF4FF}\textbf{63.1} & \cellcolor[HTML]{ECF4FF}\textbf{57.4} & \cellcolor[HTML]{ECF4FF}\textbf{55.0} & \cellcolor[HTML]{ECF4FF}49.0          & \multirow{-3}{*}{\cellcolor[HTML]{ECF4FF}\begin{tabular}[c]{@{}c@{}}\textbf{66.0}\\ \normalsize{(1.2×)}\end{tabular}} & \multirow{-3}{*}{\cellcolor[HTML]{ECF4FF}\begin{tabular}[c]{@{}c@{}}\textbf{84.0}\\ \normalsize{(1.6×)}\end{tabular}} & \multirow{-3}{*}{\cellcolor[HTML]{ECF4FF}\begin{tabular}[c]{@{}c@{}}\textbf{107.4}\\ \normalsize{(2.0×)}\end{tabular}} & \multirow{-3}{*}{\cellcolor[HTML]{ECF4FF}\begin{tabular}[c]{@{}c@{}}\textbf{182.5}\\ \normalsize{(3.4×)}\end{tabular}} \\ \hline
+\multicolumn{2}{c|}{Vicuna-7B: 6.7B (Original)}                                                 & \multicolumn{4}{c|}{17.1}                                                                                                                                     & \multicolumn{4}{c|}{65.9}                                                                                                                                     & \multicolumn{4}{c}{53.7}                                                                                                                                                                                                                                                                                                                                                                                                                    \\ 
+
+\specialrule{.2em}{.1em}{.1em} 
+\end{tabular}
+
+\begin{tablenotes}[para,flushleft]
+\footnotesize
+\textsuperscript{$\star$}The pruning ratios of 20\%, 45\%, 60\%, and 80\% lead to 5.5B, 3.7B, 2.7B, and 1.5B parameters, respectively. The PPL criterion is used to obtain our models.
+\newline
+\textsuperscript{$\dagger$}Average accuracy on seven commonsense reasoning tasks. 
+\newline
+\textsuperscript{$\ddagger$}Measured with 12 input tokens, 128 output tokens, and a batch size of 1 on an NVIDIA H100 GPU.
+\end{tablenotes}
+\end{threeparttable}
+\end{adjustbox}
+
+\vspace{-0.05in}
+\caption{Effectiveness of CPT under high compression rates on Vicuna-7B-v1.3. CPT is essential to regain the performance of extensively pruned models (e.g., fewer than 3.7B parameters), whereas retraining-free~\cite{flap,song2024sleb} and LoRA-based~\cite{llmpruner} approaches yield unsatisfactory results.} \label{table:cpt_results}
+\end{table*}
+\begin{table*}[ht]
+\centering
+
+\begin{adjustbox}{max width=0.98\linewidth}
+\begin{threeparttable}
+\begin{tabular}{p{1.8cm}|p{14.8cm}}
+
+\specialrule{.2em}{.1em}{.1em} 
+Model       & Generated Text 
+\\ \hline
+\small{Vicuna-7B}    & 
+\footnotesize \uline{AI can create a logo in seconds}! You choose the design elements you like best from pre-made templates, and then the AI generates a unique logo design just for you. This is a great way to get a professional-looking logo without hiring ...
+\\ \hline
+\small{Wanda-sp}    & 
+\footnotesize \uline{AI can create a logo in seconds} now. Inso Ison Im Ison Im I I was able can do do do now do now do now Innowhere you you you you you you you you you you you you you you you you you you you you you you you you you you you ...
+\\ \hline
+ \small{FLAP}        & 
+\footnotesize \uline{AI can create a logo in seconds} The V Just ing A A A A A A A A A, A A A A A S Just a. : S . No An , A A the A The The... The The... A, A A A A. A A A This A The Just A A A A The A A The A A A. and The A All T A A.. A the ...
+\\ \hline
+ \small{LLM-Pruner}  & 
+\footnotesize \uline{AI can create a logo in seconds}: 10 seconds! I've created a logo in minutes using an AI. It has only one image in front for 8 minutes. 4 hours = 65.000 + 12 hours Words: English
+Speech: 100 words in 5 minutes 1. 60 hours 2. 492 ...
+\\ \hline
+\small{SLEB} & 
+\footnotesize \uline{AI can create a logo in seconds} while.  :). I have put. I believe it . →.]. Here least →… </<erus known). See →www.giftoings . </<.next]; info. I’ve don-> .…erutex“
+Here for. to “Itin.g for the next….. .0.>1260070uro.`s- ...
+\\ \hline
+\small{Ours, CPT}   & 
+\footnotesize \uline{AI can create a logo in seconds}. Even if you don't have a designer who knows the best layouts to use or what colors work best together, AI is already hard at work creating the perfect combination to your artwork.
+AI is also capable of ...
+\\ 
+
+\specialrule{.2em}{.1em}{.1em}
+\end{tabular}
+\end{threeparttable}
+\end{adjustbox}
+
+\vspace{-0.05in}
+\caption{Generation examples from the original Vicuna-7B and the 60\%-pruned models with 2.7B parameters.}\label{gen_output_2.7b}
+\end{table*}
+
+\section{Experimental Setup}
+
+\paragraph{Source Model.} Our testbed includes LLaMA-7B~\cite{touvron2023llama} and Vicuna-\{7B, 13B\}-v1.3~\cite{vicuna}, which are famous LLMs.
+
+\paragraph{Baseline.} LLM-Pruner~\cite{llmpruner}, FLAP~\cite{flap}, and Wanda-sp (i.e., a structured variant~\cite{flap} of Wanda~\cite{wanda}) serve as the baselines for width pruning. Table~\ref{table:arch_short_ver} shows the pruned architectures under similar numbers of parameters. We also examine SLEB~\cite{song2024sleb}, a retraining-free block pruning method for LLMs, which has been concurrently introduced with our study. Section~\ref{sec:supple_baseline} describes the baselines in detail.
+
+\paragraph{Data.} Following~\citet{llmpruner}, we randomly select 10 samples from BookCorpus~\cite{Zhu_2015_ICCV} to compute block-level significance during the pruning stage. We also use this calibration dataset for the baseline methods to ensure a fair comparison. In LoRA retraining, 50K samples of the refined Alpaca~\cite{alpaca} are used for instruction tuning. In CPT retraining, we leverage SlimPajama~\cite{cerebras2023slimpajama}, which consists of 627B tokens for LLM pretraining. 
+
+\paragraph{Evaluation.} Following~\citet{touvron2023llama}, we measure zero-shot accuracy on commonsense reasoning datasets (i.e., BoolQ~\cite{clark-etal-2019-boolq}, PIQA~\cite{Bisk2020piqa}, HellaSwag~\cite{zellers2019hellaswag}, WinoGrande~\cite{sakaguchi2019winogrande}, ARC-easy~\cite{clark2018think}, ARC-challenge~\cite{clark2018think}, and OpenbookQA~\cite{OpenBookQA2018}) using the lm-evaluation-harness package~\cite{eval-harness}. We also report zero-shot PPL on WikiText2~\cite{wikitext2} and PTB~\cite{marcus-etal-1993-building}.
+
+\paragraph{Latency and Throughput.} We follow~\citet{sheng2023flexgen} to measure the metrics. Given a batch size $M$ and an output sequence length $L$ (excluding the input length), the latency $T$ represents the time required to handle the given prompts and produce $ML$ output tokens. The throughput is computed as $ML/T$. We report the average results from 20 runs after the initial 10 warm-up batches.
+
+\paragraph{Implementation.} We use the Hugging Face's Transformers library~\cite{wolf-etal-2020-transformers}. For pruning and LoRA retraining, an NVIDIA A100 GPU is employed. For CPT retraining, eight NVIDIA H100 GPUs are utilized, with a training duration of less than two weeks for each model size. For inference, we opt for the default setup of the Transformers library. See Section~\ref{sec:supple_impl_details} for the details.
+
+\section{Results}
+
+\subsection{Moderate Pruning and LoRA Retraining}
+Tables~\ref{table:lora_results}~and~\ref{supple_lora_results} show the zero-shot performance and inference efficiency of differently pruned models. Here, our models are obtained using a light LoRA retraining setup. The width pruning methods~\cite{llmpruner,flap,wanda} do not improve LLM inference efficiency. Under limited input (batch) scales, the processing speed largely hinges on the frequency of memory access operations. Addressing this issue by merely reducing matrix sizes is challenging, unless they are completely removed. The speed even worsens compared to the original model due to GPU-unfriendly operation dimensions (e.g., the hidden sizes of FFN are often not divisible by 8 (Table~\ref{supple_table:arch}), which hinders the effective utilization of GPU Tensor Cores~\cite{tensor_core_guide}). 
+
+On the contrary, our depth pruning exhibits speedups through the complete removal of several Transformer blocks, resulting in fewer memory access and matrix-level operations between activations and weights. Moreover, under the same LoRA retraining protocol as~\citet{llmpruner}, our models achieve zero-shot scores on par with finely width-pruned models. Although SLEB~\cite{song2024sleb} enhances inference efficiency similar to our method, its approach without retraining falls short in developing proficient small LLMs. See Section~\ref{sec:supple_moderate_pruning} for detailed results.
+
+\begin{figure}[t]
+  \centering
+    \includegraphics[width=\linewidth]{fig/compare_cpt_init.pdf}
+  \caption{Zero-shot scores during the training progress of the 2.7B-parameter model from Vicuna-7B. Using the pruned network as initialization (blue lines) for CPT accelerates the learning process and yields better results than starting from scratch (purple).}
+  \label{fig_learncurve_cpt}
+  \vspace{-0.2in}
+\end{figure}
+
+\subsection{Aggressive Pruning and CPT Retraining}
+Table~\ref{table:cpt_results} compares different retraining methods. Our models are obtained using the PPL criterion. Under high pruning ratios (e.g., yielding fewer than 3.7B parameters), LoRA-based tuning (LLM-Pruner~\cite{llmpruner}; Ours, LoRA) and retraining-free approaches (Wanda-sp~\cite{wanda,flap}, FLAP~\cite{flap}, SLEB~\cite{song2024sleb}) fail to recover model performance. In contrast, CPT proves effective in regaining the quality of heavily pruned models. CPT$\Rightarrow$LoRA slightly improves zero-shot accuracy for some pruning ratios, but with a minor drop in PPL. Table~\ref{gen_output_2.7b} presents samples produced by 2.7B-parameter models (60\% pruned). In contrast to the baselines, our model can generate text that is fluent and appropriately aligned with the context.
+
+Compared to LoRA retraining, the computational costs for CPT are considerably higher: LoRA can be completed within a day using just one GPU, while CPT requires about two weeks with eight GPUs in our experiments, with the option to use more if needed. However, utilizing a pruned network for initialization in CPT leads to faster learning and better results than building the same-sized models from scratch (see Figure~\ref{fig_learncurve_cpt}), highlighting its efficacy for smaller LLMs. Section \ref{sec:supple_aggressive_pruning} presents the learning progress in detail.
+
+\begin{figure}[t]
+  \centering
+    \includegraphics[width=\linewidth]{fig/gptq_results.png}
+        \vspace{-0.25in}
+  \caption{Further compression with GPTQ. Our pruned models following 4-bit weight quantization exhibit reduced VRAM usage without significant performance decline. The results for the original Vicuna-7B are presented for reference. See Section~\ref{sec:appendix_gptq} for the details.}
+  \vspace{-0.1in}
+  \label{fig_gptq_measure}
+\end{figure}
+
+\subsection{Applicability with Quantization} 
+Leveraging post-training quantization (PTQ) effectively lowers the memory consumption for inference of LLMs. Figure~\ref{fig_gptq_measure} shows the results of applying GPTQ~\cite{frantar2023optq}, a well-known PTQ method, to our depth-pruned models after CPT. The 4-bit weight quantization significantly reduces the VRAM demands across various model sizes without noticeable degradation in zero-shot accuracy. See Section~\ref{sec:appendix_gptq} for further results.
+
+\subsection{Ablation Study}
+We explore various design factors, including the criteria for importance evaluation, the choice of units for depth pruning, and the impact of calibration data volume. The results presented in this section were obtained through LoRA retraining.
+
+\subsubsection{Importance Criteria for Block Pruning} 
+Table~\ref{table:criterion} presents the results of block pruning using various significance criteria. The basic methods without the `+' label fail to maintain essential initial blocks, causing a decline in performance. The Mag+ method, which preserves these critical blocks, partially improves the scores; however, its effectiveness is still inferior compared to the other methods, indicating that relying solely on weight magnitude could be improper for pruning decisions. The Taylor+ criterion enhances accuracy in commonsense reasoning tasks, while the PPL method leads to better generation quality without relying on heuristic selection of pruning candidates.
+
+\subsubsection{Structural Unit for Depth Pruning} 
+Pruning individual MHA and FFN modules, which are more fine-grained units than Transformer blocks, is also possible. To examine its effect, we measure the impact of removing each module on the PPL of the calibration set and selectively eliminate the unnecessary modules. The same LoRA retraining procedure is conducted.
+
+\begin{table}[t]
+\centering
+
+\begin{adjustbox}{max width=0.88\columnwidth}
+\begin{threeparttable}
+\begin{tabular}{cc|cc|c}
+
+\specialrule{.2em}{.1em}{.1em} 
+
+\multicolumn{2}{c|}{\multirow{2}{*}{\begin{tabular}[c]{@{}c@{}}Block Pruning\\ Criterion\end{tabular}}} & \multicolumn{2}{c|}{PPL↓} & \multirow{2}{*}{\begin{tabular}[c]{@{}c@{}}Ave Acc↑\\  (\%)\textsuperscript{$\dagger$} \end{tabular}} \\
+\multicolumn{2}{c|}{}                                                                                   & WikiText2    & PTB        &                                                                          \\ \hline
+\multirow{5}{*}{\begin{tabular}[c]{@{}c@{}}5.5B\\ (20\%\\Pruned)\end{tabular}}       & Mag       & 7720.7       & 10618.7    & 34.4                                                                     \\
+                                                                                      & Mag+      & 19.4         & 36.3       & 56.1                                                                     \\
+                                                                                      & Taylor        & 3631.7       & 4327.9     & 35.5                                                                     \\
+                                                                                      & Taylor+       & 20.2         & 32.3       & \textbf{63.5}                                                                     \\
+                                                                                      & PPL             & \textbf{17.7}         & \textbf{30.7}       & 61.9                                                                     \\ \hline
+\multirow{5}{*}{\begin{tabular}[c]{@{}c@{}}4.5B\\ (35\%\\Pruned)\end{tabular}}       & Mag       & 8490.1       & 14472.1    & 34.9                                                                     \\
+                                                                                      & Mag+      & 36.9         & 61.1       & 49.3                                                                     \\
+                                                                                      & Taylor        & 7666.8       & 10913.1    & 35.3                                                                     \\
+                                                                                      & Taylor+       & 33.2         & 58.5       & \textbf{55.4}                                                                     \\
+                                                                                      & PPL            & \textbf{23.1}         & \textbf{38.8}       & 55.2                                                                     \\ 
+
+\specialrule{.2em}{.1em}{.1em} 
+\end{tabular}
+\begin{tablenotes}[para,flushleft]
+\footnotesize
+\textsuperscript{$\dagger$}Average accuracy on seven commonsense reasoning tasks. 
+\end{tablenotes}
+\end{threeparttable}
+\end{adjustbox}
+
+\vspace{-0.05in}
+  
+\caption{Comparison of pruning criteria on LLaMA-7B. The Taylor+ method excels in commonsense reasoning accuracy, while the PPL criterion leads to better generation performance.} \label{table:criterion}
+
+\vspace{+0.15in}
+
+\begin{adjustbox}{max width=\columnwidth}
+\begin{threeparttable}
+\begin{tabular}{c|c|cc|c}
+
+\specialrule{.2em}{.1em}{.1em} 
+
+\multirow{2}{*}{\begin{tabular}[c]{@{}c@{}}Depth Pruning\\ Unit\end{tabular}} & \multirow{2}{*}{\#Param} & \multicolumn{2}{c|}{PPL↓} & \multirow{2}{*}{\begin{tabular}[c]{@{}c@{}}Ave Acc↑\\  (\%)\textsuperscript{$\dagger$} \end{tabular}} \\
+                                                                              &                          & WikiText2      & PTB      &                                                                          \\ \hline
+Individual MHA \& FFN                                                                & 5.7B                     & 20.8           & 34.8     & \textbf{63.1}                                                                     \\
+Transformer Block                                                             & 5.7B                     & \textbf{16.9}           & \textbf{29.3}     & 62.8                                                                     \\ \hline
+Individual MHA \& FFN                                                                & 5.3B                     & 25.2           & 41.3     & \textbf{61.1}                                                                     \\
+Transformer Block                                                             & 5.3B                     & \textbf{18.6}           & \textbf{33.1}     & 60.6                                                                     \\ \hline
+Individual MHA \& FFN                                                                & 4.6B                     & 38.9           & 58.7     & 52.5                                                                     \\
+Transformer Block                                                             & 4.5B                     & \textbf{23.1}           & \textbf{38.8}     & \textbf{55.2}                                                                     \\ \hline
+Individual MHA \& FFN                                                                & 4.0B                     & 63.2           & 88.9     & 48.3                                                                     \\
+Transformer Block                                                             & 3.9B                     & \textbf{31.1}           & \textbf{47.3}     & \textbf{50.6}                                                                     \\ 
+
+\specialrule{.2em}{.1em}{.1em} 
+\end{tabular}
+\begin{tablenotes}[para,flushleft]
+\footnotesize
+\textsuperscript{$\dagger$}Average accuracy on seven commonsense reasoning tasks. 
+\end{tablenotes}
+\end{threeparttable}
+\end{adjustbox}
+
+\vspace{-0.05in}
+\caption{Comparison of depth pruning granularities on LLaMA-7B. Removing entire Transformer blocks instead of individual MHA and FFN modules generally yields better results.} \label{table:ablation_pruneunit}
+\vspace{-0.1in}
+\end{table}
+
+Table~\ref{table:ablation_pruneunit} shows the results of depth pruning at different granularities. For the models with more than 5B parameters, removing individual MHA and FFN modules results in better downstream task accuracy but worse PPL compared to removing entire Transformer blocks. For smaller models than 5B, block-level pruning achieves superior results in terms of all the examined metrics. This differs from the common belief that removing finer units yields better performance.
+
+Given the collaborative roles of the modules (i.e., MHA captures dependency relations~\cite{transformer}, while skip connections and FFN prevent the rank collapse in purely attention-driven networks~\cite{dong2021attention}), it may be suboptimal to treat them in isolation. Taking the 5.3B model in Table~\ref{table:ablation_pruneunit} as an example, module-level pruning results in consecutive FFNs in some positions, potentially impairing the model's ability to handle word interactions. In contrast, with block-level removal, the loss of information could be compensated by neighboring blocks that serve similar functions.
+
+\subsubsection{Calibration Data Volume}
+ The calibration set is employed to assess the weight significance of width pruning baselines and the block-level importance of our method during the pruning phase. Table~\ref{table:calib_data_volume} presents the results obtained by varying the number of calibration samples in the BookCorpus dataset. The scores remain relatively stable for the examined methods, suggesting that 10 samples could be sufficient. However, our Taylor+ method encounters a drop in downstream task accuracy when 1K samples are used, leaving the exploration of calibration data characteristics for future research.
+
+\section{Related Work} \label{relwork}
+
+Numerous techniques have been developed towards efficient LLMs, including knowledge distillation~\cite{fu2023specializing,hsieh2023distilling}, quantization~\cite{frantar2023optq,dettmers2022llmint8}, and system-level inference acceleration~\cite{dao2023flashattention2,kwon2023efficient}. In this study, we focus on network pruning~\cite{lecun1989optimal}, which has a long-standing reputation in the model compression field. Beyond its use in relatively small-scale convolutional networks~\cite{li2016pruning,he2019filter} and Transformer models~\cite{yu2022unified,xia2022structured,kurtic2023ziplm}, pruning has recently begun to be applied to contemporary LLMs. Several studies~\cite{frantar-sparsegpt,wanda} employ unstructured and semi-structured~\cite{zhou2021} pruning by zeroing individual neurons. SparseGPT~\cite{frantar-sparsegpt} addresses the layer-wise reconstruction problem for pruning by computing Hessian inverses. Wanda~\cite{wanda} introduces a pruning criterion that involves multiplying weight magnitudes by input feature norms. Despite the plausible performance of pruned models using zero masks, they necessitate specialized support for sparse matrix operations to ensure actual speedups.
+
+In contrast, structured pruning removes organized patterns, such as layers~\cite{fan2019reducing,jha2023train}, MHA's attention heads~\cite{voita2019analyzing,michel2019sixteen}, FFN's hidden sizes~\cite{nova2023gradientfree,santacroce2023matters}, and some hybrid forms~\cite{lagunas2021block,xia2022structured,kwon2022fast,kurtic2023ziplm}, thereby improving inference efficiency in a hardware-agnostic way. To compress LLMs, FLAP~\cite{flap} and LLM-Pruner~\cite{llmpruner} eliminate coupled structures in the aspect of network width while retaining the number of layers. Sheared-LLaMA~\cite{xia2023sheared} introduces a mask learning phase aimed at identifying prunable components in both the network's width and depth. Our study explores the relatively untapped area of depth-only pruning for multi-billion parameter LLMs, which can markedly accelerate latency while attaining competitive performance.
+
+Strategies for skipping layers~\cite{schuster2022confident,delcorro2023skipdecode,raposo2024mixtureofdepths} effectively serve to decrease computational burdens. Moreover, depth pruning approaches~\cite{song2024sleb,men2024shortgpt,tang2024rethinking} for LLMs have been proposed concurrently with our work, based on the architectural redundancy in LLMs.
+
+\begin{table}[t]
+\centering
+\begin{adjustbox}{max width=0.94\columnwidth}
+\begin{threeparttable}
+\begin{tabular}{cc|cccc}
+
+\specialrule{.2em}{.1em}{.1em} 
+
+\multirow{2}{*}{\begin{tabular}[c]{@{}c@{}}Evaluation\\ Metric\end{tabular}} & \multirow{2}{*}{Method} & \multicolumn{4}{c}{\# Calibration Samples}                    \\
+                                                                             &                         & 10            & 50            & 100           & 1000          \\ \hline
+\multirow{5}{*}{\begin{tabular}[c]{@{}c@{}}PPL↓ on\\ WikiText2\end{tabular}} & Wanda-sp                & 21.4          & 21.4          & 21.7          & 20.8          \\
+                                                                             & FLAP                    & \textbf{17.0} & 17.5          & 17.5          & \textbf{17.3} \\
+                                                                             & LLM-Pruner              & 17.6          & \textbf{17.2} & \textbf{17.0} & OOM\textsuperscript{$\ddagger$}           \\
+                                                                             & Ours: Taylor+             & 20.2          & 20.2          & 19.0          & 19.6          \\
+                                                                             & Ours: PPL               & 17.7          & \textbf{17.2} & 17.4          & 17.4          \\ \hline
+\multirow{5}{*}{\begin{tabular}[c]{@{}c@{}}Ave Acc↑\\  (\%)\textsuperscript{$\dagger$} \end{tabular}}     & Wanda-sp                & 51.8          & 52.9          & 52.0          & 53.0          \\
+                                                                             & FLAP                    & 59.5          & 59.7          & 59.9          & 60.8          \\
+                                                                             & LLM-Pruner              & 61.8          & 61.6          & 61.7          & OOM\textsuperscript{$\ddagger$}           \\
+                                                                             & Ours: Taylor+             & \textbf{63.5} & \textbf{63.5} & \textbf{63.9} & \textbf{61.7} \\
+                                                                             & Ours: PPL               & 61.9          & 61.5          & 61.7          & \textbf{61.7} \\ 
+                                                                             
+                                                                             
+
+\specialrule{.2em}{.1em}{.1em} 
+
+\end{tabular}
+\begin{tablenotes}[para,flushleft]
+\footnotesize
+\textsuperscript{$\dagger$}Average accuracy on seven commonsense reasoning tasks. 
+\newline
+\textsuperscript{$\ddagger$}Out-of-memory error on an A100 (80GB) using the official code. 
+\end{tablenotes}
+\end{threeparttable}
+\end{adjustbox}
+
+\vspace{-0.05in} 
+\caption{Impact of calibration data volume. The results of 20\%-pruned LLaMA-7B are reported.} \label{table:calib_data_volume}
+\vspace{-0.1in}
+\end{table}
+
+\section{Conclusion}
+By introducing a block pruning method, we conduct an in-depth comparative analysis on the impact of network width and depth on LLM compression. Our work involves the one-shot removal of Transformer blocks. Despite its simplicity, our method with light LoRA retraining matches the zero-shot capabilities of recent width pruning techniques under moderate pruning levels. Moreover, it offers significant inference speedups in resource-constrained scenarios that require running LLMs with limited batch sizes, where width pruning falls short. When comparing retraining strategies, continued pretraining on a large-scale dataset significantly surpasses LoRA-based tuning, particularly in cases of severe pruning. We hope this study will support the development of potent small LLMs.
+
+\section*{Limitations}
+Due to constraints in computational resources, we could not test our method on LLMs exceeding 13B parameters. We plan to explore larger models in future research, given that our method can be applied to any model size. Secondly, we found that continued pretraining was essential for performance recovery after extensive pruning. Further exploration of different training corpora and hyperparameters could lead to additional performance improvements. Lastly, commercially available LLMs are optimized for human preferences, such as safety and helpfulness, through alignment tuning. We have yet to assess human preferences throughout the entire process of pruning, retraining, and quantization. We hope future research will address this aspect.
+
+\section*{Acknowledgments}
+We thank the Microsoft Startups Founders Hub program and the AI Industrial Convergence Cluster Development project funded by the Ministry of Science and ICT (MSIT, Korea) and Gwangju Metropolitan City for their generous support of GPU resources.
+
+\clearpage
+
+\end{document}

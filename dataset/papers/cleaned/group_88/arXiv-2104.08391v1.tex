@@ -1,0 +1,514 @@
+\title{Learning To Count Everything}
+
+\begin{document}
+
+\title{Learning To Count Everything}
+
+\author{Viresh Ranjan$^{1}$ \quad Udbhav Sharma$^{1}$  \quad Thu Nguyen$^{2}$ \quad Minh Hoai$^{1,2}$ \\
+$^1$Stony Brook University, USA\\
+$^2$VinAI Research, Hanoi, Vietnam 
+}
+
+\maketitle
+
+\begin{abstract}
+Existing works on visual counting primarily focus on one specific category at a time, such as people, animals, and cells. In this paper, we are interested in counting everything, that is to count objects from any category given only a few annotated instances from that category.
+To this end, we pose counting as a few-shot regression task. 
+To tackle this task, we present a novel method that takes a query image together with a few exemplar objects from the query image and predicts a density map for the presence of all objects of interest in the query image. We also present a novel adaptation strategy to adapt our network to any novel visual category at test time, using only a few exemplar objects from the novel category.  We also introduce a dataset of 147 object categories containing over 6000 images that are suitable for the few-shot counting task. The images are annotated with two types of annotation, dots and bounding boxes, and they can be used for developing few-shot counting models. Experiments on this dataset shows that our method outperforms several state-of-the-art object detectors and few-shot counting approaches. Our code and dataset can be found at \url{https://github.com/cvlab-stonybrook/LearningToCountEverything}. 
+
+\end{abstract}
+
+\section{Introduction}
+Humans can count objects from most of the visual object categories with ease, while  current state-of-the-art computational  methods~\cite{zhang2016single,ma2019bayesian,m_Wang-etal-NIPS20} for counting can only handle a limited number of visual categories. In fact, most of the counting neural networks~\cite{arteta2016counting,m_Wang-etal-NIPS20} can handle a single category at a time, such as people, cars, and cells. 
+
+There are two major challenges preventing the Computer Vision community from designing systems capable of counting a large number of visual categories. First, most of the contemporary counting approaches~\cite{m_Wang-etal-NIPS20,zhang2016single,arteta2016counting} treat counting as a supervised regression task, requiring thousands of labeled images to learn a fully convolutional regressor that maps an input image to its corresponding density map, from which the estimated count is obtained by summing all the density values. These networks require dot annotations for millions of objects on several thousands of training images, and obtaining this type of annotation is a costly and laborious process. As a result, it is difficult to scale these contemporary counting approaches to handle a large number of visual categories. Second, there are not any large enough unconstrained counting datasets with many visual categories for the development of a general counting method. Most of the popular counting datasets~\cite{zhang2016single,Idrees_2013_CVPR,idrees2018composition,wang2020nwpu,sindagi2020jhu,hsieh2017drone} consist of a single object category.
+
+\begin{figure}[t]
+     \includegraphics[width=\linewidth]{./Images/teaser2.png}
+     \vskip -0.1in
+    \caption{\textbf{Few-shot counting---the objective of our work.} Given an image from a novel class and a few exemplar objects from the same image delineated by bounding boxes, the objective is to count the total number of objects of the novel class in the image.
+  \label{fig:motivation}}
+ \end{figure} 
+
+\iffalse
+\setlength{\tabcolsep}{3pt}
+\begin{table}[!tb]
+\centering
+\begin{tabular}{lcccc}
+\toprule
+& & & \multicolumn{2}{c}{Annotation type} \\
+\cmidrule(lr){4-5}
+Dataset & Images & Categories & Dot & Bounding Box  \\
+\midrule
+UCF CC 50~\cite{Idrees_2013_CVPR} & 50  & 1 & \cmark & \xmark  \\
+Shanghaitech~\cite{zhang2016single}  & 1198 & 1  & \cmark & \xmark  \\
+UCF QNRF~\cite{idrees2018composition} & 1535 & 1   & \cmark & \xmark    \\
+NWPU~\cite{wang2020nwpu} & 5109 & 1& \cmark & \xmark \\
+JHU Crowd~\cite{sindagi2020jhu} & 4372 & 1  & \cmark & \cmark \\
+CARPK~\cite{hsieh2017drone} & 1448 & 1  & \cmark & \cmark   \\
+\textbf{Proposed} & 6135 & 147 & \cmark & \cmark   \\
+\bottomrule
+\end{tabular}
+\caption{{\bf Comparison with popular counting datasets}. Existing  datasets comprise of a single object category, while our dataset contain multiple categories. Our dataset is of similar size as the existing datasets, and it comes with dot, bounding box, and polygon annotations. \mhoai{This table is not needed, at least not in the introduction section}
+\label{tab:DatasetComparison}}
+\end{table}
+\fi
+
+In this work, we address both of the above challenges. To handle the first challenge, we take a detour from the existing counting approaches which treat counting as a typical fully supervised regression task, and pose counting as a few shot regression task, as shown in \Fref{fig:motivation}. In this few-shot setting, the inputs for the counting task are an image and few examples from the same image for the object of interest, and the output is the count of object instances. The examples are provided in the form of bounding boxes around the objects of interest. In other words, our few shot counting task deals with counting instances within an image which are similar to the exemplars from the same image. Following the convention from the few-shot classification task~\cite{Lake-et-al-Science15,vinyals2016matching,finn2017model}, the classes at test time are completely different from the ones seen during training. This makes few-shot counting very different from the typical counting task, where the training and test classes are the same. Unlike the typical counting task, where hundreds~\cite{zhang2016single} or thousands~\cite{idrees2018composition} of labeled examples are available for training, a few-shot counting method needs to generalize to completely novel classes using only the input image and a few exemplars. 
+
+We propose a novel architecture called \underline{F}ew Shot \underline{A}daptation and \underline{M}atching Network~(FamNet) for tackling the few-shot counting task. FamNet has two key components: 1) a feature extraction module, and 2) a density prediction module. The feature extraction module consists of a general feature extractor capable of handling a large number of visual categories. The density prediction module is designed to be agnostic to the visual category. As will be seen in our experiments, both the feature extractor and density prediction modules can already generalize to the novel categories at test time. We further improve the performance of FamNet by developing a novel few-shot adaptation scheme at test time. This adaptation scheme uses the provided exemplars themselves and adapts the counting network to them with a few gradient descent updates, where the gradients are computed based on two loss functions which are designed to utilize the locations of the exemplars to the fullest extent. Empirically, this adaptation scheme improves the performance of FamNet.
+
+Finally, to address the lack of a dataset for developing and evaluating the performance of few-shot counting methods, we introduce a medium-scale dataset consisting of more than 6000 images from 147 visual categories. The dataset comes with dot and bounding box annotations, and is suitable for the few-shot counting task. We name this dataset Few-Shot Counting-147 (FSC-147). 
+
+In short, the main contributions of our work are as follows. First, we pose counting as a few-shot regression task. Second, we propose a novel architecture called FamNet for handling the few-shot counting task, with a novel few-shot adaptation scheme at test time. Third, we present a novel few-shot counting dataset called FSC-147, comprising of over 6000 images with 147 visual categories.
+
+ 
+
+\section{Related Works}
+In this work, we are interested in counting objects of interest in a given image with a few labeled examples from the same image. Most of the previous counting methods are for specific types of objects such as people~\cite{ma2019bayesian,zhang2016single,ranjan2018iterative,babu2018divide,sam2017switching,li2018csrnet,liu2018leveraging,cao2018scale,ranjan2019crowd,shi2019revisiting,liu2019context,wang2019learning,zhang2019attentional,wan2019adaptive,m_Ranjan-etal-ACCV20,m_Abousamra-etal-AAAI21}, cars~\cite{mundhenk2016large}, animals~\cite{arteta2016counting}, cells~\cite{arteta2016detecting,xie2018microscopy,khan2016deep}, and fruits~\cite{rahnemoonfar2017deep}. These methods often require training images with tens of thousands or even millions of annotated object instances. Some of these works~\cite{m_Ranjan-etal-ACCV20} tackle the issue of costly annotation cost to some extent by adapting a counting network trained on a source domain to any target domain using labels for only few informative samples from the target domain. However, even these approaches require a large amount of labeled data in the source domain.  
+
+The proposed FamNet works by exploiting the strong similarity between a query image and the provided exemplar objects in the image. To some extent, it is similar the decade-old self-similarity work of Shechtman and Irani~\cite{Shechtman-Irani-CVPR07}. Also related to this idea is the recent work of Lu and Zisserman\cite{lu2018class}, who proposed a Generic Matching Network (GMN) for class-agnostic counting. GMN was pre-trained with tracking video data, and it had an explicit adaptation module to adapt the network to an image domain of interest. GMN has been shown to work well if several dozens to hundreds of examples are available for adaptation. Without adaptation, GMN does not perform very well on novel classes, as will be seen in our experiments. 
+
+Related to few-shot counting is the few-shot detection task (e.g.,~\cite{kang2019few,fan2020few}), where the objective is to learn a detector for a novel category using a few labeled examples. Few-shot counting differs from few-shot detection in two primary aspects. First, few-shot counting requires dot annotations while detection requires bounding box annotations. Second, few-shot detection methods can be affected by severe occlusion whereas few-shot counting is tackled with a density estimation approach~\cite{Lempitsky-Zisserman-NIPS10,zhang2016single}, which is more robust towards occlusion than the detection-then-counting approach because the density estimation methods do not have to commit to binarized decisions at an early stage. The benefits of the density estimation approach has been empirically demonstrated in several domains, especially for crowd and cell counting.
+
+Also related to our work is the task of few-shot image classification~\cite{lake2015human,koch2015siamese,vinyals2016matching,santoro2016one,finn2017model,ravi2016optimization}. The few-shot classification task deals with classifying images from novel categories at test time, given a few training examples from these novel test categories.
+The Model Agnostic Meta Learning (MAML)~\cite{finn2017model} based few-shot approach is relevant for our few-shot counting task, and it focuses on learning parameters which can adapt to novel classes at test time by means of few gradient descent steps. However, MAML involves computing second order derivatives during training which makes it expensive, even more so for the pixel level prediction task of density map prediction being considered in our paper. Drawing inspiration from these works, we propose a novel adaptation scheme which utilizes the exemplars available at test time and performs a few steps of gradient descent in order to adapt FamNet to any novel category. Unlike MAML, our training scheme does not require higher order gradients at training time. We compare our approach with MAML, and empirically show that it leads to better performance and is also much faster to train.
+
+\iffalse
+\section{Few-Shot Counting}\label{sec:FewShotCounting}
+\mhoai{This section is redundant. You have said it very explicitly in the introduction. Even in the introduction, you have two paragraphs for it, and I think it is not necessary. }
+
+Next we summarize a typical counting task in brief, followed by the few-shot Counting task being considered in this paper, and contrast the two.
+
+Most of the works~\cite{zhang2016single,idrees2018composition,ma2019bayesian,arteta2016counting} in counting focus on counting objects of a specific category such as crowd, penguins, cars, cells etc. These approaches treat counting as a fully supervised regression task, and typically train a fully convolutional architecture to map any image to the corresponding density map. The count is obtained by summing all the pixels in the predicted density map. The groundtruth density map for training these counting networks is obtained by convolving the dot annotation map corresponding to the location of each of the objects of interest with a 2D Gaussian kernel. These counting networks perform remarkably well at counting specific objects, however their training requires hundreds~\cite{zhang2016single} or even thousands~\cite{idrees2018composition,wang2020nwpu,sindagi2020jhu} of annotated images
+with millions of dot annotations.
+In this work, we are interested in counting objects from a large number of visual categories, and not just a specific category. One straightforward approach to tackle large number of visual categories would be to collect large number of annotated examples from each of the visual categories, and train separate/joint counting networks for all of the visual categories. However, this approach would be expensive in terms of the data annotation cost. To circumvent this data annotation cost, we pose counting as a few-shot regression task which involves counting objects of any visual category given an image and a few examples of the object of interest from the same image. In few-shot counting, the classes seen at test time are completely different from the ones seen at training time. The class of approaches which would perform well at few-shot counting would need to generalize to any novel category using only a test image, and few examples of object of interest from the test image. This makes the few-shot counting problem very different from the typical counting problems such as crowd counting~\cite{zhang2016single,sindagi2020jhu,idrees2018composition,wang2020nwpu}, vehicle counting~\cite{hsieh2017drone}, penguin counting~\cite{arteta2016counting}, where a large dataset of annotated images is readily available for training. Furthermore, the few-shot counting task is scalable to large number of visual categories, since it does not require large number of annotated examples for each of the visual categories.  
+\fi
+
+\begin{figure*}[t]
+    \includegraphics[width=\textwidth]{./Images/block-A2.png}
+    \caption{{\bf Few-shot adaptation \& matching Network} takes as input the query image along with few bounding boxes depicting the object of interest, and predicts the density map. The count is obtained by summing all the pixel values in the density map. The adaptation loss is computed based on the bounding box information, and the gradients from this loss are used to update the parameters of the density prediction module. The adaptation loss is only used during test time. 
+  \label{fig:EmNet}}
+ \end{figure*}  
+\section{Few-Shot Adaptation \& Matching Network}
+
+In this section, we describe the proposed FamNet for tackling the few-shot counting task. 
+
+\subsection{Network architecture}
+
+\Fref{fig:EmNet} depicts the pipeline of FamNet. The input to the network is an image $X \in \Re^{H \times W \times 3}$ and a few exemplar bounding boxes depicting the object to be counted from the same image. The output of the network is the predicted density map $Z \in \Re^{H \times W}$, and the count for the object of interest is obtained by summing over all density values. 
+ 
+FamNet consists of two key modules: 1) a multi-scale feature extraction module, and 2) a density prediction module. We design both of these modules so that they can handle novel categories at test time. We use an ImageNet-pretrained network~\cite{He-et-al-CVPR16} for the feature extraction, since such networks can handle a broad range of visual categories. The density prediction module is designed to be agnostic to the visual categories.
+The multi-scale feature extraction module consists of the first four blocks from a pre-trained ResNet-50 backbone~\cite{He-et-al-CVPR16} (the parameters of these blocks are frozen during training). We represent an image by the convolutional feature maps at the third and fourth blocks. We also obtain the multi-scale features for an exemplar by performing ROI pooling on the convolutional feature maps from the third and fourth Resnet-50 blocks.
+
+To make the density prediction module agnostic to the visual categories, we do not use the features obtained from the feature extraction module directly for  density prediction. Instead, we only use the correlation map between the exemplar features and image features as the input to the density prediction module. To account for the objects of interest at different scales, we scale the exemplar features to different scales, and correlate the scaled exemplar features with the image features to obtain multiple correlation maps, one for each scale. For all of our experiments, we use the scales of 0.9 and 1.1, along with the original scale. The correlation maps are concatenated and fed into the density prediction module. The density prediction module consists of five convolution blocks and three upsampling layers placed after the first, second, and third convolution layers. The last layer is a $1{\times}1$ convolution layer, which predicts the 2D density map. The size of the predicted density map is the same as the size of the input image. 
+
+\subsection{Training}
+
+We train the FamNet using the training images of our dataset. Each training image contains multiple objects of interest, but only the exemplar objects are annotated with bounding boxes and the majority of the objects only have dot annotations. It is, however, difficult to train a density estimation network with the training loss that is defined based on the dot annotations directly. Most existing works for visual counting, especially for crowd counting~\cite{zhang2016single}, convolve the dot annotation map with a Gaussian window of a fixed size, typically $15{\times}15$, to generate a smoothed target density map for training the density estimation network. 
+
+Our dataset consists of $147$ different categories, where there is huge variation in the sizes of the objects. Therefore, to generate the target density map, we use Gaussian smoothing with adaptive window size. First, we use dot annotations to estimate the size of the objects. Given the dot annotation map, where each dot is at an approximate center of an object, we compute the distance between each dot and its nearest neighbor, and average these distances for all the dots in the image. This average distance is used as the size of the Gaussian window to generate the target density map. The standard deviation of the Gaussian is set to be a quarter of the window size. 
+
+To train FamNet, we minimize the mean squared error between the predicted density map and the ground truth density map. We use Adam optimizer with a learning rate of $10^{-5}$, and batch size of 1. We resize each image to a fixed height of 384, and the width is adjusted accordingly to preserve the aspect ratio of the original image. 
+
+\subsection{Test-time adaptation}
+
+Since the two modules of the FamNet are not dependent on any object categories, the trained FamNet can already be used for counting objects from novel categories given a few exemplars. In this section, we describe a novel approach to adapt this network to the exemplars, further improving the accuracy of the estimated count. The key idea is to harness the information provided by the locations of the exemplar bounding boxes. So far, we have only used the bounding boxes of the exemplars to extract appearance features of the exemplars, and we have not utilized their locations to the full extent. 
+
+Let $B$ denote the set of provided exemplar bounding boxes. For a bounding box $b \in B$, let $Z_b$ be the crop from the density map $Z$ at location $b$. To harness the extra information provided by the locations of the bounding boxes $B$, we propose to consider the following two losses.
+
+\myheading{Min-Count Loss.} For each exemplar bounding box~$b$, the sum of the density values within $Z_b$ should be at least one. This is because the predicted count is taken as the sum of predicted density values, and there is at least one object at the location  specified by the bounding box $b$. However, we cannot assert that the sum of the density values within $Z_b$ to be exactly one, due to possible overlapping between $b$ and other nearby objects of interest. This observation leads to an inequality constraint: $||Z_b||_1 \geq 1$, where $||Z_b||_1$ denotes the sum of all the values in $Z_b$. Given the predicted density map and the set of provided bounding boxes for the exemplars, we define the following Min-Count loss to quantify the amount of constraint violation: 
+
+\begin{equation}\label{adaptation1}
+\mL_{MinCount} = \sum_{b \in B} \max(0,1- ||Z_b||_1).    
+\end{equation}
+
+\myheading{Perturbation Loss.} Our second loss to harness the positional information provided by the exemplar bounding boxes is inspired by the success of tracking algorithms based on correlation filter \cite{Henriques-etal-PAMI15,valmadre2017end,wang2019fast}. Given the bounding box of an object to track, these algorithms learn a filter that has highest response at the exact location of the bounding box and lower responses  at perturbed locations. The correlation filter can be learned by  optimizing a regression function to map from a perturbed location to a target response value, where the target response value decreases exponentially as the perturbation distance increases, usually specified by a Gaussian distribution. 
+
+In our case, the predicted density map $Z$ is essentially the correlation response map between the exemplars and the image. To this end, the density values around the location of an exemplar should ideally look like a Gaussian. Let $G_{h \times w}$ be the 2D Gaussian window of size $h{\times}w$. We define the perturbation loss as follows: 
+\begin{equation}\label{adaptation2}
+\mL_{Per} = \sum_{b \in B} ||Z_b - G_{h \times w}||_2^2.    
+\end{equation}
+
+\myheading{The combined adaptation Loss.} The loss used for test-time adaptation is the weighted combination of the Min-Count loss and the Perturbation loss. The final test time adaptation loss is given as 
+\begin{equation}\label{adaptation3}
+    \mL_{Adapt} = \lambda_1 \mL_{MinCount} + \lambda_2 \mL_{Per},
+\end{equation}
+where $\lambda_1$ and $\lambda_2$ are scalar hyper parameters. At test time, we perform $100$ gradient descent steps for each test image, and optimize the joint loss presented in  \Eref{adaptation3}. We use the learning rate $10^{-7}$. The values for $\lambda_1$ and $\lambda_2$ are $10^{-9}$ and $10^{-4}$ respectively. 
+The learning rate, the number of gradient steps, $\lambda_1$, and $\lambda_2$, are tuned based on the performance on the validation set. 
+The values of $\lambda_1$, and $\lambda_2$ seem small, but this is necessary to make the adaptation loss to have similar magnitude to the training loss. Even though the training loss is not used for test time adaptation, it is important for the losses and their gradients to have similar magnitudes. Otherwise, the gradient update steps of the adaptation process will either do nothing or move away far from the parameters learned during training. 
+
+Note that the adaptation loss is only used at test time. During training of FamNet, this loss is redundant because the proposed training loss, based on mean squared errors computed over all pixel locations, already provides stronger supervision signal than the adaptation loss. 
+
+\iffalse
+\section{Old}
+In this section, we describe EmNet, our proposed architecture for tackling the few-shot counting task.
+
+\subsection{Network Architecture}
+The processing pipeline and architecture of Exemplar Matching Network (EmNet) is depicted in \Fref{fig:EmNet}. The input to EmNet is a query image of size $H {\times} W$, and a set of $M$ image patches containing $M$ exemplar objects. The output of EmNet is a density map highlighting the locations of all objects of interest in the query image. EmNet can handle a variable number of exemplar patches, and it consists of three key blocks: 1) feature extraction; 2) feature convolution;  and 3) density prediction.  The feature extraction block extracts convolutional feature maps from the query image and the exemplar patches. The feature extraction block consists of the first four blocks from a pretrained Resnet-50 backbone, and the parameters of the block are kept frozen during training. The feature convolution block takes as input the feature map for the query image and $M$ feature maps from $M$ exemplar patches. The exemplar feature maps are convolved with the image feature map to produce a 3D tensor $Z$ of size $M{\times}h{\times}w$. Note that $h=\frac{H}{8}$ and $w = \frac{W}{8}$. We pad the query image feature map with zeros before convolving it with the exemplar feature maps to preserve the size of the feature map. We apply average pooling and max pooling across first dimension of the the 3D tensor $Z$ to obtain two 2D feature maps of size $h{\times}w$. These feature maps are concatenated and passed to the density prediction block. The density prediction block consists of five convolution blocks and three upsampling layers after the first, second, and third convolution layers. The last layer is a $1{\times}1$ convolution layer, which predicts the 2D density map. The size of the density map is same as the size of the input image.
+
+\subsection{Generating Target Density Map from Dot Annotation}
+
+We train EmNet with images from the training data subset. Each training image, however, only has dot annotation for the majority of objects in the image. It is however difficult to train a density estimation network with the training loss that is defined based on the dot annotations directly. Most existing works for visual counting, especially crowd counting, convolve the dot map with a Gaussian window of fixed size, typically $15{\times}15$ to generate the target density map for training the density estimation network. 
+
+Our dataset consists of $64$ different categories, where there is huge variation in the sizes of the objects. Therefore, to generate the target density map, we use Gaussian smoothing with adaptive window size. We use dot annotations for estimating the size of the objects. Given the dot annotation map, where each dot is at the approximate center of an object, we compute the distance between each dot and its nearest neighbor, and average this distance for all the dots in the image. This average distance is used as the size of the Gaussian window used in generating the target density map. The standard deviation of the Gaussian is set to be a quarter of the window size. 
+
+\subsection{Training}
+For each annotation type (i.e., dot, box, and polygon), we train three EmNets, for $1$-shot, 2-shot, and 3-shot. For training the $k$-shot model, we sample an image and $k$ random exemplars from the same image, and propagate them through EmNet to obtain a density map. We use mean squared error loss and force the density map to be close to the ground truth density map. We use a batch size of 1, and use Adam optimizer with a learning rate of $10^{-5}$ and momentum $0.9$ for the training. For an image for which the width or height is bigger than 1504, we rescale it so that the larger size is equal to $1504$. The aspect ratio of the image is preserved while rescaling.
+\fi
+\section{The FSC-147 Dataset}
+\begin{figure*}[!t]
+    \begin{subfigure}[!category]{0.3\textwidth}
+    \includegraphics[height=1\textwidth, width=\textwidth]{./plot/piechart4}
+    \label{fig:cate}
+    \vskip -0.1in
+    \caption[width=0.8\textwidth]{Image categories and number of images for each category in our dataset. \label{fig:categoryPlot}}
+\end{subfigure}
+    \hfill
+    \begin{subfigure}[!hist]{0.3\textwidth}
+        \includegraphics[height=\textwidth, width=\textwidth]{./plot/hist_objcount}
+        \label{fig:hist}
+    \vskip -0.1in        
+        \caption{Number of images in several ranges of object count.\label{fig:histogram}}
+    \end{subfigure}
+     \hfill
+\begin{subfigure}[!hist]{0.37\textwidth}
+\setlength{\tabcolsep}{2pt}
+\begin{adjustbox}{width=\columnwidth}
+\begin{tabular}{lcccc}
+\toprule
+& & & \multicolumn{2}{c}{Annotation type} \\
+\cmidrule(lr){4-5}
+Dataset & Images & Categories & Dot & Bounding Box  \\
+\midrule
+UCF CC 50~\cite{Idrees_2013_CVPR} & 50  & 1 & \cmark & \xmark  \\
+Shanghaitech~\cite{zhang2016single}  & 1198 & 1  & \cmark & \xmark  \\
+UCF QNRF~\cite{idrees2018composition} & 1535 & 1   & \cmark & \xmark    \\
+NWPU~\cite{wang2020nwpu} & 5109 & 1& \cmark & \xmark \\
+JHU Crowd~\cite{sindagi2020jhu} & 4372 & 1  & \cmark & \cmark \\
+CARPK~\cite{hsieh2017drone} & 1448 & 1  & \cmark & \cmark   \\
+\textbf{Proposed} & 6135 & 147 & \cmark & \cmark   \\
+\bottomrule
+\end{tabular}
+\end{adjustbox}
+\vskip .1in
+\caption{Comparison with popular counting datasets. 
+\label{tab:DatasetComparison}}
+    \end{subfigure}
+ \label{fig:plot}
+  \caption{{\bf Categories \& no. of images per category, object counts, and comparison with other counting datasets}}
+ \end{figure*}  
+
+To train the FamNet, we need a dataset suitable for the few-shot counting task, consisting of many visual categories. Unfortunately, existing counting datasets are mostly dedicated for specific object categories such as people, cars, and cells. Meanwhile, existing multi-class datasets do not contain many images that are suitable for visual counting. For example, although some images from the COCO dataset~\cite{Lin-etal-ECCV14} contains multiple instances from the same object category, most of the images do not satisfy the conditions of our intended applications due to the small number of object instances or the huge variation in pose and appearance of the object instances in each image. 
+
+Since there was no dataset that was large and diverse enough for our purpose, we collected and annotated images ourselves. Our dataset consists of 6135 images across a diverse set of 147 object categories, from kitchen utensils and office stationery to vehicles and animals. The object count in our dataset varies widely, from 7 to 3731 objects, with an average count of 56 objects per image. In each image, each object instance is annotated with a dot at its approximate center. In addition, three object instances are selected randomly as exemplar instances; these exemplars are also annotated with axis-aligned bounding boxes. In the following subsections, we will describe how the data was collected and annotated. We will also report the detailed statistics and how the data was split into disjoint training, validation, and testing sets. 
+
+ 
+
+\subsection{Image Collection}
+
+To obtain the set of 6135 images for our dataset, we started with a set of candidate images obtained by keyword searches. Subsequently, we performed manual inspection to filter out images that do not satisfy our predefined conditions as described below. 
+
+\myheading{Image retrieval}. We started with a list of object categories, and collected 300--3000 candidate images for each category by scraping the web. We used Flickr, Google, and Bing search engines with the open source image scrappers~\cite{Flickr-Scrapper,Google-Scrapper}. We added adjectives such as \textit{many, multiple, lots of}, and \textit{stack of} in front of the category names to create the search query keywords. 
+
+\myheading{Manual verification and filtering}. 
+We manually inspected the candidate images and only kept the suitable ones satisfying the following criteria: 
+\begin{enumerate} \denselist
+    \item \textit{High image quality}: The resolution should be high enough to easily differentiate between objects. 
+    \item \textit{Large enough object count}: The number of objects of interest should be at least 7. We are more interested in counting a large number of objects, since humans do not need help counting a small number of objects. 
+    \item \textit{Appearance similarity}: we selected images where object instances have somewhat similar poses, texture, and appearance.  
+    \item \textit{No severe occlusion}: in most cases, we removed candidate images where severe occlusion prevents humans from accurately counting the objects. 
+\end{enumerate}
+
+\subsection{Image Annotation}
+Images in the dataset were annotated by a group of annotators using the OpenCV Image and Video Annotation Tool~\cite{CVAT}. Two types of annotation were collected for each image, dots and bounding boxes, as illustrated in  \Fref{fig:annotation_examples}. For images containing multiple categories, we picked only one of the categories. Each object instance in an image was marked with a dot at its approximate center. In case of occlusion, the occluded instance was only counted and annotated if the amount of occlusion was less than 90\%. For each image, we arbitrarily chose three objects as exemplar instances and we drew axis-aligned bounding boxes for those instances. 
+
+\subsection{Dataset split}
+We divided the dataset into train, validation, and test sets such that they do not share any object category. We randomly selected 89 object categories for the train set, and 29 categories each for the validation and test sets. The train, validation, and test sets consist of 3659, 1286 and 1190 images respectively.
+ 
+\subsection{Data Statistics}
+\iffalse
+\vr{The statistics need to be changed in this section, text will remain unchanged.}
+The dataset contains images from 148 categories. These categories can be roughly grouped to form super-categories: (i) People \& Animal (156 images); (ii) Apparel \& Cosmetic (133 images); (iii) Bottle, Box, \& Bag (129 images); (iv) Furniture and building elements (84 images); (v) Food \& Fruit (130 images); (vi) Toy \& Collectible (84 images); (vii) Office stationery (164 images); and (viii) Vehicle (49 images). \Fref{fig:categoryPlot} shows the categories and the super-categories together with the number of images for each category. 
+\fi
+
+The dataset contains a total of 6135 images. The average height and width of the images are 774 and 938 pixels, respectively. The average number of objects per image is 56, and the total number of objects is \mbox{343,818}. The minimum and maximum number of objects for one image are 7 and 3701, respectively. The three categories with the highest number of objects per image are: Lego (303 objects/image), Brick (271), and Marker (247). The three categories with lowest number of objects per image are: Supermarket shelf (8 objects/image), Meat Skewer (8), and Oyster (11). \Fref{fig:histogram} is a histogram plot for the number of images in several ranges of object count. 
+
+\begin{figure*}[!th]
+
+  \begin{subfigure}[b]{0.23\textwidth}    \includegraphics[height=0.75\textwidth,width=\textwidth]{./Images/examples/1084.png}
+  \end{subfigure}
+  \hfill
+  \begin{subfigure}[b]{0.23\textwidth}    \includegraphics[height=0.75\textwidth,width=\textwidth]{./Images/examples/1306.png}
+  \end{subfigure}
+  \hfill
+    \begin{subfigure}[b]{0.23\textwidth}    \includegraphics[height=0.75\textwidth,width=\textwidth]{./Images/examples/931.png}%1866 {./Images/examples/4077.png}
+  \end{subfigure}
+  \hfill
+      \begin{subfigure}[b]{0.23\textwidth}    \includegraphics[height=0.75\textwidth,width=\textwidth]{./Images/examples/31.png}
+  \end{subfigure}
+  \vspace{3pt}
+
+  \begin{subfigure}[b]{0.23\textwidth}    \includegraphics[height=0.75\textwidth,width=\textwidth]{./Images/examples/2768.png}
+  \end{subfigure}
+  \hfill
+  \begin{subfigure}[b]{0.23\textwidth}    \includegraphics[height=0.75\textwidth,width=\textwidth]{./Images/examples/2459.png}
+  \end{subfigure}
+  \hfill
+    \begin{subfigure}[b]{0.23\textwidth}    \includegraphics[height=0.75\textwidth,width=\textwidth]{./Images/examples/2878.png}
+  \end{subfigure}
+  \hfill
+      \begin{subfigure}[b]{0.23\textwidth}    \includegraphics[height=0.75\textwidth,width=\textwidth]{./Images/examples/2775.png}%2686.png}
+  \end{subfigure}
+\vskip -0.05in
+  \caption{{\bf Few annotated images from the dataset}. Dot and box annotations are shown in red and blue respectively. The number of objects in each image varies widely, some images contain a dozen of objects while some contains thousands.  \label{fig:annotation_examples} }
+
+\end{figure*}
+\section{Experiments}
+
+\subsection{Performance Evaluation Metrics} 
+
+We use Mean Absolute Error (MAE) and Root Mean Squared Error (RMSE) to measure the accuracy of a counting method. MAE and RMSE are commonly used metrics for counting task~\cite{zhang2016single,ma2019bayesian,ranjan2018iterative}, and they are defined as follows.
+$MAE = \frac{1}{n}\sum_{i=1}^{n} \lvert c_i - \hat{c}_i \rvert; 
+RMSE = \sqrt[]{\frac{1}{n}\sum_{i=1}^{n} (c_i - \hat{c}_i)^2}, 
+$
+where $n$ is the number of test images, and $c_i$ and $\hat{c}_i$ are the ground truth and predicted counts.
+
+\subsection{Comparison with Few-Shot Approaches}
+\setlength{\tabcolsep}{2pt}
+\begin{table}[!tb]
+\vskip 0.1in
+\centering
+\begin{tabular}{lcccc}
+\toprule
+          &  \multicolumn{2}{c}{ Val Set} &  \multicolumn{2}{c}{ Test Set} \\
+         \cmidrule(lr){2-3} \cmidrule(lr){4-5} 
+    Method &  MAE          & RMSE    & MAE          & RMSE         \\
+
+\midrule 
+Mean & 53.38 & 124.53 & 47.55 & 147.67 \\
+Median & 48.68 & 129.70 & 47.73 & 152.46 \\
+FR few-shot detector  \cite{kang2019few} & 45.45  & 112.53 & 41.64 & 141.04 \\
+FSOD few-shot detector \cite{fan2020few} & 36.36 & 115.00 & 32.53  & 140.65 \\
+Pre-trained GMN \cite{lu2018class} & 60.56 &  137.78 & 62.69 & 159.67 \\
+GMN \cite{lu2018class} & 29.66 & 89.81 & 26.52 & 124.57  \\
+MAML \cite{finn2017model} & 25.54 & 79.44 & 24.90  & 112.68 \\
+FamNet (Proposed)   & \textbf{23.75} & \textbf{69.07} & \textbf{22.08} & \textbf{99.54}  \\
+\bottomrule 
+\end{tabular}
+\vskip -0.1in
+\caption{Comparing FamNet to two simple baselines (Mean, Median) and four stronger baseline (Feature Reweighting (FR) few-shot detector, FSOD few-shot detector, GMN and MAML), these are few-shot methods that have been adapted and trained for counting. FamNet has the lowest MAE and RMSE on both val and test sets.
+\label{tab:baseline}}
+\end{table}
+
+We compare the performance of FamNet with two trivial baselines and four competing few-shot methods. The two trivial baseline methods are: (1) always output the average object count for training images; (2) always output the median count for the training images. We also implement stronger methods for comparison, by adapting several few-shot methods for the counting task and training them on our training data. Specifically, we adapt the following approaches for counting: the state-of-the-art few-shot detectors~\cite{kang2019few,fan2020few}, the Generic Matching Network (GMN)~\cite{lu2018class}, and Model Agnostic Meta Learning (MAML)~\cite{finn2017model}. 
+We implement MAML using the higher library~\cite{grefenstette2019generalized}, which is a meta learning library supporting higher order optimization. The training procedure of MAML involves an \textit{inner optimization loop}, which adapts the network to the specific test classes, and an \textit{outer optimization loop} which learns meta parameters that facilitate faster generalization to novel tasks. At test time, only the inner optimization is performed. We use the $\mL_{Adapt}$ loss defined in \Eref{adaptation3} for the inner optimization loop, and the MSE loss over the entire dot annotation map for the outer optimization loop. 
+
+As can be seen in \Tref{tab:baseline}, FamNet outperforms all the other methods. Surprisingly, the pre-trained GMN does not work very well, even though it is a class agnostic counting method. The GMN model trained on our training data performs better than its pre-trained version; and this demonstrates the benefits of our dataset. The state-of-the-art few-shot detectors~\cite{kang2019few,fan2020few} perform relatively poor, even when they are trained on our dataset.
+With these results, we are the first to show the empirical evidence for the inferiority of the detection-then-counting approach compared to the density estimation approach (GMN, MAML, FamNet) for generic object counting. However, this is not new for the crowd counting research community, where the density estimation approach dominates the recent literature~\cite{zhang2016single}, thanks to its robustness to occlusion and the freedom of not having to commit to binarized decisions at an early stage. Among the competing approaches, MAML is the best method of all. This is perhaps because MAML is a meta learning method that leverages the advantages of having the FamNet architecture as its core component. The MAML way of training this network leads to a better model than GMN, but it is still inferior to the proposed FamNet together with the proposed training and adaptation algorithms. In terms of training time per epoch, FamNet is around three times faster than MAML, because it does not require any higher order gradient computation like MAML. 
+
+\setlength{\tabcolsep}{3pt}
+\begin{table}[!t]
+\centering
+\begin{tabular}{lcccc}
+\toprule
+          &  \multicolumn{2}{c}{ Val-COCO Set} &  \multicolumn{2}{c}{ Test-COCO Set} \\
+         \cmidrule(lr){2-3} \cmidrule(lr){4-5} 
+    Method &  MAE          & RMSE    & MAE          & RMSE         \\
+
+\midrule 
+Faster R-CNN & 52.79 & 172.46 & 36.20 & 79.59 \\
+RetinaNet & 63.57 & 174.36 & 52.67 & 85.86 \\
+Mask R-CNN & 52.51 & 172.21 & 35.56 & 80.00 \\
+FamNet (Proposed)  & \textbf{39.82} & \textbf{108.13} & \textbf{22.76} & \textbf{45.92}  \\
+
+\bottomrule 
+\end{tabular}
+\vskip -0.1in
+\caption{{\bf Comparing FamNet with pre-trained object detectors}, on counting objects from categories where there are pre-trained object detectors. 
+\label{tab:detectors}}
+\end{table}
+
+\subsection{Comparison with Object Detectors}
+One approach for counting is to use a detector to detect objects and then count. This approach only works for certain categories of objects, where there are detectors for those categories. In general, it requires thousands of examples to train an object detector, so this is not a practical method for general visual counting. Nevertheless, we evaluate the performance of FamNet on a subset of categories from the validation and test sets that have pre-trained object detectors on the COCO dataset. We refer to these subsets as Val-COCO and Test-COCO, which comprise of 277 and 282 images respectively. Specifically, we compare FamNet with FasterRCNN~\cite{Ren-etal-NIPS15}, MaskRCNN~\cite{He-etal-ICCV17}, and RetinaNet~\cite{lin2017focal}. All of these pretrained detectors are available in the Detectron2 library~\cite{wu2019detectron2}. \Tref{tab:detectors} shows the comparison results. As can be seen, FamNet outperforms the pre-trained detectors, even on object categories where the detectors have been trained with thousands of annotated examples from the COCO dataset. 
+\setlength{\tabcolsep}{10pt}
+\begin{table}[!t]
+\centering
+\begin{tabular}{crr}
+\toprule
+Number of Exemplars & MAE & RMSE \\
+\midrule 
+1 & 26.55 & 77.01 \\
+2 & 24.09 & 72.37 \\
+3 & 23.75 & 69.07 \\
+\bottomrule 
+\end{tabular}
+\vskip -0.1in
+\caption{{Performance of FamNet on the validation data as the number of exemplars increases}. FamNet can provide a reasonable count estimate even with a single exemplar, and the estimate becomes more accurate with more exemplars.  
+\label{tab:NoExemplars}}
+\end{table}
+
+\iffalse
+\setlength{\tabcolsep}{10pt}
+\begin{table}[!t]
+\centering
+\begin{tabular}{crr}
+\toprule
+Number of Exemplars & MAE & RMSE \\
+\midrule 
+1 & 28.49 & 86.21\\
+2 & 27.22 & 80.40 \\
+3 & 26.80 & 73.83 \\
+\bottomrule 
+\end{tabular}
+\vskip -0.1in
+\caption{{\vr{entire table}Performance of FamNet on the validation data as the number of exemplars increases}. FamNet can provide a reasonable count estimate even with a single exemplar, and the estimate becomes more accurate with more exemplars.  
+\label{tab:NoExemplars}}
+\end{table}
+
+\setlength{\tabcolsep}{3pt}
+\begin{table}[!thb]
+\centering
+\begin{tabular}{lcccc}
+\toprule
+Components & \multicolumn{4}{c}{Combinations}   \\
+\midrule
+Multi-scale image feature  & \xmark  & \checkmark &\checkmark &\checkmark \\
+Multi-scale exemplar feature & \xmark & \xmark &\checkmark & \checkmark \\
+Test time adaptation & \xmark& \xmark& \xmark& \checkmark  \\
+\midrule 
+MAE & 31.02 & 30.70 & 27.90 & 26.80 \\
+RMSE & 101.6 &  95.93 & 79.78 & 73.83 \\
+\bottomrule
+\end{tabular}
+\vskip -0.1in
+\caption{\vr{entire table}{\bf Analyzing the components of FamNet}. Each of the components of FamNet adds to the performance. \label{tab:ablation}}
+\end{table}
+\fi
+
+\setlength{\tabcolsep}{3pt}
+\begin{table}[!thb]
+\centering
+\begin{tabular}{lcccc}
+\toprule
+Components & \multicolumn{4}{c}{Combinations}   \\
+\midrule
+Multi-scale image feature & \xmark & \checkmark &\checkmark & \checkmark \\
+Multi-scale exemplar feature  & \xmark  & \xmark &\checkmark &\checkmark \\
+Test time adaptation & \xmark& \xmark& \xmark& \checkmark  \\
+\midrule 
+MAE & 32.70 & 27.80 & 24.32 & 23.75 \\
+RMSE & 104.31 &  93.53 & 70.94 & 69.07 \\
+\bottomrule
+\end{tabular}
+\vskip -0.1in
+\caption{{\bf Analyzing the components of FamNet}. Each of the components of FamNet adds to the performance. \label{tab:ablation}}
+\end{table}
+
+\subsection{Ablation Studies}
+We perform ablation studies on the validation set of FSC-147 to analyze: (1) how the counting performance changes as the number of exemplars increases, and (2) the benefits of different components of FamNet. 
+
+In \Tref{tab:NoExemplars}, we analyze the performance of FamNet as the number of exemplars is varied between one to three during the testing of FamNet. We see that FamNet can work even with one exemplar, and it outperforms all the competing methods presented in \Tref{tab:baseline} with just 2 exemplars. Not surprisingly, the performance of FamNet improves as the number of exemplars is increased. This suggests that an user of our system can obtain a reasonable count even with a single exemplar, and they can obtain a more accurate count by providing more exemplars. 
+
+In \Tref{tab:ablation}, we analyze the importance of the key components of FamNet: multi-scale image feature map, the multi-scale exemplar features, and test time adaptation. We train models without few/all of these components on the training set of FSC-147, and report the validation performance. We notice that all of the components of FamNet are important, and adding each of the component leads to improved results. 
+
+\subsection{Counting category-specific objects}
+
+FamNet is specifically designed to be general, being able to count generic objects with only a few exemplars. As such, it might not be fair to demand it to work extremely well for a specific category, such as counting cars. Cars are popular objects that appear in many datasets and this category is the explicit or implicit target for tuning for many networks, so it would not be surprising if our method does not perform as well as other customized solutions. Having said that, we still investigate the suitability of using FamNet to count cars from the CARPK dataset~\cite{hsieh2017drone}, which consists of overhead images of parking lots taken by downward facing drone cameras. The training and test set consists of 989 and 459 images respectively. There are around 90,000 instances of cars in the dataset. 
+
+We experiment with two variants of FamNet: a pre-trained model and a model trained on CARPK dataset. The pre-trained FamNet model is called FamNet--, which is trained on FSC-147, without using the data from CARPK or the car category from FSC-147. The FamNet model trained with training data from CARPK is called FamNet+, and it is trained as follows. 
+We randomly sample a set of 12 exemplars from the training set, and use these as the exemplars for all of the training and test images. We train FamNet$+$ on the CARPK training set. \Tref{tab:carspk} displays the results of several methods on this CARPK dataset.
+FamNet+ outperforms all methods except GMN~\cite{lu2018class}. GMN, unlike all the other approaches, uses extra training data from the ILSVRC video dataset which consists of video sequences of cars. Perhaps this may be why GMN works particularly well on CARPK.
+
+\setlength{\tabcolsep}{3pt}
+\begin{table}[!tb]
+\vskip .1in
+\centering
+\begin{tabular}{lrrrr}
+\toprule
+Method & MAE & RMSE \\
+\midrule 
+YOLO~\cite{Redmon-et-al-CVPR16,hsieh2017drone} & 48.89 & 57.55 \\
+Faster RCNN~\cite{ren2015faster,hsieh2017drone} & 47.45 & 57.39 \\
+One-look Regression~\cite{mundhenk2016large,hsieh2017drone} & 59.46 & 66.84 \\
+Faster RCNN~\cite{ren2015faster,hsieh2017drone}(RPN-small) & 24.32 & 37.62 \\
+Spatially Regularized RPN~\cite{hsieh2017drone} & 23.80 &36.79 \\
+GMN \cite{lu2018class} & 7.48 & 9.90  \\
+FamNet-- (pre-trained)    & 28.84 &  44.47 \\
+FamNet+ (trained with CARPK data) & 18.19 & 33.66 \\
+\bottomrule 
+\end{tabular}
+\vskip -0.1in
+\caption{{\bf Counting car performance on the CARPK dataset}. FamNet-- is a FamNet model, that is trained without any CARPK images nor images from the car category of FSC-147. Other methods use the entire CARPK train set. Pre-trained FamNet-- outperforms three of of the previous approaches. FamNet+, yields even better performance. 
+\label{tab:carspk}}
+\end{table}
+
+\newcommand\qualextwo{0.23\textwidth}
+\newcommand\qualexthree{0.15\textwidth}
+\newcommand\heightqualex{2.2cm}
+\begin{figure}[h]  
+\centering
+\makebox[\qualextwo]{Image}
+\makebox[\qualextwo]{Prediction}
+
+    \includegraphics[width=\qualextwo,height=\heightqualex]{Images/Quali/2807_image.png}
+    \includegraphics[width=\qualextwo,height=\heightqualex]{Images/Quali/2807_pred.png} \\    
+\makebox[\qualextwo]{GT Count: 263}
+\makebox[\qualextwo]{Pred Count: 280} \\ \vspace{2ex}
+
+    \includegraphics[width=\qualextwo,height=\heightqualex]{Images/Quali/197_image.png}
+    \includegraphics[width=\qualextwo,height=\heightqualex]{Images/Quali/197_pred.png} \\    
+\makebox[\qualextwo]{GT Count: 77}
+\makebox[\qualextwo]{Pred Count: 77} \\ \vspace{2ex}
+
+    \includegraphics[width=\qualextwo,height=\heightqualex]{Images/Quali/4571_image.png}
+    \includegraphics[width=\qualextwo,height=\heightqualex]{Images/Quali/4571_pred.png} \\    
+\makebox[\qualextwo]{GT Count: 47}
+\makebox[\qualextwo]{Pred Count: 46} \\ \vspace{2ex}
+
+    \includegraphics[width=\qualextwo,height=\heightqualex]{Images/Quali/762_image.png}
+    \includegraphics[width=\qualextwo,height=\heightqualex]{Images/Quali/762_pred.png} \\    
+\makebox[\qualextwo]{GT Count: 77}
+\makebox[\qualextwo]{Pred Count: 192} \\ \vspace{2ex}
+\iffalse
+    \includegraphics[width=\qualexthree,height=\heightqualex]{Images/Quali/2243_image.png}
+    \includegraphics[width=\qualexthree,height=\heightqualex]{Images/Quali/2243_pred.png}
+        \includegraphics[width=\qualexthree,height=\heightqualex]{Images/Quali/2243_pred_adapt.png}\\    
+\makebox[\qualexthree]{GT Count: 544}
+\makebox[\qualexthree]{Count: 147} 
+\makebox[\qualexthree]{Count: 177}\\ \vspace{2ex} \fi
+  \vskip -0.1in
+  \caption{{\bf Predicted density maps and counts of FamNet}. }
+  \label{fig:Qualitative}
+\end{figure}
+
+\begin{figure}[h]  
+\centering
+\makebox[\qualexthree]{Image}
+\makebox[\qualexthree]{Pre Adapt.}
+\makebox[\qualexthree]{Post Adapt.}
+    \includegraphics[width=\qualexthree,height=1.8cm]{Images/Quali/860_image.png}
+    \includegraphics[width=\qualexthree,height=1.8cm]{Images/Quali/860_pred.png}
+        \includegraphics[width=\qualexthree,height=1.8cm]{Images/Quali/860_pred_adapt.png}\\    
+\makebox[\qualexthree]{GT Count: 240}
+\makebox[\qualexthree]{Count: 356} 
+\makebox[\qualexthree]{Count: 286}\\ \vspace{2ex}
+  \vskip -0.1in
+  \caption{{\bf Test time adaptation}. Shown are the initial density map (Pre Adapt) and final density map after adaptation (Post Adapt). In case of over counting, adaptation decreases the density values at dense locations. }
+  \label{fig:Qualitative2}
+\end{figure}
+
+\subsection{Qualitative Results}
+\Fref{fig:Qualitative} shows few images and FamNet predictions. The first three are success cases,and the last is a failure case. For the fourth image, FamNet confuses portions of the background as being the foreground, because of similarity in appearance between the background and the object of interest. \Fref{fig:Qualitative2} shows a test case where test time adaptation improves on the initial count by decreasing the density values in the dense regions.
+
+\section{Conclusions}
+In this paper, we posed counting as a few-shot regression task. Given the non-existence of a suitable dataset for the few-shot counting task, we collected a visual counting dataset with relatively large number of object categories and instances. We also presented a novel approach for density prediction suitable for the few-shot visual counting task. We compared our approach with several state-of-art detectors and few shot counting approaches, and showed that our approach outperforms all of these approaches.
+
+\myheading{Acknowledgements:} This project is partially supported by MedPod, the SUNY2020 Infrastructure Transportation Security Center, and the NSF I/UCRC Center for Visual and Decision Informatics at Stony Brook.
+
+{\small
+\setlength{\bibsep}{0pt}
+
+}
+
+\end{document}

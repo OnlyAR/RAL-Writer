@@ -1,0 +1,464 @@
+\title{simple diffusion: End-to-end diffusion for high resolution images}
+
+\begin{document}
+
+\twocolumn[
+\icmltitle{simple diffusion: End-to-end diffusion for high resolution images}
+
+\icmlsetsymbol{equal}{*}
+
+\begin{icmlauthorlist}
+\icmlauthor{Emiel Hoogeboom}{equal,goog}
+\icmlauthor{Jonathan Heek}{equal,goog}
+\icmlauthor{Tim Salimans}{goog}
+\end{icmlauthorlist}
+
+\icmlaffiliation{goog}{Google Research, Brain Team, Amsterdam, Netherlands}
+
+\icmlcorrespondingauthor{Emiel Hoogeboom}{emielh@google.com}
+
+\icmlkeywords{Machine Learning, ICML}
+
+\vskip 0.3in
+]
+
+\printAffiliationsAndNotice{\icmlEqualContribution} % otherwise use the standard text.
+
+\begin{abstract}
+Currently, applying diffusion models in pixel space of high resolution images is difficult. Instead, existing approaches focus on diffusion in lower dimensional spaces (latent diffusion), or have multiple super-resolution levels of generation referred to as cascades. The downside is that these approaches add additional complexity to the diffusion framework.
+
+This paper aims to improve denoising diffusion for high resolution images while keeping the model as simple as possible. The paper is centered around the research question: How can one train standard diffusion models on high resolution images, and still obtain performance comparable to these alternate approaches? 
+
+The four main findings are: 1) the noise schedule should be adjusted for high resolution images, 2) It is sufficient to scale only a particular part of the architecture, 3) dropout should be added at specific locations in the architecture, and 4) downsampling is an effective strategy to avoid high resolution feature maps. Combining these simple yet effective techniques, we achieve state-of-the-art on image generation among diffusion models without sampling modifiers on ImageNet.\end{abstract}
+
+\begin{figure}
+    \centering
+    \includegraphics[width=.21\textwidth]{images/frog_sweater.jpg} \hspace{.01\textwidth}
+    \includegraphics[width=.21\textwidth]{images/owl_piano.jpg} \\
+    \vspace{.24cm}
+    \includegraphics[width=.44\textwidth]{images/robots_chess.jpg}
+    \caption{\textit{A dslr photo of a frog wearing a sweater}, \textit{An owl playing the piano, vivid, fantasy art}, and \textit{two robots playing chess with New York in the background}. Except for the frozen text encoder, \textit{simple diffusion} is trained end-to-end and images are generated in full pixel space.}
+    \label{fig:frog_sweater}
+    \vspace{-.4cm}
+\end{figure}
+
+\section{Introduction}
+Score-based diffusion models have become increasingly popular for data generation. In essence the idea is simple: one pre-defines a diffusion process, which gradually destroys information by adding random noise. Then, the opposite direction defines the denoising process, which is approximated with a neural network.\vspace{.2cm}
+
+Diffusion models have shown to be extremely effective for image, audio, and video generation. However, for higher resolutions the literature typically operates on lower dimensional latent spaces (latent diffusion) \citep{rombach2022highresolution} or divides the generative process into multiple sub-problems, for instance via super-resolution (cascaded diffusion) \citep{ho2022cascaded} or mixtures-of-denoising-experts \citep{balaji2022ediffi}. The disadvantage is that these approaches introduce additional complexity and usually do not support a single end-to-end training setup.
+
+\begin{figure*}[]
+    \centering
+    \includegraphics[width=.9\textwidth]{images/overview_samples.jpg}\vspace{-.2cm}
+    \caption{Generated images with \textit{simple diffusion}. Importantly, each image is generated in full image space by a single diffusion model without any cascades (super-resolution) or mixtures of experts. Samples are drawn from the U-Net model with guidance scale 4.}
+    \label{fig:overview}
+\end{figure*}
+
+In this paper, we aim to improve standard denoising diffusion for higher resolutions while keeping the model as simple as possible. Our four main findings are that 1) the noise schedule should be adjusted for larger images,  adding more noise as the resolution increases. 2) It is sufficient to scale the U-Net architecture on the $16 \times 16$ resolution to improve performance. Taking this one step further is the U-ViT architecture, a U-Net with a transformer backbone. 3) Dropout should be added for improved performance, but not on the highest resolution feature maps. And finally 4) for higher resolutions, one can down-sample without performance degradation. 
+Most importantly, these results are obtained using just a single model and an end-to-end training setup. After using existing distillation techniques which now only have to be applied to a single stage, the model can generate an image in 0.4 seconds.
+
+\section{Background: Diffusion Models}
+\label{sec:background}
+
+A diffusion model generates data by learning the reverse of a destruction process. Commonly, the diffusion process gradually adds Gaussian noise over time. It is convenient to express the process directly in the marginals $q(\vz_t | \vx)$ which is given by:
+\begin{equation}\small
+    q(\vz_t | \vx) = \mathcal{N}(\vz_t | \alpha_t \vx, \sigma_t^2 \rmI)
+\end{equation}
+where $\alpha_t, \sigma_t \in (0, 1)$ are hyperparameters that determine how much signal is destroyed at a timestep $t$, which can be continuous for instance $t \in [0, 1]$. Here, $\alpha_t$ is decreasing and $\sigma_t$ is increasing, both larger than zero. We consider a variance preserving process, which fixes the relation between $\alpha_t, \sigma_t$ to be $\alpha_t^2 = 1 - \sigma_t^2$. Assuming the diffusion process is Markov, the transition distributions are given by:
+\begin{equation}\small
+    q(\vz_t | \vz_s) = \mathcal{N}(\vz_t | \alpha_{ts} \vz_s, \sigma_{ts}^2 \rmI)
+\end{equation}
+where $\alpha_{ts} = \alpha_t / \alpha_s$ and $\sigma_{ts}^2 = \sigma_t^2 - \alpha_{t|s}^2 \sigma_s^2$ and $t > s$.
+
+\textbf{Noise schedule}
+An often used noise schedule is the $\alpha$-cosine schedule where $\alpha_t = \cos(\pi t / 2)$ which under the variance preserving assumption implies $\sigma_t = \sin(\pi t / 2)$. An important finding from \citep{kingma2021vdm} is that it is the signal-to-noise ratio $\alpha_t / \sigma_t$ that matters, which is then $1 / \tan(\pi t / 2)$ or in log space $\log \frac{\alpha_t}{\sigma_t} = -\log \tan(\pi t / 2)$. 
+
+\textbf{Denoising}
+Conditioned on a single datapoint $\vx$, the denoising process can be written as:
+\begin{equation}\small
+    q(\vz_s | \vz_t, \vx) = \mathcal{N}(\vz_t | \vmu_{t \to s}, \sigma_{t \to s}^2 \rmI).
+\end{equation}
+where $\vmu_{t \to s} = \frac{\alpha_{ts} \sigma_s^2}{\sigma_t^2} \vz_t + \frac{\alpha_s \sigma_{ts}^2}{\sigma_t^2} \vx$ and $ \sigma_{t \to s} = \frac{\sigma_{ts}^2 \sigma_{s}^2}{\sigma_t^2}$. An important and surprising result in literature is that when $\vx$ is approximated by a neural network $\hat{\vx} = f_\theta(\vz_t)$, then one can define the learned distribution $p(\vz_s | \vz_t) = q(\vz_s | \vz_t, \vx = \hat{\vx})$ without loss of generality as $s \to t$. This works because as $s \to t$, the true denoising distribution for all datapoints $q(\vz_s | \vz_t)$ (which is typically unknown) will become equal to $q(\vz_s | \vz_t, \vx = \mathbb{E}[\vx | \vz_t])$ \citep{song2021scorebasedsde}.
+
+\textbf{Parametrization}
+The network does not need to approximate $\hat{\vx}$ directly, and experimentally it has been found that other predictions produce higher visual quality. Studying the re-parametrization of the marginal $q(\vz_t | \vx)$ which is $\vz_t = \alpha_t \vx + \sigma_t \veps_t$ where $\veps_t \sim \mathcal{N}(0, 1)$, one can for instance choose the \textit{epsilon} parametrization where the neural net predicts $\hat{\veps}_t$. To obtain $\hat{\vx}$, one computes $\hat{\vx} = \vz_t / \alpha_t - \sigma_t \hat{\veps}_t / \alpha_t$. The problem with the epsilon parametrization is that it gives unstable sampling near $t = 1$. An alternative parametrization without this issue is called \textit{v prediction} and was proposed in \citep{salimans2022progressive}, it is defined as $\hat{\vv}_t = \alpha_t \hat{\veps}_t - \sigma_t \hat{\vx}$.
+
+Note that given $\vz_t$ one can obtain $\hat{\vx}$ and $\hat{\veps}_t$ via the identities $\sigma_t \vz_t + \alpha_t \hat{\vv}_t = (\sigma_t^2 + \alpha_t^2) \hat{\veps}_t = \hat{\veps}_t $ and  $\alpha_t \vz_t - \sigma_t \hat{\vv}_t = (\alpha_t^2 + \sigma_t^2) \hat{\vx} = \hat{\vx}$. In initial experiments we found \textit{v prediction} to train more reliably, especially for larger resolutions, and therefore we use this parametrization throughout this paper.
+
+\begin{figure*}
+    \centering
+    \includegraphics[interpolate=false,width=.7\textwidth]{images/diffusion_shifted.pdf}
+    \includegraphics[width=.235\textwidth]{images/plots_shifted.pdf}
+    \vspace{-.2cm}
+    \caption{The standard and shifted diffusion noise on an image of $512 \times 512$, that is visualized by average pooling to a resolution of $64 \times 64$. The top row shows a conventional cosine schedule, the bottom row shows our proposed shifted schedule.}
+    \label{fig:diffusion_shifted}
+\end{figure*}
+
+\textbf{Optimization}
+To train the model, we use the standard epsilon loss from \citep{ho2020denoising}. A way to motivate this choice of loss, is that using variational inference one can derive a lowerbound (in continuous time) on the model log-likelihood as done in \citep{kingma2021vdm}:
+\small\begin{align*}
+\begin{split}
+   \log p(\vx) &= \log \mathbb{E}_{q} \frac{p(\vx, \vz_0, \ldots, \vz_1)}{q(\vz_0, \ldots, \vz_1 | \vx)} \geq \mathbb{E}_{q} \log \frac{p(\vx, \vz_0, \ldots, \vz_1)}{q(\vz_0, \ldots, \vz_1 | \vx)} \\
+   &= \mathcal{L}_x + \mathcal{L}_T - \mathbb{E}_{t \sim \mathcal{U}(0, 1)} \Big{[} w(t) ||\veps_t - \hat{\veps}_t ||^2 \Big{]}, 
+\end{split}
+\end{align*}\normalsize
+where for a well-defined process $\mathcal{L}_x = -\log p(\vx | \vz_0) \approx 0$ for discrete $\vx$, $\mathcal{L}_T = -\mathrm{KL}(q(\vz_T | \vx) | p(\vz_T)) \approx 0$, and where $w(t)$ is a weighting function which for the equation to be true needs to be $w(t) = - \frac{\mathrm{d}}{\mathrm{d}t}\log \mathrm{SNR}(t)$ where $\mathrm{SNR}(t) = \alpha_t^2 / \sigma_t^2$. In practice, we generally use the unweighted loss on $\veps_t$ (meaning that $w(t) = 1$) which in \citep{ho2020denoising} was found to give superior sample quality. See Appendix~\ref{sec:addition_info_diffusion} for additional useful background information.
+
+\section{Method: simple diffusion}
+In this section, we introduce several modifications that enable denoising diffusion to work well on high resolutions.
+
+\subsection{Adjusting Noise Schedules}
+One of the modifications is the noise schedule that is typically used for diffusion models. The most common schedules is the $\alpha$-cosine schedule, which under the variance preserving assumption amounts to $\frac{\sigma_t}{\alpha_t} = \tan(\pi t / 2)$ (ignoring the boundaries around $t=0$ and $t = 1$ for this analysis) \citep{nichol2021improvedddpm}. This schedule was originally proposed to improve the performance on CIFAR10 which has a resolution of $32 \times 32$ and ImageNet $64 \times 64$. 
+
+However, for high resolutions not enough noise is added. For instance, inspecting the top row of Figure~\ref{fig:diffusion_shifted} shows that for the standard cosine schedule, the global structure of the image is largely defined already for a wide range in time. This is problematic because the generative denoising process only has a small time window to decide on the global structure of the image. We argue that for higher resolutions, this schedule can be changed in a predictable way to retain good visual sample quality.
+
+To illustrate this need in more detail, let us study a $128 \times 128$ problem. Given an input image $\vx$ the diffusion distribution for pixel $i$ is given by $q(z_t^{(i)} | \vx) = \mathcal{N}(z_t^{(i)} | \alpha_t x_i, \sigma_t)$. Commonly, diffusion models use network architectures that use \textit{downsampling} to operate on lower resolution feature maps, in our case with average pooling. Suppose we average pool $\vz_t$, where we let indices $1, 2, 3, 4$ denote the pixels in a $2 \times 2$ square that is being pooled. This new pixel is $z^{64 \times 64}_t = (z_t^{(1)} + z_t^{(2)} + z_t^{(3)} + z_t^{(4)}) / 4$. Recall that for variance of independent random variables is additive meaning that $\mathrm{Var}[X_1 + X_2] = \mathrm{Var}[X_1] + \mathrm{Var}[X_2]$ and that $\mathrm{Var}[aX] = a^2\mathrm{Var}[X]$ for a constant $a$. Letting $x^{64 \times 64}$ denote the first pixel of the average pooled input image, we find that $z^{64 \times 64}_t \sim \mathcal{N}(\alpha_t x^{64 \times 64}, \sigma_t / 2)$. The lower resolution pixel $z^{64 \times 64}_t$ only has half the amount of noise. We hypothesize that as resolutions increase this is problematic, as much less diffusion time is spent on the lower resolution, a stage at which the global consistency is generated.
+
+\begin{figure*}
+\centering
+\begin{subfigure}[t]{0.33\textwidth}
+\centering
+\includegraphics[width=.99\textwidth]{images/tti_256/dog_cycling.jpg}
+\caption{\textit{A dog riding a bicycle through Amsterdam}}
+\end{subfigure} \hfill
+\begin{subfigure}[t]{0.33\textwidth}
+\centering
+\includegraphics[width=.99\textwidth]{images/tti_256/car_desert.jpg}
+\caption{\textit{A futuristic car driving through the desert}}
+ \end{subfigure} \hfill
+\begin{subfigure}[t]{0.33\textwidth}
+\centering
+\includegraphics[width=.99\textwidth]{images/tti_256/distillation_gold.jpg}
+\caption{\textit{A distillation machine on a table creating gold}}
+\end{subfigure} \hfill
+\begin{subfigure}[t]{0.33\textwidth}
+\includegraphics[width=.99\textwidth]{images/tti_256/elephant_abstract.jpg}
+\caption{\textit{An abstract painting of an elephant}}
+\end{subfigure} \hfill
+\begin{subfigure}[t]{0.33\textwidth}
+\centering
+\includegraphics[width=.99\textwidth]{images/tti_256/city_overgrown.jpg}
+\caption{\textit{A futuristic city overgrown by nature}}
+\end{subfigure} \hfill
+\begin{subfigure}[t]{0.33\textwidth}
+\centering
+\includegraphics[width=.99\textwidth]{images/tti_256/lion_vangogh.jpg}
+\caption{\textit{A Van Gogh painting of a lion}}
+\end{subfigure}
+\begin{subfigure}[t]{0.33\textwidth}
+\centering
+\includegraphics[width=.99\textwidth]{images/tti_256/sphere_city.jpg}
+\caption{\textit{A city inside a glass pearl}}
+\end{subfigure} \hfill
+\begin{subfigure}[t]{0.33\textwidth}
+\centering
+\includegraphics[width=.99\textwidth]{images/tti_256/horse_hat.jpg}
+\caption{\textit{A horse wearing a hat}}
+\end{subfigure} \hfill
+\begin{subfigure}[t]{0.33\textwidth}
+\centering
+\includegraphics[width=.99\textwidth]{images/tti_256/balloon_brain.jpg}
+\caption{\textit{A balloon in the shape of the Google Brain logo}}
+\end{subfigure}
+\caption{Text to image samples at resolution $256 \times 256$, generated by a single stage diffusion model}
+\end{figure*}
+
+One can further derive that the $\alpha_t$ to $\sigma_t$ ratio at this lower resolution is twice as high, meaning that the signal to noise ratio is $2^2$ as high. And so $\mathrm{SNR}^{64 \times 64}(t) = \mathrm{SNR}^{128\times 128}(t) \cdot 2^2$, or in general:
+\begin{equation}\small
+    \mathrm{SNR}^{d / s \times d / s}(t) = \mathrm{SNR}^{d \times d}(t) \cdot s^2
+\end{equation}
+In summary, after averaging over a window of size $s \times s$, the ratio $\alpha_t$ to $\sigma_t$ increases by a factor $s$ (and thus the $\mathrm{SNR}$ by $s^2$). Hence, we argue that the noise schedule could be defined with respect to some reference resolution, say $32 \times 32$ or $64 \times 64$ for which the schedules were initially designed and successfully tested. 
+In our approach one first chooses a reference resolution, for example $64 \times 64$ (a reasonable choice as we will see empirically). At the reference resolution we define the noise schedule $\mathrm{SNR}^{64 \times 64}(t) = 1 / \tan(\pi t / 2)^2$ which in turn defines the desired $\mathrm{SNR}$ at full resolution $d \times d$:
+\begin{equation}
+    \mathrm{SNR}_{\mathrm{shift}\, 64}^{d \times d}(t) = \mathrm{SNR}^{64 \times 64}(t) \cdot (64 / d)^2,
+\end{equation}
+the signal to noise ratio is simply multiplied by $(64 / d)^2$, which for our setting $d > 64$ reduces the signal-to-noise ratio at high resolution. In log-space, this implies a simple shift of $2 \cdot \log (64 / d)$ (see Figure~\ref{fig:diffusion_shifted_snr}). For example, the equation of a noise schedule for images of 128 $\times$ 128 and a reference resolution of 64 the schedule is:
+\begin{equation*}
+    \log \mathrm{SNR}_{\mathrm{shift} \, 64}^{128 \times 128}(t) = - 2 \log \tan (\pi t / 2) + 2 \log (64 / 128).
+\end{equation*}
+Recall that under a variance preserving process, the diffusion parameters can be computed as $\alpha^2_t = \mathrm{sigmoid}(\log \mathrm{SNR}(t))$ and $\sigma^2_t = \mathrm{sigmoid}(-\log \mathrm{SNR}(t))$.
+
+Finally, it may be worthwhile to study the concurrent and complementary work \citep{chen2023importancenoise} which also analyzes adjusted noise schedules for higher resolution images and describes several other improvements as well.
+
+\begin{figure}
+    \centering
+    \includegraphics[width=.3\textwidth]{images/plot_logsnr.pdf}\vspace{-.1cm}
+    \caption{Log signal to noise ratio for the original and shifted cosine schedule.}
+    \label{fig:diffusion_shifted_snr}
+    \vspace{-.35cm}
+\end{figure}
+
+\paragraph{Interpolating schedules}
+A potential downside of shifting the schedule is that high frequency details are now generated much later in the diffusion process due to the increased per-pixel noise. However, we postulate that high-frequency details are weakly correlated when conditioning on the global/low-frequency features that are already generated. It should therefore be possible to generate the high-frequency details in few diffusion steps. Alternatively, one can \textit{interpolate} different shift schedules, for example for a resolution of $512$ one could include higher frequency details by starting at shift 32 and interpolating in log-space to shift 256. The schedule for $\log \mathrm{SNR}_{\mathrm{interpolate} (32 \to 256)}(t)$ equals:
+\begin{equation}\small
+     t \log \mathrm{SNR}_{\mathrm{shift} \, 256}^{512 \times 512}(t) + (1 - t) \log \mathrm{SNR}_{\mathrm{shift} \, 32}^{512 \times 512}(t)
+\end{equation}
+which has more equal weighting over low, mid and high frequency details. When sampling guidance is desired (for example in our text to image experiments) we recommend using this interpolated schedule. We found that shifted schedules can only tolerate little guidance, and interpolated schedules get better results with higher guidance weights.
+
+\subsection{Multiscale training loss}
+In the last section we argued that the noise schedule of our diffusion model should be adjusted when training on high resolution images so that the signal-to-noise ratio at our base resolution is held constant. However, even when adjusting the noise schedule in this way, the training loss on images of increasingly high resolution is dominated by high frequency details. To correct for this we propose replacing the standard training loss by a multiscale version that evaluates the standard training loss at downsampled resolutions with a weighting factor that increases for the lower resolutions. We find that the multiscale loss enables quicker convergence especially at resolutions greater than $256 \times 256$. The training loss at the $d \times d$ resolution can be written as:
+\[L^{d \times d}_{\theta}(\vx) = \frac{1}{d^{2}}\mathbb{E}_{\veps,t} \lVert \text{D}^{d \times d}[\veps] - \text{D}^{d \times d}[\hat{\veps}_{\theta}(\alpha_t \vx+\sigma_t \veps, t)] \rVert_{2}^{2},\]
+where $\text{D}^{d \times d}$ denotes downsampling to the $d \times d$ resolution. If this resolution is identical to the native resolution of our model $\hat{\veps}_{\theta}$ and data $\vx$, the downsampling does not do anything and can be removed from this equation. Otherwise, $\text{D}^{d \times d}[\hat{\veps}_{\theta}]$ can be considered as an adjusted denoising model for data at non-native resolution $d \times d$. Since downsampling an image is a linear operation, we have that $\text{D}^{d \times d}[\mathbb{E}(\veps|\vx)] = \mathbb{E}(\text{D}^{d \times d}[\veps]|\vx)$, and this way of constructing the lower-resolution model is thus indeed consistent with our original model.
+
+We then propose training our high resolution model against the multiscale training loss comprising of multiple resolutions. For instance for the resolutions $32, 64, \ldots, d$ the loss would be: 
+$\tilde{L}^{d \times d}_{\theta}(\vx) = \sum_{s \in \{32, 64, 128, \ldots, d\}} \frac{1}{s} L^{s \times s}_{\theta}(\vx)$.
+
+That is, we train against a weighted sum of training losses for resolutions starting at a base resolution (in this case $32 \times 32$) and always including the final resolution of $d \times d$. We find that losses for higher resolution are noisier on average, and we therefore decrease the relative weight of the loss as we increase the resolution.
+
+\subsection{Scaling the Architecture}
+Another question is how to scale the architecture. Typical model architectures half the channels each time the resolution is doubled such that the flops per operation is the same but the number of features doubles. The computational intensity (flops / features) also halves each time the resolution doubles. Low computational intensity leads to poor utilization of the accelerator and large activations result in out-of-memory issues. As such, we prefer to scale on the lower resolutions feature maps. Our hypothesis is that mainly scaling on a particular resolution, namely the $16 \times 16$ resolution is sufficient to improve performance within a range of network sizes we consider. Typically, low resolution operations have relatively small feature maps. To illustrate this, consider for example
+\begin{equation*} \small
+1024 \text{ (batch) } \times 16 \times 16 \times 1024 \text{ (channel)} \cdot 2 \text{ bytes} / \text{dim}
+\end{equation*}
+costs $0.5$ GB for a feature map whereas for a $256 \times 256$ feature map with $128$ channels, a feature map costs $16$ GB, given they are stored in a 16 bit float format. 
+
+Parameters have a smaller memory footprint: The typical size of a convolutional kernel is $3^2 \times 128^2  \text{ dimensions} \cdot 4 \text{ bytes} / \text{dims} \cdot 5 \text{ replications } = 2.8$MB and $180$MB for $1024$ channels, with $5$ replications for the gradient, optimizer state and exponential moving average. The point is, at a resolution of $16 \times 16$ both the size of feature maps are manageable at $16^2$ and the required space for the parameters is manageable. Summarizing this back-of-the-envelope calculation in Table~\ref{tab:memory_computation} one can see that for the same memory constraint, one can fit $16$GB $/$ $0.7$GB $\approx 23$ layers at $16 \times 16$ versus only $1$ at $256 \times 256$.
+
+\begin{table}
+    \centering
+    \caption{Memory and compute for a convolutional layer at the typical sizes encountered in diffusion architectures. Using more channels is usually much cheaper at lower resolutions in terms of memory, $B=1024$ for this example.}
+    \label{tab:memory_computation}
+    \scalebox{.8}{
+    \begin{tabular}{l l l}
+    \toprule
+    Size & ($B \times 256^2 \times 128)$ & ($B \times 16^2 \times 1024)$  \\ \midrule
+    Conv Kernel Memory & 2.8MB & 180MB \\
+    Feature Map Memory & 16GB & 0.5GB \\ 
+    Total Memory & 16GB & 0.7GB \\  \midrule
+    Compute (TFLOPS) & 9 & 2.3 \\
+        \bottomrule
+    \end{tabular}}\vspace{-.4cm}
+\end{table}
+
+Other reasons to choose this resolution is because it is the one at which self-attention starts being used in many existing works in the diffusion literature \citep{ho2020denoising,nichol2021improvedddpm}. Furthermore, it is the $16 \times 16$ resolution at which vision transformers for classification can operate successfully \citep{dosovitskiy2021imageisworth}. Although this may not be the ideal way to scale the architecture, we will show empirically that scaling the $16 \times 16$ level works well.
+
+An observant ML practitioner may have realized that when using multiple devices naively, parameters are replicated (typical in JAX and Flax) or stored on the first device (PyTorch). Both cases result in a situation where the memory requirements per device for the feature maps decreases with $1 / \text{devices}$ as desired, but the parameter requirement is unaffected and requires a lot of memory. We scale mostly at a low resolution where activations are relatively small but parameter matrices are large $O(\text{features}^2)$. We found that sharding the weights allows us to scale to much larger models without requiring more complicated parallelization approaches like model parallelism.
+
+\paragraph{Avoiding high resolution feature maps}
+High resolution feature maps are memory expensive. If the number of FLOPs is kept constant, memory still scales linearly with the resolution.
+
+In practise, it is not possible to decrease the channels beyond a certain size without sacrificing accelerator utilization. Modern accelerators have a very high ratio between compute and memory bandwidth. Therefore, a low channel count can make operation memory bound, causing a mostly idling accelerator and worse than expected wall-clock performance.
+
+To avoid doing computations on the highest resolutions, we down-sample images immediately as a the first step of the neural network, and up-sample as the last step. Surprisingly, even though the neural networks are cheaper computationally and in terms of memory, we find empirically that they also achieve better performance. We have two approaches to choose from.
+
+One approach is to use the invertible and linear 5/3 wavelet (as used in JPEG2000) to transform the image to lower resolution frequency responses as demonstrated in Figure~\ref{fig:dwt}. Here, the different feature responses are concatenated spatially for visual purposes. In the network, the responses are concatenated over the channel axis. When more than one level of DWT is applied (here there are two), then the responses differ in resolution. This is resolved by finding the lowest resolution (in the figure $128^2$) and reshaping pixels for the higher resolution feature maps, in the case of $256^2$ they are reshaped $128^2 \times 4$, as a typical space to depth operations. A guide on the implementation of the DWT can be found here\footnote{\url{http://trueharmoniccolours.co.uk/Blog/?p=14}}.
+
+If the above seems to complicated, there also exists a simpler solution if one is willing to pay a small performance penalty. As a first layer one can use a $d \times d$ convolutional layer with stride $d$, and an identically shaped \textit{transposed} convolutional layer as a last layer. This is equivalent to what is called patching in transformer literature. Empirically we show this performs similarly, albeit slightly worse.
+
+\begin{figure}
+    \centering
+    \includegraphics[width=0.235\textwidth]{images/tiger_gray.jpg}\hfill
+    \includegraphics[width=0.235\textwidth]{images/dwt.jpg}
+    \caption{The `5/3' DWT transform transforms an image to low and high frequency responses. Left: original image. Right: The different frequency responses of a two-level DWT, outputs are four $128 \times 128$ maps and three $256 \times 256$ maps. Best viewed electronically.} \vspace{-.6cm}
+    \label{fig:dwt}
+    \vspace{-.2cm}
+\end{figure}
+
+\subsection{Dropout}
+In architecture typically used in diffusion, a global dropout hyperparameter is used for the residual blocks, at all resolutions. In CDM \citep{ho2022cascaded}, dropout is used to generate images at lower resolutions. For the conditional higher resolution images, no dropout is used. However, various other forms of augmentation are performed on the data. This indicates that regularization is important, even for models operating on high resolutions. However, as we will demonstrate empirically, the naive method of adding dropout in all residual blocks does not give desired results. 
+
+Since our network design only scales the network size at lower resolutions, we hypothesize that it should be sufficient to only add dropout add the lower resolutions. This avoids regularizing the high resolution layers which are memory-wise expensive, while still using the dropout regularization that has been successful for models trained on lower resolution images.
+
+\subsection{The U-ViT architecture}
+Taken the above described changes to the architecture one step further, one can replace convolutional layers with MLP blocks if the architecture already uses self-attention at that resolution. This bridges the transformers for diffusion introduced by \citep{peebles2022scalable} with U-Nets, replacing its backbone with a transformer. Consequently, this relatively small change means that we now are using transformer blocks at these resolutions. The main benefit is that the combination of self-attention and MLP blocks has high accelerator utilization, and thus large models train somewhat faster. See Appendix~\ref{app:experimental_details} for details regarding this architecture. In essence, this U-Vision Transformer (U-ViT) architecture can be seen as a small convolutional U-Net which through multiple levels down-samples to the $16 \times 16$ resolution. At this stage a large transformer is applied after which the upsampling is again done via the convolutional U-Net.
+
+\subsection{Text to image generation}
+As a proof of concept, we also train a simple diffusion model conditioned on text data. Following \citep{saharia2022imagen} we use the T5 XXL \citep{raffel2020exploring} text encoder as conditioning. For further details see Appendix~\ref{app:experimental_details}. We train three models: One on images of resolution $256 \times 256$ for a direct comparison to models in literature, one on $512 \times 512$ and one on $384 \times 640$. For the last, non-square resolution, images are rotated during prepossessing if their width is smaller than their height, along which a `portrait mode' flag is set to true. As a result, this model can generate natively in a 5:3 aspect ratio for both landscape and portrait orientation.
+\section{Related Work}
+Score-based diffusion models \citep{sohldickstein2015diffusion,song2019generativemodellingestimatinggradient,ho2020denoising} are a generative model that pre-defines a stochastic destruction process. The generative process is learned by approximating the reverse process with the help of neural networks. 
+
+Diffusion models have been succesfully applied to image generation \citep{ho2020denoising,ho2022cascaded}, speech generation \citep{chen2020wavegrad,kong2021diffwave}, video generation \citep{singer2022makeavideo,saharia2022imagen}. Other types of generative models have also been successfully applied to image generation \citep{chang2022maskgit,sauer2022styleganxl,anonymous2023discrete}, although modifications such as guidance and low temperature sampling can make it difficult to compare these models fairly.
+Diffusion models for high resolutions (for example $512^2, 256^2, 128^2$) on complicated data (such as ImageNet) are generally not learned directly. Instead, approaches in literature divide the generative process into sub-problems via super-resolution \citep{ho2022cascaded}, or mixtures-of-denoisers \citep{feng2022ernievilg,balaji2022ediffi}. Alternatively, other approaches project high resolution data down to a lower dimensional latent space \citep{rombach2022highresolution}. Although this sub-division makes optimization easier, the engineering complexity increases: Instead of dealing with a single model, one needs to train and keep track of multiple models. In \citep{gu2022fdm} a different approach to adapt noise to resolution is proposed, although this method seems to generate lower quality samples with a more complicated scheme. We show that it is possible to train a single denoising diffusion model for resolutions up to $512 \times 512$ with only a small number modifications with respect to the original (modern) formulation in \citep{ho2020denoising}.
+
+\section{Experiments}
+\label{sec:results}
+
+\subsection{Effects of the proposed modifications}
+
+\begin{table}
+    \centering
+    \caption{Noise Schedule on ImageNet 128 and 256.}\vspace{-.2cm}
+    \label{tab:i128_i256_noise_schedule}
+    \scalebox{.9}{
+    \begin{tabular}{l l l}
+    \toprule
+    Noise Schedule & FID train & FID eval \\ \midrule
+    \textbf{128 $\times$ 128 resolution} \\
+    cosine (original at 128) & 2.96 & 3.38 \\
+    cosine (shifted to 64) & 2.41 & 3.03 \\
+    cosine (shifted to 32) & \textbf{2.26} & \textbf{2.88} \\ \midrule
+    \textbf{256 $\times$ 256 resolution} \\
+    cosine (original at 256) & 7.65 & 6.87 \\
+    cosine (shifted to 128) & 5.05 & 4.74 \\
+    cosine (shifted to 64) & 3.94 & 3.89 \\
+    cosine (shifted to 32) & \textbf{3.76} & \textbf{3.71} \\
+        \bottomrule
+    \end{tabular}}\vspace{-.4cm}
+\end{table}
+
+\begin{table}
+    \centering
+    \caption{Dropout Ablation on ImageNet 128}\vspace{-.2cm}
+    \label{tab:dropout}
+    \scalebox{.9}{
+    \begin{tabular}{l r r r r}
+    \toprule
+    Starting from Resolution & FID train & FID eval \\ \midrule
+    128 & 3.19 & 3.85 \\
+    64 & \textbf{2.27} & \textbf{2.85} \\
+    32 & 2.31 & 2.87 \\
+    16 & 2.41 & 3.03 \\
+    no dropout (at 700K iters) & 3.74 & 3.91 \\
+        \bottomrule
+    \end{tabular}} \vspace{-.4cm}
+\end{table}
+
+\textbf{Noise schedule}
+In this experiment it is studied how the noise schedule effects the quality of generated images, evaluated on FID50K score on both train and eval data splits. Recall that our hypothesis was that the cosine schedule does not add sufficient noise, but can be adjusted by `shifting' its log SNR curve using the ratio between the image resolution and the noise resolution. In these experiments, the noise resolution is varied from the original image resolution (corresponding to the conventional cosine schedule) all the way down to $32$ by factors of two.
+
+As can be seen in Table~\ref{tab:i128_i256_noise_schedule} for ImageNet at resolution 128 $\times$ 128 and resolution 256 $\times$ 256, shifting the noise schedule considerably improves performance. The difference is especially noticeable at the higher resolution, where the difference is 7.65 for the original cosine schedule against 3.76 for the shifted schedule in FID on the train data. Notice that the difference in performance between the shift towards either 64 and 32 is relatively small, albeit slightly better for the 32 shift. Given that the difference is small and that the shift 64 schedule performed slightly better in early iterations, we generally recommend the shift 64 schedule.
+
+\textbf{Dropout}
+The ImageNet dataset has roughly 1 million images. As noted by prior work, it is important to regularize the networks to avoid overfitting \citep{ho2022cascaded,dhariwal2021diffusionbeatgans}. Although dropout has been successfully applied to networks at resolutions of $64 \times 64$, it is often disabled for models operating on high resolutions. In this experiment we enable dropout only on a subset of the network layers: Only for resolutions below the given `starting resolution' hyperparameter. For example, if the starting resolution is $32$, then dropout is applied to modules operating on resolutions $32 \times 32$, $16 \times 16$ and $8 \times 8$.
+
+Recall our hypothesis that it should be sufficient to regularize the modules of the network that operate on the lower resolution feature maps. As presented in Table~\ref{tab:dropout}, this hypothesis holds. For this experiment on images of $128 \times 128$, adding dropout from resolutions $64, 32, 16$ all perform comparatively. Although adding dropout from $16 \times 16$ performed a little worse, we use this setting throughout the remainder of the experiments because it converged faster in early iterations.
+
+The experiment also shows two settings that do not work and should be avoided: either adding no dropout, or adding dropout starting from the same resolution as the data. This may explain why dropout for high resolution diffusion has not been widely used thus far: Typically dropout is set as a global parameter for all feature maps at all resolutions, but this experiment shows that such a regularization is too aggressive.
+
+\textbf{Architecture scaling}
+In this section we study the effect of increasing the amount of $16 \times 16$ network modules. In U-Nets, the number of blocks hyperparameter typically refers to the number of blocks on the `down' path. In many implementations, the `up' blocks use one additional block. When the table reads `2 + 3' blocks, that means 2 down blocks and 3 up blocks, which would in literature be referred to as 2 blocks.
+
+Generally, increasing the number of modules improves the performance as can be seen in Table~\ref{tab:scaling}. An interesting exception to this is the eval FID going from $8$ to $12$ blocks, which decreases slightly. We believe that this may indicate that the network should be more strongly regularized as it grows. This effect will later be observed to be amplified for the larger U-ViT architectures.
+
+\begin{table}
+    \centering
+    \caption{Scaling the U-Net architecture}\vspace{-.2cm}
+    \label{tab:scaling}
+    \scalebox{.95}{
+    \begin{tabular}{l l l r}
+    \toprule
+    \# blocks at $16 \times 16$ & FID train & FID eval & steps / sec \\ \midrule
+    2 \textcolor{gray}{+ 3} & 3.42 & 3.59 & \textbf{114}\% \\
+    4 \textcolor{gray}{+ 5} & 2.98 & 3.29 & 100\% \\
+    8 \textcolor{gray}{+ 9} & 2.46 & \textbf{3.00} & 76\% \\
+    12 \textcolor{gray}{+ 13} & \textbf{2.41} & 3.03 & 62\% \\
+        \bottomrule
+    \end{tabular}}
+\end{table}
+
+\begin{table}
+    \centering
+    \caption{Downsampling strategies on ImageNet 512 $\times$ 512.}\vspace{-.2cm}
+    \label{tab:downsampling}
+    \scalebox{.9}{
+    \begin{tabular}{l r r r r}
+    \toprule
+    Strategy & FID train & FID eval & steps / sec \\ \midrule
+    None & 5.60 & 5.23 & 100\% \\
+    DWT-1 & 5.42 & 4.97 & 139\% \\
+    DWT-2 & \textbf{4.85} & \textbf{4.58} & \textbf{146}\% \\
+    Conv-(2 $\times$ 2) & 5.99 & 5.33 & 137\% \\
+    Conv-(4 $\times$ 4) & 5.04 & 4.80 & \textbf{146}\% \\
+        \bottomrule
+    \end{tabular}}
+    \vspace{-.4cm}
+\end{table}
+
+\begin{table}
+    \centering
+    \caption{Multiscale loss. Note that the $256$ models use the shift 32 and the $512$ use shift 64. This loss modifications is helpful for the highest resolution, but diminishes performance slightly for lower resolutions.}
+    \label{tab:multiscale}\scalebox{.9}{
+    \begin{tabular}{l l l l}
+    \toprule
+    Resolution & FID train & FID eval & IS \\ \midrule
+    256 & \textbf{3.76} & \textbf{3.71} & \textbf{171.6} \\
+    + multiscale loss (32) & 4.00 & 3.89 & 171.0 \\ \midrule
+    512 & 4.85 & 4.58 & 156.1 \\
+     + multiscale loss (32) & \textbf{4.30} & \textbf{4.28} & \textbf{171.0} \\ 
+        \bottomrule
+    \end{tabular}}
+\end{table}
+\begin{table}
+    \centering
+    \caption{Comparison to generative models in the literature on ImageNet without any guidance or other sampling modifications, except ($^*$) which use temperature scaling.}\vspace{-.2cm}
+    \label{tab:literature_comparison}
+    \scalebox{.8}{
+    \begin{tabular}{l r r l}
+    \toprule 
+    & \multicolumn{2}{c}{FID} \\
+    Method & train & eval & IS \\ \midrule 
+    \textbf{128 $\times$ 128 resolution} \\
+    ADM \citep{dhariwal2021diffusionbeatgans} & 5.91 \\
+    CDM ($32, 64, 128$) \citep{ho2022cascaded} & 3.52 & 3.76 &  128.8 {\small $\pm$ 2.51} \\
+    RIN \citep{jabri2022scalable} & 2.75 & & 144.1 \\
+    simple diffusion (U-Net) (ours) & 2.26 & \textbf{2.88} & 137.3 {\small $\pm$ 2.03} \\
+    simple diffusion (U-ViT 2B) (ours) & \textbf{1.94} & 3.23 & \textbf{171.9} {\small $\pm$ 3.24} \\ \midrule
+    \textbf{256 $\times$ 256 resolution} \\
+    BigGAN-deep (no truncation) & 6.9\hspace{.175cm} & & 171.4 {\small $\pm$ 2} \\
+    MaskGIT \citep{chang2022maskgit} & 6.18 & & 182.1 \\
+    DPC$^\star$ (full 5) \citep{anonymous2023discrete} & 4.45 & & \textbf{244.8} \\ \midrule
+    \textit{Denoising diffusion models} \\ 
+    ADM \citep{dhariwal2021diffusionbeatgans} & 10.94 \\
+    CDM ($32, 64, 256$) \citep{ho2022cascaded} & 4.88 & 4.63 & 158.71 {\small $\pm$ 2.26} \\
+    LDM-4 \citep{rombach2022highresolution} & 10.56 & & 103.49 \\
+    RIN \citep{jabri2022scalable} & 4.51 & & 161.0 \\
+    DiT-XL/2 \citep{peebles2022scalable} & 9.62 & & 121.5 \\
+    simple diffusion (U-Net) (ours) & 3.76 & \textbf{3.71} & 171.6 {\small $\pm$ 3.07} \\
+    simple diffusion (U-ViT 2B) (ours) & \textbf{2.77} & 3.75 & 211.8 {\small $\pm$ 2.93} \\ 
+    \midrule
+    \textbf{512 $\times$ 512 resolution} \\ 
+    MaskGIT \citep{chang2022maskgit} & 7.32 & & 156.0 \\
+    DPC (U)$^\star$ \citep{anonymous2023discrete} & 3.62 &  & \textbf{249.4} \\ \midrule
+    \textit{Denoising diffusion models} \\ 
+    ADM \citep{dhariwal2021diffusionbeatgans}& 23.24 \\
+    DiT-XL/2 \citep{peebles2022scalable} & 12.03 & & 105.3 \\
+    simple diffusion (U-Net) (ours) & 4.30 & \textbf{4.28} & 171.0 {\small $\pm$ 3.00} \\
+    simple diffusion (U-ViT 2B) (ours) & \textbf{3.54} & 4.53 & 205.3{\small $\pm$ 2.65} \\
+        \bottomrule
+    \end{tabular}}
+    \vspace{-.2cm}
+\end{table}
+
+\begin{table}
+    \centering
+    \vspace{-.2cm}
+    \caption{Text to image result on zero-shot COCO}\vspace{-.2cm}
+    \label{tab:text_to_image_fid}
+    \scalebox{.9}{
+    \begin{tabular}{l r}
+    \toprule
+    Method & FID@30K 256 \\ \midrule
+    GLIDE \citep{nichol2022glide} & 12.24 \\
+    Dalle-2 \citep{ramesh2022hierarchicaltextconditional} & 10.39 \\
+    Imagen \citep{saharia2022imagen} & 7.27 \\
+    Muse \citep{chang2023muse} & 7.88 \\
+    Parti \citep{yu2022scalingautoregressive} & 7.23 \\
+    eDiff-I \citep{balaji2022ediffi} & \textbf{6.95} \\
+    simple diffusion (U-ViT 2B) (ours) & 8.30 \\
+        \bottomrule
+    \end{tabular}}
+\end{table}
+
+\textbf{Avoiding higher resolution feature maps}
+In this experiment, we want to study the effect of downsampling techniques to avoid high resolution feature maps. For this experiment we first have a standard U-Net for images of resolution 512. Then, when we downsample (either to 256 or to 128) using conventional layers or the DWT. For this study the total number of blocks is kept the same, by distributing the high resolution blocks that are skipped over the lower resolution blocks (see Appendix~\ref{app:experimental_details} for more details). Recall our hypothesis that downsampling should not cost much in sample quality, while considerably making the model faster. Surprisingly, in addition to being faster, models that use downsampling strategies also obtain better sample quality. It seems that downsampling for such a high resolution enables the network to optimize better for sample quality. Most importantly, it allows training without absurdly large feature maps without performance degradation.
+
+\textbf{Multiscale Loss}
+For this final experiment, we test the difference between the standard loss and the multiscale loss, which adds more emphasis on lower frequencies in the image. For the resolutions 256 and 512 we report the sample quality in FID score for a model trained with the multiscale loss enabled or disabled. As can be seen in Figure~\ref{tab:multiscale}, for 256 the loss does not seem to have much effect and performs slightly worse. However, for the larger 512 resolution the loss has an impact and reduces FID score. 
+
+\subsection{Comparison with literature}
+In this section, simple diffusion is compared to existing approaches in literature. Although very useful for generating beautiful images, we specifically choose to only compare to methods without guidance (or other sampling modifications such as rejection sampling) to see how well the model is fitted. These sampling modifications may produce inflated scores on visual quality metrics \citep{ho2022classifierfreeguidance}.
+
+Interestingly, the larger U-ViT models perform very well on train FID and Inception Score (IS), outperforming all existing methods in literature (Table~\ref{tab:literature_comparison}). However, the U-Net models perform better on eval FID. We believe this to be an extrapolation of the effect we observed before in Table~\ref{tab:scaling}, where increasing the architecture size did not necessarily result in better eval FID. For samples from the models see Figures~\ref{fig:overview} \& \ref{fig:random_samples_imagenet}.
+In summary, simple diffusion achieves SOTA FID scores on class-conditional ImageNet generation among all other types of approaches without sampling modifications. We think this is an incredibly promising result: by adjusting the diffusion schedule and modifying the loss, simple diffusion is a single stage model that operates on resolutions as large as 512 $\times$ 512 with high performance. See Appendix~\ref{app:additional_exps} for additional results.
+
+\textbf{Text to image}
+In this experiment we train a text-to-image model following \citep{saharia2022imagen}. In addition to the self-attention and mlp block, this network also has cross-attention in the transformer that operates on T5 XXL text embeddings. For these experiments we also replaced convolutional layers with self-attention at the 32 resolution feature maps to improve detail generation. As can be seen in Table~\ref{tab:text_to_image_fid}, simple diffusion is a little better than some recent text-to-image models such as DALLE-2, although it still lacks behind Imagen. For the resolution $512 \times 512$, the FID@30K score is 9.57. Importantly, our model is the first model that can generate images of this quality using only a single diffusion model that is trained end-to-end. 
+
+\section{Conclusion}
+In summary, we have introduced several simple modifications of the original denoising diffusion formulation that work well for high resolution images. Without sampling modifiers, simple diffusion achieves state-of-the-art performance on ImageNet in FID score and can be easily trained in an end-to-end setup. Furthermore, to the best of our knowledge this is the first single-stage text to image model that can generate images with such high visual quality.
+
+\clearpage
+
+\clearpage
+
+\end{document}

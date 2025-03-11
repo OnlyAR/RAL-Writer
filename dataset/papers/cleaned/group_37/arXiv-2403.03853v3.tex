@@ -1,0 +1,351 @@
+\title{ShortGPT: Layers in Large Language Models are More Redundant Than You Expect}
+
+\begin{document}
+
+\maketitle
+	\begin{abstract} \label{lab:abstract}
+		As Large Language Models (LLMs) continue to advance in performance, their size has increased significantly, with current LLMs containing billions or even trillions of parameters.  In this study, we identify notable redundancy across the layers of LLMs, where some layers contribute minimally to overall network functionality. To quantify this, we introduce a metric called Block Influence (BI) which use the similarity between layer's input and output to measure the importance of each layer. Based on the observation of layer redundancy, we propose a straightforward pruning method: layer removal, which eliminates redundant layers based on their BI scores. Our approach, termed ShortGPT, demonstrates superior performance over previous state-of-the-art pruning methods.  Moreover, ShortGPT is orthogonal to quantization-like methods, enabling further reduction in parameters and computation. The ability to achieve better results through simple layer removal, as opposed to more complex pruning techniques, suggests a high degree of redundancy across layers, not only in transformer models but also in non-transformer models. We hope this work will contribute to future research in LLM compression.
+	\end{abstract}
+	\section{Introduction}\label{lab:intro}
+	The field of large language models (LLMs) has witnessed rapid development recently, with LLMs achieving impressive performance across various domains. Guided by the scaling laws identified in prior work \citep{kaplan2020scaling,hoffmann2022training}, current LLM research tend to increase model parameters to boost performance. As a result, modern LLMs, which can comprise billions to trillions of parameters, require significant hardware resources for deployment, creating substantial barriers to their practical use.       
+	
+	To mitigate the hardware demands of large models, model compression techniques have become a critical area of focus \citep{zhu2023survey}. These techniques are generally divided into quantization \citep{liu2021post,gholami2022survey,dettmers2022llm,dettmers2024qlora} and pruning\citep{lecun1989optimal,han2015learning,frantar2023massive}. Quantization reduces the precision of model parameters, but its effectiveness often requires specific hardware support. In contrast, pruning method removes redundant parameters to decrease the model's size and computation, offering a more flexible and hardware-agnostic approach. Despite its advantages, many existing pruning methods are  complex; for example, some require gradient information \citep{ma2024llm}, which limits their practicality.
+	
+	
+	In this paper, we focus on the issue of layer redundancy in LLMs and propose a novel approach for simplifying these models. We introduce \textbf{Block Influence (BI)}, a metric that quantifies how much the hidden state changes after passing through each layer, providing a more direct measure of a layer's importance. Leveraging this insight, we propose a simple yet effective pruning method \textbf{ShortGPT}, which identifies and removes layers with lower BI scores, significantly reducing model size without sacrificing much performance. 
+	
+	To evaluate our approach, we conducted evaluation across comprehensive benchmarks.  Our experiments revealed that our method exhibits a smaller performance decrement compared to the previous methods. For instance,  removing 10 layers (25\% of the total 40 layers) from the LLaMA 2-13B model resulted in only a slight drop in performance on the MMLU benchmark \citep{hendrycks2020measuring}, from 55.0 to 52.2. Our findings highlight substantial redundancy in current LLMs and suggest potential avenues for improving the efficiency of model training by reducing inherent redundancy in the future.
+	
+	The main contributions of our paper are summarized as follows:
+	\begin{itemize}
+		\item We analyze the redundancy in large language models (LLMs) and find that they exhibit significant redundancy at the layer level. This finding inspire us to prune LLMs by simply removing redundant layers. 
+		\item We propose a metric called Block Influence (BI) as an  indicator of layer importance. Based on BI,  our layer removal method maintains approximately 90\% performance while reducing approximately 25\% of  parameters, outperforming previous state-of-the-art methods.
+		\item Furthermore, we demonstrate that our layer pruning approach is orthogonal to quantization methods, meaning it can be combined with quantization techniques to further reduce the deployment overhead of LLMs.
+	\end{itemize}	
+	
+	\begin{figure}[t]
+		\centering
+		\begin{subfigure}[t]{0.45\textwidth}
+			\centering  
+			\includegraphics[width=\textwidth]{image1/paper_pdfs/background-redundancy-ppl-v2.pdf}
+			\caption{Perplxity}
+			\label{fig:overall_illustartion_llama2:1}
+		\end{subfigure}
+		\hfill
+		\begin{subfigure}[t]{0.45\textwidth}
+			\centering  
+			\includegraphics[width=\textwidth]{image1/paper_pdfs/background-redundancy-mmlu-v2.pdf}
+			\caption{MMLU}
+		\end{subfigure}
+		\caption{Performance of removing certain layer from LLMs. We can see that certain layers are redundant, and their removal results in minimal performance degradation. }    %大图名称
+		\label{fig:background-redundancy}    %图片引用标记
+	\end{figure}
+	\section{Motivation}
+	\subsection{Background}
+	
+	The predominant LLMs are primarily based on the Transformer architecture \citep{vaswani2017attention}, with the pre-norm configuration being the most commonly adopted, as in models like LLaMA \citep{touvron2023llama}. The pre-norm configuration, where layer normalization is applied before the self-attention and feed-forward layers, offers several advantages such as faster convergence, improved training stability, and better scalability for deeper networks \citep{xiong2020layer, liu2020understanding, wang2024deepnet}. Due to these benefits, the pre-norm approach has been adopted even in non-transformer models, such as  Mamba \citep{gu2023mamba} and RWKV \citep{peng2023rwkv}. For the sake of simplicity in descriptions, our analysis primarily focuses on the Transformer architecture, though we extend our experiments to non-Transformer structures in Section \ref{sec:non-transformer}. 
+	
+		\begin{figure}[h]
+			\centering  
+			\includegraphics[width=0.8\textwidth]{image1/paper_pdfs/sim2.pdf}
+			\caption{The cosine similarity  between a layer's input and output during the training process. The horizontal axis (X-axis) represents the number of training tokens, while the vertical axis (Y-axis) depicts the degree of similarity. Notably, the model employing post-normalization exhibits divergence after approximately $\sim$26B tokens of training. Training setting is provided in \ref{appendix:post and pre}.}
+			\label{fig:background-similarity}    %图片引用标记
+		\end{figure}
+		
+		However, we observe that when pre-norm is adopted, the similarity between the input and output of transformer layers tends to be higher, as illustrated in Figure \ref{fig:background-similarity}. This high similarity indicates that certain layers induce minimal changes to the hidden states, suggesting they contribute little to the model’s overall function. A detailed mathematical explanation for this phenomenon is provided in Appendix \ref{appendix:math}. Which suggests that the deep layers of the model with pre-norm might not play a critical role in the overall function, and that \textbf{the layers in large language models could be more redundant than expected}, which motivates the layer-removal based pruning method we explore in the next section.
+		
+		
+		
+		
+		
+		\subsection{Layer redundancy}\label{layerredundancy}
+		\begin{wraptable}{r}{0.45\textwidth}\label{tab:last layer}
+				\centering
+				\caption{Ablation of removing FFN and Attention of Llama2-7B-Base. We sample 100 instances from PG19 \citep{rae2019compressive} to calculate PPL.}
+				\label{tab:last_layer}
+				\begin{tabular}{@{}ll@{}}
+					\toprule
+					\textbf{Delete} & \textbf{PPL} \\ \midrule
+					None & 7.60\\
+					The whole last layer & 13.37 \\
+					Attention of the last layer & 7.65 \\
+					FFN of the last layer & 12.35 \\ \bottomrule
+				\end{tabular}
+		\end{wraptable}
+		As discussed in the previous section, we speculate that the LLMs exhibit layer redundancy. To verify this, we assess the performance degradation caused by removing individual layers of two popular models, Llama2-7B-Base \citep{touvron2023llama}, an English based LLMs, and Baichuan2-7B-Base \citep{yang2023baichuan} which is mainly focused on Chinese. Figure \ref{fig:background-redundancy} confirms our speculation, which reveals that some layers do not play a crucial role in LLMs, causing little degradation when omitting them individually. Moreover, this redundancy is primarily manifested in the middle to later layers of the network, with the initial layers and the last layer often being more critical. Notably, we found the last layer to be particularly important, aligning with findings from LLM Pruner \citep{ma2024llm}. This observation contradicts our mathematical explanation in Appendix \ref{appendix:math} which suggests that deeper layers tend to be more redundant. We posit that this discrepancy arises because the final FFN effectively functions as part of the token classifier and should be considered in conjunction with the language model head.To verify our hypothesis, we conducted further investigation, detailed in Table \ref{tab:last_layer}. The results show that within the last layer, the FFN component is crucial, while the Attention module is less significant. This finding supports our interpretation of the final layer's importance.
+		
+		
+		
+		
+		\section{Methodology}
+		In this section, we present the methodological framework of our layer removal approach for LLMs, elucidating the underlying principles and techniques employed. We begin by introducing Block Influence (BI), a novel metric designed to assess the hidden states transformation of each layer. Leveraging BI, we then detail our layer removal method.
+		
+		
+		
+		\subsection{Layer importance} \label{method:layerimportacne}
+		As outlined in the preceding section, the layers of LLMs exhibit redundancy, with varying degrees of redundancy across different layers. To capture this, we introduce a new metric, Block Influence (BI), to measure the degree of transformation performed by each layer.   The BI score of $i^{th}$ layer can be calculated as follows: 
+		
+		
+		\begin{align}
+			\text{BI}_i = 1 - \mathbb{E}_{X,t} \frac{X_{i,t}^TX_{i+1,t}}{||X_{i,t}||_2||X_{i+1,t}||_2},
+		\end{align}
+		where $X_{i,t}$ means the $t^{th}$ row of hidden states of $i^{th}$ layer. Lower BI score imply that $X_i$ and $X_{i+1}$ exhibit high cosine similarity, suggesting that the layer makes minimal transformations to the hidden states and is therefore less important. We plot the BI scores of a single layer and the PPL after removing it separately, as shown in the Figure \ref{fig:bi_ppl}. The results demonstrate a positive correlation between the BI score and the importance of a layer.
+		
+		\begin{figure}[t]
+			\centering
+			\begin{subfigure}[t]{0.49\textwidth}
+				\centering  
+				\includegraphics[width=\textwidth]{image1/paper_pdfs/llama_bi_ppl.pdf}
+				\caption{Llama2 7B}
+			\end{subfigure}
+			\hfill
+			\begin{subfigure}[t]{0.49\textwidth}
+				\centering  
+				\includegraphics[width=\textwidth]{image1/paper_pdfs/bc_bi_ppl.pdf}
+				\caption{Baichuan2 7B }
+			\end{subfigure}
+			\caption{The BI score of a layer and the PPL after removing the layer. }    %大图名称
+			\label{fig:bi_ppl}    %图片引用标记
+		\end{figure}
+		
+		
+		\subsection{Layer Removal}
+		Our goal is to obtain a pruned model that remains as close as possible to the original model. Since an LLM functions as a series of transformations applied to hidden states across its layers and we can determine the importance of each layer, we propose a straightforward pruning method: layer removal, which we refer to as ShortGPT. We delete certain layers in LLMs based on BI score. First of all, we construct a calibration set, which is a set of unlabelled text samples such as PG19 \citep{rae2019compressive}. 
+		Then we collect the hidden states of each layer during inference on these samples. Next, we calculate the BI score based on the collected hidden states. Finally, we sort layers in ascending order according to the BI, and delete the layers with the lower BI score. The number of layers to be deleted can vary to trade off the speed and performance. The details of our layer removal setting can be found in Appendix \ref{appendix:remove_strategy}.
+		
+		\section{Experiments}\label{exp}
+		\subsection{Experimental Setup} \label{label:exp_setup}
+		\paragraph{Models.}To validate the effectiveness of our method, we conducted experiments on existing popular open-source language models, including Llama2-7B \citep{touvron2023llama}, Llama2-13B, Baichuan2-7B, and Baichuan2-13B. They are all large language models based on the decoder-only Transformer architecture. LLaMA 2 was trained on more than 2 trillion tokens. Baichuan-series was mainly trained in Chinese and its 13-Billion model replaced the RoPE \citep{su2024roformer} positional embedding with ALiBi \citep{press2021train}. 
+		
+		\paragraph{Benchmarks.} In order to comprehensively evaluate the changes in the ability of large language models before and after pruning, we conducted comprehensive evaluation from five aspect: \textbf{Reasoning}: CMNLI \citep{li2024cmmlu}, HellaSwag (HeSw) \citep{zellers2019hellaswag}, PIQA \citep{bisk2020piqa}. \textbf{Language}: CHID \citep{zheng2019chid},  WSC (Levesque et al., 2012). \textbf{Knowledge}: CommonSenseQA (CoQA) \citep{reddy2019coqa}, BoolQ \citep{clark2019boolq}. \textbf{Examination}: MMLU \citep{hendrycks2020measuring}, CMMLU \citep{li2024cmmlu}. \textbf{Understanding}: Race-High/Middle (H/M) \citep{lai2017race}, XSum \citep{hasan2021xl}, C3 \citep{sun2020investigating} and PG19 \citep{rae2019compressive}. For more details, please refer to Appendix \ref{appendix:benchmark}
+		
+		\paragraph{Baselines.} 
+		
+		To evaluate the effectiveness of our method, we compared several structured pruning methods for large language models, including:
+		
+		\textbf{1) LLMPru} \citep{ma2024llm}, which  adopts structural pruning that selectively removes non-critical coupled structures based on gradient information, maximally preserving the majority of the LLM’s functionality. LLMPru. applies post training to the pruned model, but for fair comparison, we do not apply post training to it.
+		
+		\textbf{2) SliceGPT} \citep{ashkboos2024slicegpt}, which is a post-training sparsification scheme that replaces each weight matrix with a smaller matrix, reducing the embedding dimension of the network. Specifically, they applied PCA to the hidden representation from shallow to deep layers, and incorporated the dimension reduction matrix into existing network parameters.
+		
+		\textbf{3) LaCo} \citep{yang2024laco}, which is a pruning method for large language models based on reducing layers. LaCo gradually merges similar layers from deep to shallow and sets a threshold to avoid continuously merging too many layers.
+		
+		For our evaluation, we use PG19 for layer importance and perplexity calculation. The models, baselines and evaluate benchmarks is the same as LaCo. 
+		
+		\renewcommand\arraystretch{1.3} 
+		\begin{table}[t]
+			\tiny
+			\setlength{\tabcolsep}{1.6pt}
+			\caption{Comparison of pruning methods on multiple natural language benchmarks. The results of LLMPrun., SliceGPT and LaCo are reported from LaCo. The last column reports the relative performance retention.}
+			\label{tab:llm_comparison_all}
+			\centering
+			\begin{tabular}{c|c|c|ccccccccccccc|cc}
+				\hline
+				\hline
+				\multirow{2}{*}{LLM} & \multirow{2}{*}{Method}  & \multirow{2}{*}{Ratio}& \multicolumn{13}{c|}{Benchmarks}& \multirow{2}{*}{Ave.} & \multirow{2}{*}{Per.} \\  
+				& & & CMNLI & HeSw&PIQA&CHID&WSC&CoQA&BoolQ&Race-H&Race-M&XSum&C3 &MMLU & CMMLU& &\\
+				\hline
+				\multirow{5}{*}{Llama2-7B} & Dense  & 0.00\% &32.99 &71.26 &77.91  &41.66 &50.00  &64.62 &71.62 &35.71  &34.19 &19.40 &43.56&45.39& 32.92 &47.78 &100.00
+				\\
+				& LLMPrun. & 27.0\% & \textbf{34.33} &\textbf{56.46}& \textbf{71.22} &25.25 &36.54  &42.51 &55.20 &22.56 &22.35 &11.51 &25.64& 23.33  &  25.25 &34.78&72.79\\
+				& SliceGPT  & 26.4\%& 31.70 &50.27 &66.21 &20.79 &36.54 & 41.36& 38.32&  21.07 &21.66& 4.89& \textbf{39.78}&28.92 & 25.37 &32.84&68.73   \\
+				& LaCo  & 27.1\%& 34.43 &55.69& 69.80 &\textbf{36.14} &40.38  &45.70 &64.07 &22.61& 23.61 &\textbf{15.64} &39.67&  26.45& 25.24&38.41& 80.39\\
+				& ShortGPT  & 27.1\%& 32.95	&53.02	&66.43	&24.68	&\textbf{52.46}	&\textbf{47.99}		&\textbf{74.71}&	\textbf{32.25}&	\textbf{35.17}&	0.67	&39.62&\textbf{43.96} &	\textbf{32.25}&\textbf{41.24}&\textbf{86.31} \\
+				\hline
+				\multirow{5}{*}{Llama2-13B} & Dense &0.00\%&32.99 	&74.78	&79.71	&47.35	&50.00	&66.91 &82.39 &57.95	&60.38	&23.45	&47.51&55.00 &38.40&55.14 &100.00  \\
+				& LLMPrun. &24.4\%&\textbf{33.03} &\textbf{67.76} &\textbf{76.66} &35.64 &40.38  &50.86 &56.42  &22.47 &22.08 &\textbf{19.17} &32.33 &25.21& 24.71&38.97&70.67\\
+				& SliceGPT &23.6\%&29.82 &55.71 &69.04 &19.31 &36.54  &47.26 &37.86 &23.41 &24.03 &5.27 &41.92 &  37.14& 25.79&34.85&63.20\\
+				& LaCo &24.6\%&32.86 &64.39 &63.20 &\textbf{40.10} &\textbf{52.88}  &52.66&\textbf{63.98} &54.49 &56.55 &14.45 &44.93&  45.93& 32.62 &47.62 &86.36\\
+				& ShortGPT  &24.6\%&33.00	&66.64&	73.45&	36.61	&50.00		&\textbf{58.64}&	62.48	&\textbf{58.35}	&\textbf{60.17}&	17.59	&\textbf{46.90}&\textbf{54.69}	&\textbf{38.38}&\textbf{50.53}& \textbf{91.64} \\
+				\hline
+				\multirow{5}{*}{Baichuan2-7B} & Dense &0.00\%&33.37 &67.56	&76.17	&85.56	&50.00	 &63.14 &74.10 &52.63	&51.04	 &20.82	&64.55& 53.87	& 56.95 &57.67&100.00 \\
+				& LLMPrun. &24.2\%&32.28 &53.66 &\textbf{71.82} &69.80 &\textbf{53.85} &\textbf{47.83} &61.19 &21.96 &22.28 &\textbf{15.98} &41.64 &  24.93 & 25.69 &41.76& 72.41 \\
+				& SliceGPT &22.2\%&32.07 &25.29 &50.33 &14.85 &36.54  &19.57 &39.30 &23.53 &22.49 &0.00 &26.58&  25.18 &25.25&26.23&45.48 \\
+				& LaCo &24.2\%&33.00 &52.28 &68.50 &\textbf{76.24} &42.31 &47.26 &56.15 &28.99 &27.72 &12.03 &50.85& 31.53 &31.24&42.93 & 74.44 \\
+				& ShortGPT &24.2\%&\textbf{33.30} 	&\textbf{56.96}	&67.68	&65.63	&50.00	 &46.70 &\textbf{67.83} &\textbf{53.26} &\textbf{46.76}&0.04 &\textbf{56.33}& \textbf{45.77} &	\textbf{47.87} &\textbf{49.08}&\textbf{85.10} \\
+				\hline
+				\multirow{5}{*}{Baichuan2-13B} & Dense&0.00\%& 33.21 	&71.10	&78.07	&86.51	&50.00 &65.6 &77.89 &67.27	&68.94	 &25.02	&65.64 &  59.50 &61.30&62.31&100.00   \\
+				& LLMPrun. &24.3\%&\textbf{33.80} &53.57 &\textbf{71.82} &72.77 &37.50  &38.82 &56.54 &21.17 &21.61 &13.67 &39.89&  23.19 & 25.18&39.20&62.91 \\
+				& SliceGPT &22.8\%&32.07 &25.85 &51.03 &10.40 &36.54  &18.02 &37.83 &21.56 &21.52 &0.00 &24.99&  22.95 & 25.26&25.23& 40.49\\
+				& LaCo &24.7\%&33.03 &\textbf{60.71} &68.88 &76.73 &44.23  &\textbf{55.45} &62.35  &\textbf{56.92} &\textbf{57.80} &12.32 &\textbf{61.10}&  51.35 & 53.65&53.43& 85.75 \\
+				& ShortGPT &24.7\%&32.81 	&60.55	&\textbf{71.60}	&\textbf{80.17}	&\textbf{47.13}	 &54.30 &\textbf{62.54} &55.77	&56.41	 &\textbf{15.14}		&60.16 &\textbf{52.11}   &\textbf{58.86} &\textbf{54.43}&\textbf{87.35} \\
+				\hline
+				\hline
+			\end{tabular}
+			
+		\end{table}
+		
+		\subsection{Main Results}
+		
+		To validate the efficacy of our proposed method, we conducted comparative experiments against baseline techniques commonly employed in large language model evaluation. Considering the current structured pruning methods generally reduce parameters by no more than 30\%, we performed experiments with approximately 1/4 of the parameters pruned. The experimental results are presented in Table \ref{tab:llm_comparison_all}. Additional experiments exploring different parameter reduction proportions will be discussed in the subsequent section.
+		
+		The results demonstrate that the performance of the model pruned by our method significantly surpasses that of the baseline methods, maintaining most of the large language model's capabilities. Furthermore, we note that the approach of reducing the number of layers (ShortGPT/LaCo) outperforms the method of reducing the embedding dimensions (LLMPru./SliceGPT), implying that the model exhibits more redundancy in depth than in width. Further experimental analysis will be presented in the ensuing section.
+		
+		In Table \ref{tab:llm_comparison_all}, we fully adopted the benchmark, model, and pruning ratio in the LaCo paper. In order to make a more fair comparison with LLMprun. and SliceGPT, we compared them with the same benchmark, model, and pruning ratio in their original paper. The experimental results are shown in Appendix \ref{appendix:fair compare}. Consistent with our findings in Table \ref{tab:llm_comparison_all}, these experiments further demonstrate the significant layer redundancy present in existing large language models, and ShortGPT achieves superior performance compared to other pruning methods.
+		
+		The results show that coarse-grained pruning methods, such as removing entire layers, often outperform fine-grained approaches like Slice GPT or LLM Pruner.  We speculate that the reason is that the large language model is actually very robust, as shown in Figure \ref{fig:background-redundancy}, removing any deep layer individually actually has very little impact on the final output, which means it is difficult to define the importance of a finer grained module and perform pruning.
+		
+		
+		
+		
+		
+		
+		
+		\subsection{Varying  metric and pruning ratio} \label{ana:layerimportance}
+		\begin{figure}[h]
+			\centering
+			\includegraphics[width=0.9\textwidth]{image1/paper_pdfs/multi_metric.pdf}
+			\caption{\label{fig:importance-comp}Comparison of different importance metrics. Perplexity is calculated by removing each single layer, other metrics is calculated by hidden states of each layer.}
+		\end{figure}
+		The core principle of our method is to rank layers by their importance and remove the less significant ones. The choice of importance metric significantly influences the outcome. In this section, we define and compare several different importance metrics:
+		\begin{itemize}
+			\item \textbf{Sequential}: The importance is directly proportional to the sequence order, with shallower layers being less important. This can be implemented by  assigning the negative value of each layer's index as its importance metric.
+			
+			\item \textbf{Norm/Reverse-order}: This metric posits that importance is inversely proportional to the sequence order. It assigns higher importance scores to the shallower layers. This method gives the same order as measuring importance by hidden states norm as Figure \ref{fig:importance-comp} shows.
+			
+			\item \textbf{Relative Magnitude}: Proposed in \cite{samragh2023weight}, this metric assumes layers with larger $ ||\frac{f(x)}{x+f(x)}||$ are of higher importance, where $f$ is the layer transformation function.
+			
+			\item \textbf{BI}: we calculate the BI score mentioned in Section \ref{method:layerimportacne} as importance metric.
+		\end{itemize}
+		
+		
+		
+		
+		Figure \ref{fig:importance-comp} demonstrates the different metrics. We observe that shallower layers in the LLM network are more crucial than deeper ones. Figure \ref{fig:cum-methods-compare} shows the results of removing layers by different metrics, demonstrating that Our proposed BI outperforms other metrics. The method of Relative Magnitude is highly competitive, indicating that relative values can also reflect the importance to some extent. It is worth noting that the hidden states norm seems to be a good metric when only considering the MMLU benchmark, but the perplexity is relatively poor. 
+		
+		\begin{figure}[t]
+			\centering
+			\includegraphics[width=0.9\textwidth,height=0.6\textwidth]{image1/paper_pdfs/Cummlative-llama-metrics-compare.pdf}
+			\caption{\label{fig:cum-methods-compare} Performance of MMLU and perplexity when we prune by different metrics, with increasing pruning ratio. We can see that as the pruning ratio increases, the performance of the model declines.}
+		\end{figure}
+		As a pruning method, we further validated the effects of different pruning ratios on model performance. Experiments were conducted on the Llama2 and Baichuan2 models, observing the Perplexity and MMLU. The results for Llama2, as shown in Figure \ref{fig:cum-methods-compare}, demonstrate that the model's performance generally declines as the pruning ratio increases. However, we observe a notable phenomenon: the MMLU score exhibits a sharp drop at a specific layer. This sudden decrease suggests the presence of certain critical layers within the network that play a particularly important role in maintaining performance. Similar patterns are observed in the Baichuan2 model, as illustrated in Appendix \ref{appendix:details_bc}. 
+		
+		
+		\subsection{Redundancy on non-transformer LLM}\label{sec:non-transformer}
+		
+		To determine whether the observed depth redundancy is specific to the Transformer architecture, we extended our investigation to include two popular non-Transformer models,  RWKV-7B\footnote{ We use rwkv-v5-world-7B from https://huggingface.co/RWKV/v5-Eagle-7B-HF} \citep{peng2023rwkv} and Mamba-2.8B  \footnote{We take the model from https://huggingface.co/state-spaces/mamba-2.8b-hf} \citep{gu2023mamba}. Our experiments revealed that these models also exhibit resilience to layer removal, maintaining performance despite the elimination of certain layers. This finding suggests that the redundancy phenomenon may not be unique to Transformer-based models, but rather a common characteristic across current large language models. Table \ref{tab:rwkv_mamba} shows that our method is applicable and effective for both Mamba and RWKV models, suggesting that the redundancy is universal across current LLMs. However, it is worth noting that the RWKV model appears less redundant than Mamba and Transformer models, which warrants further investigation.
+		
+		
+		
+		\renewcommand\arraystretch{1.3}
+		\begin{table}[t]
+			\tiny
+			\setlength{\tabcolsep}{2.2pt}
+			\caption{ShortGPT pruning on RWKV and Mamba.}
+			\label{tab:rwkv_mamba}
+			\centering
+			\begin{tabular}{c|c|ccccccccccccccc}
+				\toprule
+				Model & Pruning ratio & CMNLI & HeSw & PIQA & CHID & WSC & CoQA & BoolQ & Race-H & Race-M & XSum & C3 & MMLU & CMMLU  &Ave. & Per. \\
+				\midrule
+				\multirow{5}{*}{Mamba-2.8B}
+				& 0\% & 35.97 & 61.84 & 75.52 & 35.56 & 49.69 & 56.35 & 60.67 & 24.9 & 25.3 & 15.03 & 42.08 & 26.29 & 25.32 & 41.12 & 100.00 \\
+				& 10.9\% & 32.95 & 59.71 & 73.01 & 32.52 & 49.28 & 52.66 & 51.41 & 24.27 & 25.21 & 14.95 & 41.1 & 26.01 & 25.00 & 39.08 & 95.04  \\
+				& 20.3\% & 31.29 & 55.69 & 69.64 & 29.12 & 48.36 & 48.32 & 62.2 & 23.61 & 23.61 & 14.71 & 41.59 & 25.69 & 25.37 & 38.36 & 93.29 \\
+				& 25\% & 29.96 & 52.38 & 68.77 & 26.02 & 48.26 & 44.96 & 62.2 & 23.67 & 23.26 & 14.00 & 40.71 & 24.32 & 24.89 & 37.18 & 90.42 \\
+				& 31.3\% & 28.25 & 47.02 & 64.91 & 21.38 & 49.69 & 44.96 & 62.17 & 21.87 & 22.77 & 13.77 & 40.44 & 24.48 & 24.77 & 35.59 & 86.55 \\
+				\midrule
+				\multirow{5}{*}{RWKV-7B}
+				& 0\% & 32.07 & 65.98 & 77.09 & 85.36 & 50.00 & 62.65 & 62.72 & 38.56 & 45.47 & 16.5 & 57.97 & 31.85 & 28.54 & 50.37 & 100.00 \\
+				& 9.4\% & 32.6 & 56.41 & 73.94 & 78.12 & 50.00 & 49.55 & 62.35 & 25.9 & 25.77 & 9.57 & 54.68 & 27.29 & 25.03 & 43.94 & 87.23 \\
+				& 18.8\% & 32.11 & 49.47 & 71.55 & 65.63 & 50.00 & 40.54 & 61.19 & 22.04 & 23.75 & 8.13 & 49.15 & 26.35 & 25 & 40.38 & 80.17\\
+				& 25\% & 32.41 & 39.73 & 65.13 & 52.6 & 50.00 & 29.65 & 60.92 & 22.56 & 21.59 & 12.02 & 41.86 & 25.52 & 25.08 & 36.85 & 73.16\\
+				& 28.1\% & 33.11 & 32.22 & 60.01 & 32.47 & 50.1 & 28.34 & 60.85 & 22.27 & 21.31 & 10.43 & 37.81 & 25.64 & 25.15 & 33.82 & 67.14\\
+				\bottomrule
+			\end{tabular}
+		\end{table}
+		
+		
+		\subsection{Orthogonal to Quantization}
+		In this section, we show that our method is orthogonal to quantization methods. We apply our method to Llama2-7B \footnote{We take the model from https://huggingface.co/TheBloke/Llama-2-7B-GPTQ} quantized by GPTQ algorithm. Table \ref{lab:orthogonal} shows that our method is compatible with the quantization-like method. In addition, we compared the performance of applying pruning before quantization \footnote{We use GPTQ algorithm for quantization from https://github.com/AutoGPTQ/AutoGPTQ}. The results shown in the Table \ref{tab:performance_comparison} further indicates that quantization and ShortGPT are orthogonal operations.
+		\renewcommand\arraystretch{1.2} 
+		\begin{table}[t]
+			\small
+			\caption{Layer removal results on Llama2-7B-Base-GPTQ.}
+			\label{lab:orthogonal}
+			\centering
+			\begin{tabular}{ccccc}
+				\hline
+				Model    & Ratio/Layer & Perplexity & MMLU & Throughput (speed up) \\ \hline \hline
+				
+				Baseline & 0\%/32 &8.03 &43.17  & 4331.23 Token/s (1.00x) \\ \hline
+				&  3.1\%/31   & 8.37   &42.88 & 4399.31 Token/s (1.02x)  \\ 
+				& 9.4\%/29   &9.44    & 42.31 & 4602.26 Token/s (1.06x)   \\ 
+				ShortGPT    & 12.5\%/28   &10.24 &41.62      & 4680.68 Token/s (1.08x)  \\ 
+				& 15.6\%/27   &11.42    &43.17  & 4756.94 Token/s (1.10x)   \\ 
+				& 25.0\%/24 &22.29  &41.68  & 5045.59 Token/s  (1.16x)  \\ 
+				& 27.1\%/23   &40.78&43.35 & 5146.99 Token/s  (1.19x)  \\ 
+				\hline
+			\end{tabular}
+		\end{table}
+		
+		
+		\begin{table}[t]
+			\small
+			\caption{Performance comparison of different methods}
+			\label{tab:performance_comparison}
+			\centering
+			\begin{tabular}{@{}lcc@{}}
+				\toprule
+				Method & MMLU & CMMLU \\
+				\midrule     \midrule
+				Llama2-7B-Baseline & 45.4 & 32.9 \\
+				\addlinespace
+				4-bit quantization & 44.9 & 32.5 \\
+				\addlinespace
+				Layer removal (27.1\%) & 44.0 & 32.3 \\
+				\addlinespace
+				4-bit quantization then layer removal & 42.4 & 31.0 \\
+				\addlinespace
+				Layer removal then 4-bit quantization & 41.2 & 30.5 \\
+				\bottomrule
+			\end{tabular}
+		\end{table}
+		
+		
+		\subsection{Post training to restore performance} \label{sec:post training}
+		To mitigate the performance loss resulting from layer removal, we explored post-training strategies inspired by \cite{chen2024compressing}. Our approach comprised two key steps: 1)Replacement: We substituted the removed layers with lightweight Multi-Layer Perceptron (MLP) modules. 2)Retraining: We subsequently retrained the modified model. The results in Table \ref{tab:replace} demonstrate the potential of post-train in recover performance loss. Appendix \ref{appendix:post-train} list the training details.
+		\begin{table}[htbp]
+			\setlength{\tabcolsep}{2.8pt}
+			\caption{Post-train Llama2-7B to restore performance.}
+			\label{tab:replace}
+			\centering
+			\tiny
+			\begin{tabular}{@{}lccccccccccccccc@{}}
+				\toprule
+				Method & Avg. & Ratio & CMNLI & HeSw & PIQA & CHID & WSC & CoQA & BoolQ & Race-H & Race-M & XSum & C3 & MMLU & CMMLU \\
+				\midrule
+				Dense & 47.78 & 0\% & 32.99 & 71.26 &77.91& 41.66 & 50.00 & 64.62 & 71.62 & 35.71 & 34.19 & 19.40 & 43.56 & 45.39&32.92 \\
+				ShortGPT & 41.22 & 27.1\% & 32.95 & 53.02 & 66.43 & 24.68 & 52.46 & 47.99 & 	74.41	&32.25	&35.17	&0.67	&39.62	&43.96&	32.25 \\
+				ShortGPT+post-train &43.16	&24.0\% & 32.99 &	54.83&	68.12&	31.82&51.37&	58.32	&72.36	&34.18	&34.68&	4.89	&40.37	&44.47	&32.73 \\
+				\bottomrule
+			\end{tabular}
+		\end{table}
+		
+		
+		\section{Limitation}\label{limitation}
+		Although our method demonstrates strong competitiveness compared to current pruning methods, there are some phenomena that have not been explained. Our experiments reveal that the negative effect of layer removal is more significant on generative tasks compared to multiple-choice tasks. When we remove 25\% layers from Llama2-7B or Baichuan2-7B, the performance in generative tasks such as XSum and C3 deceases to nearly zero, although the performance decline was not as significant on the larger model of the 13B. We speculate that compared to multiple-choice tasks, generative tasks face the problem of accumulated errors and large model is more robust than small one. The reasons behind it still need to be explored. The post-training techniques discussed in Section \ref{sec:post training} have the potential to mitigate this issue and warrant further exploration.
+		
+		
+		
+		\section{Related works}
+		To reduce the inference cost of large language models and increase their practical applications, there have been many recent works on compressing models, which can be classified into two categories:
+		model pruning and quantization. Besides, there are some works aim to study the redundancy of model which is essential for compressing models.
+		
+		\textbf{Model pruning:} model pruning \citep{lecun1989optimal,han2015learning} is a classic and effective method of reducing model redundancy modules to compress models. The model pruning methods mainly include unstructured pruning and structured pruning. The unstructured pruning simplifies an LLM by removing specific parameters without considering its internal structure, such as SparseGPT \citep{frantar2023massive} and LoRAPrune \citep{zhang2023pruning}. However, this method disregards the overall LLM structure, resulting in an irregular sparse model composition. Another more practical approach is structured pruning, GUM\citep{syed2023prune} makes an analysis of several structured pruning methods for decoder-only LLMs. LLM-Pruner \citep{ma2024llm}  selectively removes non-critical structures according to gradient information. ShearedLLaMA \citep{xia2023sheared} employs targeted structured pruning and dynamic batch loading. LaCo \citep{yang2024laco} used layer merging to compress the model. Compared to the previous method, our method is a simple and efficient structured pruning method.
+		
+		
+		\textbf{Quantization:} quantization \citep{liu2021post,gholami2022survey,dettmers2022llm,dettmers2024qlora} is a widely accepted technique in the field of model compression, which can significantly save the storage and computational costs of deep learning models. Traditional models are generally stored as floating-point numbers, but quantization converts them into integers or other discrete forms. LUT-GEMM \citep{park2022nuqmm} quantifies only weights and optimizes matrix multiplication in LLM using BCQ format. SPQR \citep{dettmers2023spqr}  identifies and isolates abnormal weights, stores them with higher accuracy, and compresses all other weights into 3-4 bits. Our model pruning method and quantization method are orthogonal, which means quantification based on our pruned model can further compress the model.
+		
+		
+		\textbf{Model redundancy:} researchers have long noticed the significant redundancy in nonlinear models \citep{catchpole1997detecting}. In recent years, the transformer model architecture has been widely applied, and researchers have also studied its redundancy. In \citep{bian2021attention}, researchers analyzed redundancy in attention mechanisms, in which clear and similar redundancy patterns (cluster structure) are observed among attention heads. In \citep{dalvi2020analyzing}, researchers dissect two pre-trained models, BERT \citep{devlin2018bert} and XLNet \citep{yang2019xlnet}, studying how much redundancy they exhibit at a representation level and a more fine-grained neuron-level. However, the redundancy in current large language models based on decoder-only structures still needs to be explored. 
+		
+		\section{Conclusion}
+		
+		In this work,  we uncovered the significant layer-wise redundancy of LLMs, Our research demonstrates that certain layers contribute minimally to overall network functionality and can be removed without substantially compromising model performance. Based on our observation, We introduce Block influence to quantify the importance of each layer and propose a simple and straightforward pruning method: layer removal. Our experiments demonstrates that it is possible to maintain up to approximately 90\% of a LLM's performance while reducing the model's parameter amount and computational requirements by approximately 25\%. Besides, our method is orthogonal to quantization methods and can be further improved by continual training. We hope that our work can provide some insight for future model compression techniques. 
+		Moreover, our work suggests potential avenues for improving the efficiency of model training by reducing inherent redundancy in the future.
+		
+		\newpage
+						
+		\newpage
+
+\end{document}

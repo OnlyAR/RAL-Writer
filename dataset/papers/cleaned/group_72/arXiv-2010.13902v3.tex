@@ -1,0 +1,482 @@
+\title{Graph Contrastive Learning with Augmentations}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+
+Generalizable, transferrable, and robust representation learning on graph-structured data remains a challenge for current graph neural networks (GNNs).  
+Unlike what has been developed for convolutional neural networks (CNNs) for image data, self-supervised learning and pre-training are
+less explored for GNNs.
+In this paper, we propose a graph contrastive learning (GraphCL) framework
+for learning unsupervised 
+representations of graph data.
+We first design four types of graph augmentations to incorporate various priors. We then systematically 
+study the impact of
+various combinations of graph augmentations on multiple datasets, in four different settings: semi-supervised, unsupervised, and transfer learning as well as adversarial attacks. The results show that, even without tuning augmentation extents nor using sophisticated GNN architectures, our GraphCL framework can produce graph representations of similar or better generalizability, transferrability, and robustness compared to state-of-the-art methods. We also investigate the impact of parameterized graph augmentation extents and patterns, and observe further performance gains in preliminary experiments. 
+Our codes are available at: \url{https://github.com/Shen-Lab/GraphCL}.
+\end{abstract}
+
+\renewcommand{\thefootnote}{\fnsymbol{footnote}}
+\footnotetext[1]{Equal contribution.}
+\renewcommand{\thefootnote}{\arabic{footnote}}
+
+\vspace{-1em}
+\section{Introduction} \label{introduction}
+Graph neural networks (GNNs) \cite{kipf2016semi,velivckovic2017graph,xu2018powerful}, following a neighborhood aggregation scheme, are increasingly popular for graph-structured data. Numerous variants of GNNs have been proposed to  achieve state-of-the-art performances in graph-based tasks, such as node or link classification \cite{kipf2016semi,velivckovic2017graph,you2020l2,liu2020towards,zou2019layer}, link prediction \cite{zhang2018link} and graph classification \cite{ying2018hierarchical,xu2018powerful}. Intriguingly, in most scenarios of graph-level tasks, GNNs are trained end-to-end under supervision.  For GNNs,  there is little exploration (except \cite{hu2019pre}) of (self-supervised) pre-training, a technique commonly used as a regularizer in training deep architectures that suffer from gradient vanishing/explosion \cite{erhan2009difficulty,glorot2010understanding}. The reasons behind the intriguing phenomena could be that most studied graph datasets, as shown in \cite{dwivedi2020benchmarking}, are often limited in size and GNNs often have shallow architectures to avoid over-smoothing \cite{li2018deeper} or ``information loss'' \cite{oono2019graph}.  
+
+We however argue for the necessity of exploring GNN pre-training schemes.  Task-specific labels can be extremely scarce for graph datasets (e.g. in biology and chemistry labeling through wet-lab experiments is often resource- and time-intensive) \cite{zitnik2018prioritizing,hu2019pre}, and pre-training can be a promising technique to mitigate the issue, as it does in convolutional neural networks (CNNs) \cite{goyal2019scaling,kolesnikov2019revisiting,chen2020simple}.  As to the conjectured reasons for the lack of GNN pre-training: first, real-world graph data can be huge and even benchmark datasets are recently getting larger \cite{dwivedi2020benchmarking,hu2020obg}; second, even for shallow models, pre-training could initialize parameters in a ``better" attraction basin  around a local minimum associated with better generalization \cite{glorot2010understanding}. 
+Therefore, we emphasize the significance of GNN pre-training.
+
+Compared to CNNs for images, there are unique challenges of designing GNN pre-training schemes for graph-structured data.  Unlike geometric information in images, rich structured information of various contexts exist in graph data \cite{velivckovic2018deep,sun2019infograph} %\red{(not sure these are still proper references for the whole sentence)} \blue{(I think this two paper enforce more on structure information in graph?)}, 
+as graphs are abstracted representations of raw data with diverse nature (e.g. molecules made of chemically-bonded atoms and networks of socially-interacting people).  It is thus difficult to design a GNN pre-training scheme generically beneficial to down-stream tasks. A na\"ive GNN pre-training scheme for graph-level tasks is to reconstruct the vertex adjacency information (e.g. GAE \cite{kipf2016variational} and GraphSAGE \cite{hamilton2017inductive} in network embedding).  This scheme can be very limited (as seen in \cite{velivckovic2018deep} and our Sec. \ref{sec:exp_sota}) because it over-emphasizes proximity that is not always beneficial \cite{velivckovic2018deep}, and could hurt structural information \cite{ribeiro2017struc2vec}. Therefore, a well designed pre-training framework is needed to capture highly heterogeneous information in graph-structured data.% \red{(this sentence needs revision again)}.
+
+Recently, in visual representation learning, contrastive learning has renewed a surge of interest \cite{wu2018unsupervised,ye2019unsupervised,ji2019invariant,chen2020simple,he2020momentum}. Self-supervision with handcrafted pretext tasks \cite{noroozi2016unsupervised,carlucci2019domain,trinh2019selfie,chen2020adversarial} relies on heuristics to design, and thus could limit the generality of the learned representations. In comparison, contrastive learning aims to learn representations by maximizing feature consistency under differently augmented views, that exploit data- or task-specific augmentations \cite{herzig2019learning}, to inject the desired feature invariance. 
+If extended to pre-training GCNs, this framework can potentially  overcome the aforementioned limitations of proximity-based pre-training methods \cite{kipf2016variational,hamilton2017inductive,you2020does,jin2020self,zhu2020self,zhang2020graph,hu2020gpt,liu2020self}. However, it is not straightforward to be directly applied outside visual representation learning and demands significant extensions to graph representation learning, leading to our innovations below.   
+
+\textbf{Contributions.}
+In this paper, we have developed contrastive learning with augmentations for GNN pre-training to address the challenge of data heterogeneity in graphs.
+(i) Since data augmentations are the prerequisite for constrastive learning but are under-explored in graph-data \cite{verma2019graphmix}, we first design four types of graph data augmentations, each of which imposes certain prior over graph data and parameterized for the extent and pattern.
+(ii) Utilizing them to obtain correlated views, we propose a novel graph contrastive learning framework (GraphCL) for GNN pre-training,
+so that representations invariant to specialized perturbations can be learned for diverse graph-structured data.
+Moreover, we show that GraphCL actually performs mutual information maximization, and the connection is drawn between GraphCL and recently proposed contrastive learning methods that we demonstrate that GraphCL can be rewritten as \textit{a general framework} unifying a broad family of contrastive learning methods on graph-structured data.
+(iii) Systematic study is performed to assess the performance of contrasting different augmentations on various types of datasets, revealing the rationale of the performances and providing the guidance to adopt the framework for specific datasets.
+(iv) Experiments show that GraphCL achieves state-of-the-art performance in the settings of semi-supervised learning, unsupervised representation learning and transfer learning. It additionally boosts robustness against common adversarial attacks. 
+
+\section{Related Work} \label{related_work}
+\textbf{Graph neural networks.}
+In recent years, graph neural networks (GNNs) \cite{kipf2016semi,velivckovic2017graph,xu2018powerful} have emerged as a promising approach for analyzing graph-structured data. 
+They follow an iterative neighborhood aggregation (or message passing) scheme to capture the structural information within nodes' neighborhood.
+Let $\mathcal{G} = \{ \mathcal{V}, \mathcal{E} \}$ denote an undirected graph,
+with $\boldsymbol{X} \in \mathbb{R}^{|\mathcal{V}| \times N}$ as the feature matrix
+where $\boldsymbol{x}_n = \boldsymbol{X}[n, :]^T$ is the $N$-dimensional attribute vector of the node $v_n \in \mathcal{V}$.
+Considering a $K$-layer GNN $f(\cdot)$, the propagation of the $k$th layer is represented as:
+\begin{equation}
+    \boldsymbol{a}_n^{(k)} = \mathrm{AGGREGATION}^{(k)}(\{ \boldsymbol{h}_{n'}^{(k-1)}: n' \in \mathcal{N}(n) \}), \:
+    \boldsymbol{h}_n^{(k)} = \mathrm{COMBINE}^{(k)}(\boldsymbol{h}_{n}^{(k-1)}, \boldsymbol{a}_n^{(k)}),
+\end{equation}
+where $\boldsymbol{h}_n^{(k)}$ is the embedding of the vertex $v_n$ at the $k$th layer with $\boldsymbol{h}_n^{(0)} = \boldsymbol{x}_n$,
+$\mathcal{N}(n)$ is a set of vertices adjacent to $v_n$,
+and $\mathrm{AGGREGATION}^{(k)}(\cdot)$ and $\mathrm{COMBINE}^{(k)}(\cdot)$ are component functions of the GNN layer.
+After the $K$-layer propagation, the output embedding for $\mathcal{G}$ is summarized on layer embeddings through the READOUT function. Then a multi-layer perceptron (MLP) is adopted for the graph-level downstream task (classification or regression):
+\begin{equation} \label{eq:gnn}
+    f(\mathcal{G}) = \mathrm{READOUT}(\{ \boldsymbol{h}_{n}^{(k)}: v_n \in \mathcal{V}, k \in K \}), \: \boldsymbol{z}_\mathcal{G} = \mathrm{MLP}(f(\mathcal{G})).
+\end{equation}
+
+Various GNNs have been proposed \cite{kipf2016semi,velivckovic2017graph,xu2018powerful}, achieving state-of-the-art performance in graph tasks.
+
+\textbf{Graph data augmentation.}
+Augmentation for graph-structured data still remains under-explored,
+with some work along these lines but requiring prohibitive additional computation cost \cite{verma2019graphmix}.
+Traditional self-training methods \cite{verma2019graphmix,li2018deeper} utilize the trained model to annotate unlabelled data;
+\cite{ding2018semi} proposes to train a generator-classifier network in the adversarial learning setting to generate fake nodes; and
+\cite{deng2019batch,feng2019graph}
+generate adversarial perturbations to node feature over the graph structure.
+
+\textbf{Pre-training GNNs.}
+Although (self-supervised) pre-training is a common and effective scheme for convolutional neural networks (CNNs) \cite{goyal2019scaling,kolesnikov2019revisiting,chen2020simple},
+it is rarely explored for GNNs.
+One exception \cite{hu2019pre} is restricted to studying pre-training strategies in the transfer learning setting, 
+We argue that a pre-trained GNN is not easy to transfer, due to the diverse fields that graph-structured data source from.
+During transfer, substantial domain knowledge is required for both pre-training and downstream tasks, otherwise it might lead to negative transfer \cite{hu2019pre,rosenstein2005transfer}.
+
+\textbf{Contrastive learning.}
+The main idea of contrastive learning is to make representations agree with each other under proper transformations, raising a recent surge of interest in visual representation learning \cite{becker1992self,wu2018unsupervised,ye2019unsupervised,ji2019invariant,chen2020simple}.
+On a parallel note, for graph data, 
+traditional methods trying to reconstruct the adjacency information of vertices \cite{kipf2016variational,hamilton2017inductive} can be treated as a kind of ``local contrast'',
+while over-emphasizing the proximity information at the expense of the structural information \cite{ribeiro2017struc2vec}.
+Motivated by \cite{belghazi2018mine,hjelm2018learning},
+\cite{ribeiro2017struc2vec,sun2019infograph,peng2020self} propose to perform contrastive learning between local and global representations to better capture structure information.
+However, graph contrastive learning has not been explored from the perspective of enforcing perturbation invariance as \cite{ji2019invariant,chen2020simple} have done.
+
+\section{Methodology}
+\subsection{Data Augmentation for Graphs}
+\label{sec:graph_data_augmentation}
+Data augmentation aims at creating novel and realistically rational data through applying certain transformation without affecting the semantics label. It still remains  under-explored for graphs except some with expensive computation cost (see Sec. \ref{related_work}).
+We focus on graph-level augmentations.  Given a graph $\mathcal{G} \in \{ \mathcal{G}_m: m \in M \}$
+in the dataset of $M$ graphs,
+we formulate the augmented graph $\hat{\mathcal{G}}$ satisfying: $\hat{\mathcal{G}} \sim q(\hat{\mathcal{G}} | \mathcal{G})$, 
+where $q(\cdot | \mathcal{G})$ is the augmentation distribution conditioned on the original graph,
+which is pre-defined, representing the human prior for data distribution. For instance for image classification, the applications of rotation and cropping encode the prior that people will acquire the same classification-based semantic knowledge from the rotated image or its local patches \cite{xie2019unsupervised,berthelot2019mixmatch}. 
+
+When it comes to graphs, the same spirit could be followed. However, one challenge as stated in Sec. \ref{introduction} is that graph datasets are abstracted from diverse fields 
+and therefore there may not be universally appropriate data augmentation as those for  images.
+In other words, for different categories of graph datasets some data augmentations might be more desired than others. 
+We mainly focus on three categories:
+biochemical molecules (e.g. chemical compounds, proteins) \cite{hu2019pre}, social networks \cite{kipf2016semi} and image super-pixel graphs \cite{dwivedi2020benchmarking}. Next, we propose four general data augmentations for graph-structured data and discuss the intuitive 
+priors that they introduce.
+\begin{table}[ht] \vspace{-1em}
+\scriptsize
+ \caption{Overview of data augmentations for graphs.
+ }
+ \label{tab:data_augmentation}
+ \centering
+ \begin{tabular}{c | c | c} 
+  \hline
+  \hline
+  \textbf{Data augmentation} & \textbf{Type} & \textbf{Underlying Prior} \\
+  \hline
+  \hline
+  Node dropping & Nodes, edges & Vertex missing does not alter semantics. \\
+  \hline
+  Edge perturbation & Edges & Semantic robustness against connectivity variations. \\
+  \hline
+  Attribute masking & Nodes & Semantic robustness against losing partial attributes. \\
+  \hline
+  Subgraph & Nodes, edges & Local structure can hint the full semantics. \\
+  \hline
+  \hline
+ \end{tabular} % \vspace{-1em}
+\end{table}
+
+\textbf{Node dropping.}
+Given the graph $\mathcal{G}$, node dropping will randomly discard certain portion of vertices along with their connections.
+The underlying prior enforced by it is that missing part of vertices does not affect the semantic meaning of $\mathcal{G}$. Each node's dropping probability follows a default i.i.d. uniform distribution (or any other distribution).  
+
+\textbf{Edge perturbation.}
+It will perturb the connectivities in $\mathcal{G}$ through randomly adding or dropping certain ratio of edges.
+It implies that the semantic meaning of $\mathcal{G}$ has certain robustness to the edge connectivity pattern variances. We also follow an i.i.d. uniform distribution to add/drop each edge.
+
+\textbf{Attribute masking.}
+Attribute masking prompts models to recover masked vertex attributes using their context information, i.e., the remaining attributes. The underlying assumption is that missing partial vertex attributes does not affect the model predictions much.  
+
+\textbf{Subgraph.} This one samples a subgraph from $\mathcal{G}$ using  random walk (the algorithm is summarized in Appendix A). It assumes that the semantics of $\mathcal{G}$ can be much preserved in its (partial) local structure. 
+
+The default augmentation (dropping, perturbation, masking and subgraph) ratio is set at 0.2. % for all graph data augmentations. Later on we will also present ablation studies on them.
+
+\begin{figure}[t] 
+    \centering 
+    \includegraphics[width=0.85\linewidth]{CLGCN_new.pdf}
+    \caption{\small{A framework of graph contrastive learning. Two graph  augmentations $q_i(\cdot | \mathcal{G})$ and $q_j(\cdot | \mathcal{G})$ are sampled from an augmentation pool $\mathcal{T}$ and applied to input graph $\mathcal{G}$. A shared GNN-based encoder $f(\cdot)$ and a projection head $g(\cdot)$ are trained to maximize the agreement between representations $z_i$ and $z_j$ via a contrastive loss.}} 
+    \label{fig:graphcl} 
+    \vspace{-0.5em}
+\end{figure}
+
+\subsection{Graph Contrastive Learning}
+Motivated by recent contrastive learning developments in visual representation learning (see Sec. \ref{related_work}),
+we propose a graph contrastive learning framework (GraphCL) for (self-supervised) pre-training of GNNs.
+In graph contrastive learning, pre-training is performed through maximizing the agreement between two augmented views of the same graph via a contrastive loss in the latent space as shown in Fig. \ref{fig:graphcl}.
+The framework consists of the following four major components:
+
+(1) \textbf{Graph data augmentation.}
+The given graph $\mathcal{G}$ undergoes graph data augmentations to obtain two correlated views $\hat{\mathcal{G}}_i, \hat{\mathcal{G}}_j$, as a positive pair,
+where $\hat{\mathcal{G}}_i \sim q_i(\cdot | \mathcal{G}), \hat{\mathcal{G}}_j \sim q_j(\cdot | \mathcal{G})$ respectively.
+For different domains of graph datasets, how to strategically select data augmentations matters (Sec. \ref{sec:aug}).
+
+(2) \textbf{GNN-based encoder.}
+A GNN-based encoder $f(\cdot)$ (defined in \eqref{eq:gnn}) extracts graph-level representation vectors $\boldsymbol{h}_i, \boldsymbol{h}_j$ for augmented graphs $\hat{\mathcal{G}}_i, \hat{\mathcal{G}}_j$.
+Graph contrastive learning does not apply any constraint on the GNN architecture.
+
+(3) \textbf{Projection head.}
+A non-linear transformation $g(\cdot)$ named projection head maps augmented representations to another latent space where the contrastive loss is calculated, as advocated in \cite{chen2020simple}.
+In graph contrastive learning, a two-layer perceptron (MLP) is applied to obtain $\boldsymbol{z}_i, \boldsymbol{z}_j$.
+
+(4) \textbf{Contrastive loss function.}
+A contrastive loss function $\mathcal{L}(\cdot)$ is defined to enforce maximizing the consistency between positive pairs $\boldsymbol{z}_i, \boldsymbol{z}_j$ compared with negative pairs.
+Here we utilize the normalized temperature-scaled cross entropy loss (NT-Xent) \cite{sohn2016improved,wu2018unsupervised,oord2018representation}.
+
+During GNN pre-training, a minibatch of $N$ graphs are randomly sampled and processed through contrastive learning, resulting in $2N$ augmented graphs and corresponding contrastive loss to optimize,
+where we re-annotate $z_i, z_j$ as $z_{n,i}, z_{n,j}$ for the $n$th graph in the minibatch.
+Negative pairs are not explicitly sampled but generated from the other $N-1$ augmented graphs within the same minibatch as in \cite{chen2017sampling,chen2020simple}.
+Denoting the cosine similarity function as $\mathrm{sim}(\boldsymbol{z}_{n,i}, \boldsymbol{z}_{n,j}) = \boldsymbol{z}_{n,i}^\mathsf{T} \boldsymbol{z}_{n,j} / \lVert \boldsymbol{z}_{n,i} \rVert \lVert \boldsymbol{z}_{n,j} \rVert$, NT-Xent for the $n$th graph is defined as:
+\begin{equation} \label{eq:cl_loss}
+    \ell_{n} = -\mathrm{log}\frac{\mathrm{exp}(\mathrm{sim}(\boldsymbol{z}_{n,i}, \boldsymbol{z}_{n,j}) / \tau)}{\sum_{n'=1, n' \neq n}^N \mathrm{exp}(\mathrm{sim}(\boldsymbol{z}_{n,i}, \boldsymbol{z}_{n',j}) / \tau)},
+\end{equation}
+where $\tau$ denotes the temperature parameter.
+The final loss is computed across all positive pairs in the minibatch.
+The proposed graph contrastive learning is summarized in Appendix A.  % \ref{alg:graphcl}.
+
+\textbf{Discussion.}
+We first show that GraphCL can be viewed as one way of mutual information maximization between the latent representations of two kinds of augmented graphs. The full derivation is in Appendix F, with the loss form rewritten as below:
+\begin{equation} \label{eq:general_formulation}
+    \ell = \mathbb{E}_{\mathbb{P}_{\hat{\mathcal{G}}_i}} \{ - \mathbb{E}_{\mathbb{P}_{(\hat{\mathcal{G}}_j | \hat{\mathcal{G}}_i)}} T(f_1(\hat{\mathcal{G}}_i), f_2(\hat{\mathcal{G}}_j)) +  \mathrm{log} (\mathbb{E}_{\mathbb{P}_{\hat{\mathcal{G}}_j}} e^{T(f_1(\hat{\mathcal{G}}_i), f_2(\hat{\mathcal{G}}_j))}) \}.
+\end{equation}
+The above loss essentially maximizes a lower bound of the mutual information between $\boldsymbol{h}_i = f_1(\hat{\mathcal{G}}_i), \boldsymbol{h}_j = f_2(\hat{\mathcal{G}}_j)$ that the compositions of $(f_1, \hat{\mathcal{G}}_i), (f_2, \hat{\mathcal{G}}_j)$ determine our desired views of graphs.
+Furthermore, we draw the connection between GraphCL and recently proposed contrastive learning methods that we demonstrate that GraphCL can be rewrited as a general framework unifying a broad family of contrastive learning methods on graph-structured data, through reinterpreting \eqref{eq:general_formulation}.
+In our implementation, we choose $f_1 = f_2$ and generate $\hat{\mathcal{G}}_i, \hat{\mathcal{G}}_j$ through data augmentation, while with various choices of the compositions result in \eqref{eq:general_formulation} instantiating as other specific contrastive learning algorithms including \cite{velickovic2019deep,ren2019heterogeneous,park2020unsupervised,sun2019infograph,peng2020graph,hassani2020contrastive,qiu2020gcc} also shown in in Appendix F.
+
+\section{The Role of Data Augmentation in Graph Contrastive Learning}\label{sec:aug}
+
+\begin{wraptable}{r}{80mm}
+\vspace{-1em}
+\small
+ \caption{\small{Datasets statistics.}}
+ \label{tab:statistics}
+ \centering
+ \resizebox{0.58\textwidth}{!}{
+ \begin{tabular}{c | c | c | c | c } 
+  \hline
+  \hline
+  Datasets & Category & Graph Num. & Avg. Node & Avg. Degree \\
+  \hline
+  \hline
+  NCI1 & Biochemical Molecules & 4110 & 29.87 & 1.08 \\
+  PROTEINS & Biochemical Molecules & 1113 & 39.06 & 1.86 \\
+  \hline
+  COLLAB & Social Networks & 5000 & 74.49 & 32.99 \\
+  RDT-B & Social Networks & 2000 & 429.63 & 1.15 \\
+  \hline
+  \hline
+ \end{tabular}}% \vspace{-1em}
+\end{wraptable}
+
+In this section, we assess and rationalize the role of data augmentation for graph-structured data in our GraphCL framework.
+Various pairs of augmentation types are applied, as illustrated in Fig. \ref{fig:augvsaug}, to three categories of graph datasets (Table \ref{tab:statistics}, and we leave the discussion on superpixel graphs in Appendix C).  Experiments are performed in the semi-supervised setting, following the pre-training \& finetuning approach \cite{chen2020simple}.  
+Detailed settings are in Appendix B.
+
+\subsection{Data Augmentations are Crucial. Composing Augmentations Benefits.}
+We first examine whether and when applying (different) data augmentations helps graph contrastive learning in general.  We summarize the results in Fig.~\ref{fig:augvsaug} using the accuracy gain compared to training from scratch (no pre-training).  And we list the following \textbf{Obs}ervations.
+
+\begin{figure}[t] 
+    \centering 
+    \includegraphics[width=1\linewidth]{aug2.pdf}
+    \caption{\small{Semi-supervised learning accuracy gain (\%) when contrasting different augmentation pairs, compared to training from scratch, under four datasets: NCI1, PROTEINS, COLLAB, and RDT-B. Pairing ``Identical" stands for a no-augmentation baseline for contrastive learning, where the positive pair diminishes and the negative pair consists of two non-augmented graphs. 
+    Warmer colors indicate better performance gains.
+    The baseline training-from-scratch accuracies are 60.72\%, 70.40\%, 57.46\%, 86.63\% for the four datasets respectively. } %\textcolor{red}{I don't understand what contrasting two ``identical" means.} \blue{(just simply contrast between two unaugmented data, intuitively do nothing but push all data point away from each other)}
+    } 
+    \vspace{-1em}
+    \label{fig:augvsaug} 
+\end{figure}
+
+\textbf{Obs. 1. Data augmentations are crucial in graph contrastive learning.}
+Without any data augmentation graph contrastive learning  is not helpful and often worse compared with training from scratch, judging from the accuracy losses in the upper right corners of Fig. \ref{fig:augvsaug}.    
+In contrast, composing an original graph and its appropriate augmentation can benefit the downstream performance.  Judging from the top rows or the right-most columns in Fig. \ref{fig:augvsaug}, graph contrastive learning with single best augmentations achieved considerable improvement without exhaustive hyper-parameter tuning:  1.62\% for NCI1, 3.15\% for PROTEINS, 6.27\% for COLLAB, and 1.66\% for RDT-B.  
+
+The observation meets our intuition. Without augmentation,
+graphCL simply compares two original samples as a negative pair (with the positive pair loss becoming zero), leading to homogeneously pushes all graph representations away from each other,
+which is non-intuitive to justify.
+Importantly, when appropriate augmentations are applied, the corresponding priors on the data distribution are instilled, enforcing the model to learn representations invariant to the desired perturbations through maximizing the agreement between a graph and its augmentation.  
+
+\begin{figure}[!htb] 
+    \centering 
+    \includegraphics[width=1\linewidth]{obs1.pdf}
+    \caption{\small{Contrastive loss curves for different augmentation pairs.
+    In the two figures of the left attribute masking is contrasted with other augmentations and that of the right for edge perturbation, where contrasting the same augmentations always leads to the fastest loss descent.}}
+    \vspace{-1em}
+    \label{fig:cl_loss} 
+\end{figure}
+
+\textbf{Obs. 2. Composing different augmentations benefits more.} 
+Composing augmentation pairs of a graph rather than the graph and its augmentation further improves the performance: the maximum accuracy gain was 2.10\% for NCI1, 3.15\% for PROTEINS, 7.11\% for COLLAB, and 1.85\% for RDT-B.  Interestingly, applying augmentation pairs of the same type  (see the diagonals of Fig. \ref{fig:augvsaug}) does not usually lead to the best performance (except for node dropping),  
+compared with augmentation pairs of different types (off-diagonals).  
+Similar observations were made in visual representation learning  \cite{chen2020simple}. % that no single augmentation suffices to learn good representations.  
+As conjectured in \cite{chen2020simple}, composing different augmentations avoids the learned features trivially overfitting low-level ``shortcuts'', making features more generalizable.
+
+Here we make a similar conjecture that contrasting isogenous graph pairs augmented in different types presents a harder albeit more useful task for graph representation learning.
+We thus plot the contrastive loss curves composing various augmentations (except subgraph) together with attribute masking or edge perturbation  for NCI1 and PROTEINS. Fig. \ref{fig:cl_loss} 
+shows that, with augmentation pairs of different types, the contrastive loss always descents slower than it does with pairs of the same type, when the optimization procedure remains the same. This result indicates that composing augmentation pairs of different types does correspond to a ``harder" contrastive prediction task.
+We will explore in Sec.~\ref{sec:over_simple} how to quantify a ``harder" task in some cases and whether it always helps. %the model avoid learning the shortcut information and benefit the learned representations. \red{(Yang come back to revise again after completing Sec. 4)} 
+
+\subsection{The Types, the Extent, and the Patterns of Effective Graph Augmentations}
+We then note that the (most) beneficial combinations of augmentation types can be dataset-specific, which matches our intuition as  graph-structured data are of highly heterogeneous nature (see Sec. \ref{introduction}). We summarize our observations and derive insights below.  And we further analyze the impact of the extent and/or the pattern of given types of graph augmentations.   
+
+\textbf{Obs. 3. Edge perturbation benefits social networks but hurts some  biochemical molecules.}
+Edge perturbation as one of the paired augmentations improves  the performances for social-network data COLLAB and ROT-B as well as biomolecule data PROTEINS, but hurts the other biomolecule data NCI1. %For instance, the combination of identical transformation and edge perturbation achieves 3.10\%, 0.85\%, and 1.01\% improvement for COLLAB, RDT-B, and PROTEINS, respectively, while doing 2.43\% worse for NCI1 (Fig.~\ref{fig:augvsaug}). This observation highlights the art of graph augmentations.  
+We hypothesize that, compared to the case of social networks, the ``semantemes'' of some biomolecule data are more sensitive to individual edges.   Specifically, a single-edge change in NCI1  corresponds to a removal or addition of a covalent bond, which can drastically change the identity and even the validity of a compound, let alone its property for the down-stream semantemes.  
+In contrast the semantemes of social networks are more tolerant to individual edge perturbation \cite{dai2018adversarial,zugner2018adversarial}. Therefore, for chemical compounds, edge perturbation demonstrates a prior that is conceptually incompatible with the domain knowledge and empirically unhelpful for down-stream performance.
+
+We further examine whether the extent or strength of edge perturbation can affect the conclusion above.  We evaluate the downstream performances on representative examples NCI1 and COLLAB.  And we use the combination of the original graph (``identical'') and edge perturbation of various ratios in our GraphCL framework. Fig. \ref{fig:ratiovsperformance}A shows that edge perturbation worsens the NCI1 performances regardless of augmentation strength, confirming that our earlier conclusion was insensitive to the extent of edge perturbation.  Fig. \ref{fig:ratiovsperformance}B suggests that edge perturbation could improve the COLLAB performances more with increasing augmentation strength.  
+
+\textbf{Obs. 4. Applying attribute masking achieves better performance in denser graphs.} For the social network datasets, composing the identical graph and attribute masking achieves 5.12\% improvement for COLLAB (with higher average degree) while only 0.17\% for RDT-B.
+Similar observations are made for the denser PROTEINS versus NCI1.  To assess the impact of augmentation strength on this observation, we perform similar experiments on RDT-B and COLLAB, by composing the identical graph and its attributes masked to various extents.  Fig.~\ref{fig:ratiovsperformance}C and D show that, masking less for the very sparse RDT-B does not help, although masking more for the very dense COLLAB does.  
+
+\begin{figure}[!htb] 
+    \centering 
+    \includegraphics[width=1\linewidth]{obs2.pdf}
+    \caption{\small{Performance versus augmentation strength. Left two figures implemented edge perturbation with different ratios. The right two figures apply attribute masking with different masking ratios.}}
+    \vspace{-0.5em}
+    \label{fig:ratiovsperformance} 
+\end{figure} % \vspace{-1em}
+
+We further hypothesize that masking patterns also matter, and masking more hub nodes with high degrees benefit denser graphs, because GNNs cannot reconstruct the missing information of isolated nodes, 
+according to the message passing mechanism \cite{gilmer2017neural}.  To test the hypothesis, we perform an experiment to mask nodes with more connections with higher probability on denser graphs PROTEINS and COLLAB.  Specifically, we adopt a masking distribution $\mathrm{deg}_n^\alpha$ rather than the uniform distribution, where $\mathrm{deg}_n$ is the degree of vertex $v_n$ and $\alpha$ is the control factor. A positive $\alpha$ indicates more masking for high-degree nodes.  Fig. \ref{fig:controlratiovsperformance}C and D 
+showing that, for very dense COLLAB, there is an apparent upward tendency on performance if masking nodes with more connections.  
+
+\textbf{Obs. 5. Node dropping and subgraph are generally beneficial across datasets.}
+Node dropping and subgraph, especially the latter, seem to be generally beneficial in our studied datasets.
+For node dropping, the prior that missing certain vertices (e.g. some  hydrogen atoms in chemical compounds or edge users for social networks) does not alter the semantic information is emphasized,
+intuitively fitting for our cognition.  
+For subgraph, previous works \cite{velivckovic2018deep,sun2019infograph} show that enforcing local (the subgraphs we extract) and global information consistency is helpful for representation learning, which explains the observation. Even for chemical compounds in NCI1, subgraphs can represent structural and functional ``motifs'' important for the down-stream semantemes.   
+
+We similarly examined the impact of node dropping patterns by adopting the non-uniform distribution as mentioned in changing attribute-masking patterns.  Fig.~\ref{fig:controlratiovsperformance}B shows that, for the dense social-network COLLAB graphs, more GraphCL improvements were observed while dropping hub nodes more in the range considered.  Fig.~\ref{fig:controlratiovsperformance}A shows that, for the not-so-dense PROTEINS graphs, changing the node-dropping distribution away from uniform does not necessarily help.  
+
+\begin{figure}[ht] 
+    \centering 
+    \includegraphics[width=1\linewidth]{obs3.pdf}
+    \caption{\small{Performance versus augmentation patterns. Node dropping and  attribute masking are performed with various control factors (negative to positive: dropping/masking more low-degree vertices to high-degree ones).}}
+    \label{fig:controlratiovsperformance} 
+\end{figure} % \vspace{-0.5em}
+
+\vspace{-1em}
+\subsection{Unlike ``Harder'' Ones, Overly Simple Contrastive Tasks Do Not Help.}
+\label{sec:over_simple}
+As discussed in Obs. 2, ``harder'' contrastive learning might benefit more, where the ``harder'' task is achieved by composing augmentations of different types.  
+In this section we further explore quantifiable difficulty in relationship to parameterized augmentation strengths/patterns and assess the impact of the difficulty on performance improvement.  
+
+Intuitively, larger  dropping/masking ratios or control factor $\alpha$ leads to harder contrastive tasks, which did result in better COLLAB performances (Fig.~\ref{fig:ratiovsperformance} and \ref{fig:controlratiovsperformance}) in the range considered.  Very small ratios or negative $\alpha$, corresponding to overly simple tasks, We also design subgraph variants of increasing difficulty levels and reach similar conclusions. More details are in Appendix D.
+
+\textbf{Summary.} In total, we decide the augmentation pools for Section 5 as: node dropping and subgraph for biochemical molecules; all for dense social networks; and all except attribute masking for sparse social networks. Strengths or patterns are default even though varying them could help more.  
+
+\section{Comparison with the State-of-the-art Methods}
+\label{sec:exp_sota}
+In this section, we compare our proposed (self-supervised) pre-training framework, GraphCL, with state-of-the-art methods (SOTAs) in the settings of semi-supervised, unsupervised \cite{sun2019infograph} and transfer learning \cite{hu2019pre} on graph classification (for node classification experiments please refer to Appendix G).
+Dataset statistics and training details for the specific settings are in Appendix E.
+
+\textbf{Semi-supervised learning.}
+We first evaluate our proposed framework in the semi-supervised learning setting on graph classification \cite{chen2019powerful,xu2018powerful} on the benchmark TUDataset \cite{Morris+2020}.
+Since pre-training \& finetuning in semi-supervised learning for the graph-level task is unexplored before, we take two conventional network embedding methods as pre-training tasks for comparison:
+adjacency information reconstruction (we refer to GAE \cite{kipf2016variational} for implementation) and local \& global representation consistency enforcement (refer to Infomax \cite{sun2019infograph} for implementation).
+Besides, the performance of training from scratch and that with augmentation (without contrasting) is also reported.
+We adopt graph convolutional network (GCN) with the default setting in \cite{chen2019powerful} as the GNN-based encoder which achieves comparable SOTA performance in the fully-supervised setting.
+Table \ref{tab:semi-supervised} shows that GraphCL outperforms  traditional pre-training schemes.
+
+\begin{table}[!htb] \vspace{-1em}
+\scriptsize
+\begin{center}
+\caption{\small{Semi-supervised learning with pre-training \& finetuning.
+\darkred{Red} numbers indicate the best performance and the number that overlap with the standard deviation of the best performance (comparable ones). 1\% or 10\% is label rate; baseline and Aug. represents training from scratch without and with augmentations, respectively.
+}}
+\label{tab:semi-supervised}
+\resizebox{1\textwidth}{!}{
+\begin{tabular}{c | c  c  c | c  c  c c | c  c }
+    \hline
+    \hline
+    Dataset & NCI1 & PROTEINS & DD & COLLAB & RDT-B & RDT-M5K & GITHUB & MNIST & CIFAR10 \\
+    \hline
+    \hline
+    1\% baseline & 60.72$\pm$0.45 & - & - & 57.46$\pm$0.25 & - & - & 54.25$\pm$0.22 & 60.39$\pm$1.95 & 27.36$\pm$0.75 \\
+    1\% Aug. & 60.49$\pm$0.46 & - & - & 58.40$\pm$0.97 & - & - & 56.36$\pm$0.42 & 67.43$\pm$0.36 & 27.39$\pm$0.44 \\
+    1\% GAE & 61.63$\pm$0.84 & - & - & 63.20$\pm$0.67 & - & - & \darkred{59.44}$\pm$0.44 & 57.58$\pm$2.07 & 21.09$\pm$0.53 \\
+    1\% Infomax & \darkred{62.72}$\pm$0.65 & - & - & 61.70$\pm$0.77 & - & - & 58.99$\pm$0.50  & 63.24$\pm$0.78 & 27.86$\pm$0.43\\
+    \hdashline
+    1\% GraphCL & \darkred{62.55}$\pm$0.86 & - & - & \darkred{64.57}$\pm$1.15 & - & - & 58.56$\pm$0.59  & \darkred{83.41}$\pm$0.33 & \darkred{30.01}$\pm$0.84 \\
+    \hline
+    10\% baseline & 73.72$\pm$0.24 & 70.40$\pm$1.54 & 73.56$\pm$0.41 & 73.71$\pm$0.27 & 86.63$\pm$0.27 & 51.33$\pm$0.44 & 60.87$\pm$0.17 & 79.71$\pm$0.65 & 35.78$\pm$0.81 \\
+    10\% Aug. & 73.59$\pm$0.32 & 70.29$\pm$0.64 & 74.30$\pm$0.81 & 74.19$\pm$0.13 & 87.74$\pm$0.39 & 52.01$\pm$0.20 & 60.91$\pm$0.32 & 83.99$\pm$2.19 & 34.24$\pm$2.62 \\
+    10\% GAE & 74.36$\pm$0.24 & 70.51$\pm$0.17 & 74.54$\pm$0.68 & \darkred{75.09}$\pm$0.19 & 87.69$\pm$0.40 & \darkred{53.58}$\pm$0.13 & 63.89$\pm$0.52 & 86.67$\pm$0.93 & 36.35$\pm$1.04 \\
+    10\% Infomax & \darkred{74.86}$\pm$0.26 & 72.27$\pm$0.40 & \darkred{75.78}$\pm$0.34 & 73.76$\pm$0.29 & 88.66$\pm$0.95 & \darkred{53.61}$\pm$0.31 & \darkred{65.21}$\pm$0.88 & 83.34$\pm$0.24 & 41.07$\pm$0.48 \\
+    \hdashline
+    10\% GraphCL & \darkred{74.63}$\pm$0.25 & \darkred{74.17}$\pm$0.34 & \darkred{76.17}$\pm$1.37 & 74.23$\pm$0.21 & \darkred{89.11}$\pm$0.19 & 52.55$\pm$0.45 & \darkred{65.81}$\pm$0.79 & \darkred{93.11}$\pm$0.17 & \darkred{43.87}$\pm$0.77 \\
+    \hline
+    \hline
+\end{tabular}}
+\end{center}
+\end{table}
+
+\textbf{Unsupervised representation learning.}
+Furthermore, GraphCL is evaluated in the unsupervised representation learning following \cite{narayanan2017graph2vec,sun2019infograph}, where unsupervised methods generate graph embeddings that are fed into a down-stream SVM classifier \cite{sun2019infograph}. 
+Aside from SOTA graph kernel methods that graphlet kernel (GL), Weisfeiler-Lehman sub-tree kernel (WL) and deep graph kernel (DGK), we also compare with four unsupervised graph-level representation learning methods as node2vec \cite{grover2016node2vec}, sub2vec \cite{adhikari2018sub2vec}, graph2vec \cite{narayanan2017graph2vec} and InfoGraph \cite{sun2019infograph}.
+We adopt graph isomorphism network (GIN) with the default setting in \cite{sun2019infograph} as the GNN-based encoder which is SOTA in representation learning.
+Table \ref{tab:unsupervised} shows GraphCL outperforms in most cases except on datasets with small graph size (e.g. MUTAG and IMDB-B consists of graphs with average node number less than 20).
+
+\begin{table}[ht] \vspace{-1em}
+\scriptsize
+\begin{center}
+\caption{\small{Comparing classification accuracy on top of graph representations learned from graph kernels, SOTA representation learning methods, and GIN pre-trained with GraphCL. The compared numbers are from the corresponding papers under the same experiment setting.}}
+\label{tab:unsupervised}
+\resizebox{1\textwidth}{!}{
+\begin{tabular}{c | c  c c  c | c  c  c c }
+    \hline
+    \hline
+    Dataset & NCI1 & PROTEINS & DD & MUTAG & COLLAB & RDT-B & RDT-M5K & IMDB-B \\
+    \hline
+    \hline
+    GL & - & - & - & 81.66$\pm$2.11 & - & 77.34$\pm$0.18 & 41.01$\pm$0.17 & 65.87$\pm$0.98 \\
+    WL & \darkred{80.01}$\pm$0.50 & 72.92$\pm$0.56 & - & 80.72$\pm$3.00 & - & 68.82$\pm$0.41 & 46.06$\pm$0.21 & \darkred{72.30}$\pm$3.44 \\
+    DGK & \darkred{80.31}$\pm$0.46 & 73.30$\pm$0.82 & - & 87.44$\pm$2.72 & - & 78.04$\pm$0.39 & 41.27$\pm$0.18 & 66.96$\pm$0.56 \\
+    \hline
+    node2vec & 54.89$\pm$1.61 & 57.49$\pm$3.57 & - & 72.63$\pm$10.20 & - & - & - & - \\
+    sub2vec & 52.84$\pm$1.47 & 53.03$\pm$5.55 & - & 61.05$\pm$15.80 & - & 71.48$\pm$0.41 & 36.68$\pm$0.42 & 55.26$\pm$1.54 \\
+    graph2vec & 73.22$\pm$1.81 & 73.30$\pm$2.05 & - & 83.15$\pm$9.25 & - & 75.78$\pm$1.03 & 47.86$\pm$0.26 & 71.10$\pm$0.54 \\
+    InfoGraph & 76.20$\pm$1.06 & \darkred{74.44}$\pm$0.31 & 72.85$\pm$1.78 & \darkred{89.01}$\pm$1.13 & \darkred{70.65}$\pm$1.13 & 82.50$\pm$1.42 & 53.46$\pm$1.03 & \darkred{73.03}$\pm$0.87 \\
+    \hline
+    GraphCL & 77.87$\pm$0.41 & \darkred{74.39}$\pm$0.45 & \darkred{78.62}$\pm$0.40 & 86.80$\pm$1.34 & \darkred{71.36}$\pm$1.15 & \darkred{89.53}$\pm$0.84 & \darkred{55.99}$\pm$0.28 & 71.14$\pm$0.44 \\
+    \hline
+    \hline
+\end{tabular}}
+\end{center}
+\end{table}
+
+\textbf{Transfer learning.}
+Lastly, experiments are performed on transfer learning on molecular property prediction in chemistry and protein function prediction in biology following \cite{hu2019pre},
+which pre-trains and finetunes the model in different datasets to evaluate the transferability of the pre-training scheme.
+We adopt GIN with the default setting in \cite{hu2019pre} as the GNN-based encoder which is SOTA in transfer learning.
+Experiments are performed for 10 times with mean and standard deviation of ROC-AUC scores (\%) reported as \cite{hu2019pre}.
+Although there is no universally beneficial pre-training scheme especially for the out-of-distribution scenario in transfer learning (Sec. \ref{introduction}),
+Table \ref{tab:transfer} shows that GraphCL still achieves SOTA performance on 5 of 9 datasets compared to the previous best schemes.
+
+\begin{table}[ht] \vspace{-1em}
+\scriptsize
+\begin{center}
+\caption{\small{Transfer learning comparison with different manually designed pre-training schemes, where the compared numbers are from \cite{hu2019pre}.}
+}
+\label{tab:transfer}
+\resizebox{1\textwidth}{!}{
+\begin{tabular}{c | c  c c  c c  c  c c | c }
+    \hline
+    \hline
+    Dataset & BBBP & Tox21 & ToxCast & SIDER & ClinTox & MUV & HIV & BACE & PPI \\
+    \hline
+    \hline
+    No Pre-Train & 65.8$\pm$4.5 & 74.0$\pm$0.8 & 63.4$\pm$0.6 & 57.3$\pm$1.6 & 58.0$\pm$4.4 & 71.8$\pm$2.5 & 75.3$\pm$1.9 & 70.1$\pm$5.4 & 64.8$\pm$1.0 \\
+    \hline
+    Infomax & 68.8$\pm$0.8 & 75.3$\pm$0.5 & 62.7$\pm$0.4 & 58.4$\pm$0.8 & 69.9$\pm$3.0 & \darkred{75.3}$\pm$2.5 & 76.0$\pm$0.7 & 75.9$\pm$1.6 & 64.1$\pm$1.5 \\
+    EdgePred & 67.3$\pm$2.4 & 76.0$\pm$0.6 & \darkred{64.1}$\pm$0.6 & 60.4$\pm$0.7 & 64.1$\pm$3.7 & 74.1$\pm$2.1 & 76.3$\pm$1.0 & \darkred{79.9}$\pm$0.9 & 65.7$\pm$1.3 \\
+    AttrMasking & 64.3$\pm$2.8 & \darkred{76.7}$\pm$0.4 & \darkred{64.2}$\pm$0.5 & \darkred{61.0}$\pm$0.7 & 71.8$\pm$4.1 & \darkred{74.7}$\pm$1.4 & 77.2$\pm$1.1 & \darkred{79.3}$\pm$1.6 & 65.2$\pm$1.6 \\
+    ContextPred & 68.0$\pm$2.0 & 75.7$\pm$0.7 & \darkred{63.9}$\pm$0.6 & \darkred{60.9}$\pm$0.6 & 65.9$\pm$3.8 & \darkred{75.8}$\pm$1.7 & \darkred{77.3}$\pm$1.0 & \darkred{79.6}$\pm$1.2 & 64.4$\pm$1.3 \\
+    \hline
+    GraphCL & \darkred{69.68}$\pm$0.67 & 73.87$\pm$0.66 & 62.40$\pm$0.57 & \darkred{60.53}$\pm$0.88 & \darkred{75.99}$\pm$2.65 & 69.80$\pm$2.66 & \darkred{78.47}$\pm$1.22 & 75.38$\pm$1.44 & \darkred{67.88}$\pm$0.85 \\
+    \hline
+    \hline
+\end{tabular}}
+\end{center}
+\end{table}
+
+\textbf{Adversarial robustness.}
+In addition to generalizability, we claim that GNNs also gain robustness using GraphCL.
+The experiments are performed on synthetic data to classify the component number in graphs, facing the RandSampling, GradArgmax and RL-S2V attacks following the default setting in \cite{dai2018adversarial}.
+Structure2vec \cite{dai2016discriminative} is adopted as the GNN-based encoder as in \cite{dai2018adversarial}.
+Table \ref{tab:adv_graph} shows that GraphCL boosts GNN robustness compared with training from scratch, under three evasion attacks.
+
+\begin{table}[!htb] \vspace{-1em}
+\scriptsize
+\begin{center}
+\caption{\small{Adversarial performance under three adversarial attacks for GNN with different depth (following the protocol in \cite{dai2018adversarial}). \darkred{Red} numbers indicate the best performance.}}
+\label{tab:adv_graph}
+\begin{tabular}{c | c  c | c  c | c  c}
+    \hline
+    \hline
+     & \multicolumn{2}{c|}{Two-Layer} & \multicolumn{2}{c|}{Three-Layer} & \multicolumn{2}{c}{Four-Layer} \\
+    \cline{2-7}
+    Methods & No Pre-Train & GraphCL & No Pre-Train & GraphCL & No Pre-Train & GraphCL \\
+    \hline
+    \hline
+    Unattack & 93.20 & \darkred{94.73} & 98.20 & \darkred{98.33} & 98.87 & \darkred{99.00} \\
+    \hline
+    RandSampling & 78.73 & \darkred{80.68} & 92.27 & \darkred{92.60} & 95.13 & \darkred{97.40} \\
+    GradArgmax & \darkred{69.47} & 69.26 & 64.60 & \darkred{89.33} & 95.80 & \darkred{97.00} \\
+    RL-S2V & \darkred{42.93} & 42.20 & 41.93 & \darkred{61.66} & 70.20 & \darkred{84.86} \\
+    \hline
+    \hline
+\end{tabular}
+\end{center}
+\end{table} \vspace{-0.5em}
+
+\section{Conclusion}
+In this paper, we perform explicit study to explore contrastive learning for GNN pre-training, facing the unique challenges in graph-structured data.
+Firstly, several graph data augmentations are proposed  with the discussion of each of which on introducing certain human prior of data distribution.
+Along with new augmentations, we propose a novel graph contrastive learning framework (GraphCL) for GNN pre-training to facilitate invariant representation learning along with rigorous theoretical analysis.  
+We systematically assess and analyze the influence of data augmentations in our proposed framework, revealing the rationale and guiding the choice of augmentations.
+Experiment results verify the state-of-the-art performance of our proposed framework in both generalizability and robustness.
+
+ 
+
+\section*{Broader Impact}
+
+Empowering deep learning for reasoning and predicting over graph-structured data  is of broad interests and wide applications, such as recommendation systems, neural architecture search, and drug discovery.  
+The proposed graph contrastive learning framework with augmentations contributes a general framework that can potentially benefit the effectiveness and  efficiency of graph neural networks through model pre-training.  The numerical results and analyses would also inspire the design of proper augmentations toward positive knowledge transfer on downstream tasks.  
+
+{\small
+
+\end{document}

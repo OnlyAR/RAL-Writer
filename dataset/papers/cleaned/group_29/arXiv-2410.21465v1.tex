@@ -1,0 +1,439 @@
+\title{\textsc{ShadowKV}: KV Cache in Shadows for High-Throughput Long-Context LLM Inference}
+
+\begin{document}
+
+\maketitle
+\begin{abstract}
+With the widespread deployment of long-context large language models (LLMs), there has been a growing demand for efficient support of high-throughput inference. However, as the key-value (KV) cache expands with the sequence length, the increasing memory footprint and the need to access it for each token generation both result in low throughput when serving long-context LLMs. While various dynamic sparse attention methods have been proposed to speed up inference while maintaining generation quality, they either fail to sufficiently reduce GPU memory consumption or introduce significant decoding latency by offloading the KV cache to the CPU. We present \Sys, a high-throughput long-context LLM inference system that stores the low-rank key cache and offloads the value cache to reduce the memory footprint for larger batch sizes and longer sequences. To minimize decoding latency, \Sys employs an accurate KV selection strategy that reconstructs minimal sparse KV pairs on-the-fly. By evaluating \Sys on a broad range of benchmarks, including RULER, LongBench, and Needle In A Haystack, and models like Llama-3.1-8B, Llama-3-8B-1M, GLM-4-9B-1M, Yi-9B-200K, Phi-3-Mini-128K, and Qwen2-7B-128K, we demonstrate that it can support up to 6$\times$ larger batch sizes and boost throughput by up to 3.04$\times$ on an A100 GPU without sacrificing accuracy, even surpassing the performance achievable with infinite batch size under the assumption of infinite GPU memory. The code is available at \url{https://github.com/bytedance/ShadowKV}.
+\end{abstract}
+
+\section{Introduction}
+Large language models (LLMs) have increasingly demonstrated their ability to scale and handle long contexts \citep{bingchat, liu2024world, achiam2023gpt, team2023gemini}, enabling them to tackle complex tasks like multi-document question answering and information retrieval from extensive contexts of up to 1M tokens \citep{achiam2023gpt,wang2024loong}. However, efficiently serving these long-context LLMs presents challenges related to the key-value (KV) cache \citep{liu2024scissorhands, ge2023model}, which stores previous key-value activations to avoid re-computation. As the KV cache scales with sequence length, its growing memory footprint and the need to access it for each token generation lead to low throughput during long-context LLM inference. To address these issues, KV cache eviction or sparse attention methods have been widely explored.
+
+However, existing methods face three primary limitations: accuracy degradation, inadequate memory reduction, and significant decoding latency overhead. KV cache eviction strategies \citep{zhang2024h2o, zhang2024pyramidkv} aim to reduce the memory footprint by discarding KV pairs based on specific policies, but they often result in information loss and accuracy degradation in tasks such as multi-turn conversations \citep{yang2024no, tang2024razorattention}. Dynamic sparse attention methods \citep{tang2024quest} preserve all KV pairs on the GPU and accelerate inference by computing attention with selected KV pairs. However, this line of work does not mitigate the memory footprint, thereby limiting the batch size and preventing accommodation of extremely long contexts (e.g., 1M tokens). A naive solution based on sparse attention involves offloading the KV cache to the CPU to reduce memory usage \citep{lee-osdi24, he2024fastdecode}. Nonetheless, this approach incurs significant overhead due to the latency of fetching the selected sparse KV pairs from the CPU during decoding.
+
+Consequently, an ideal effective system for long-context LLM inference with sparse attention should: (i) reduce GPU memory usage, (ii) minimize inference latency, and (iii) maintain accuracy within limited sparse KV cache budgets. Fortunately, we can potentially overcome these challenges by leveraging our discovery that pre-Rotary Position Embedding \citep{su2024roformer} (RoPE) keys are exceptionally low-rank compared to the layer inputs, post-RoPE keys, values, key weight matrix, and value weight matrix, as indicated in \cref{fig:singular_combined}. Furthermore, our analysis in \cref{fig:similarity} reveals that pre-RoPE keys lack significant similarities in low-rank subspaces across different sequences, while a sequence and its continuation tend to strongly share low-rank subspaces, enabling high compression rates within each sequence. Motivated by these findings, we have developed two key insights that pave the way for  the design of an applicable system, detailed in \cref{sec:observation}.
+
+\begin{figure}[t]
+    \centering
+   \begin{subfigure}[b]{0.32\textwidth}
+        \includegraphics[width=\linewidth]{imgs/singular_combined.pdf}
+        \caption{}
+        \label{fig:singular_combined}
+   \end{subfigure}
+    \hfill
+       \centering
+   \begin{subfigure}[b]{0.32\textwidth}
+        \includegraphics[width=\linewidth]{imgs/frobs.pdf}
+        \caption{}
+        \label{fig:similarity}
+   \end{subfigure}
+    \hfill
+    \begin{subfigure}[b]{0.32\textwidth}
+        \includegraphics[width=\linewidth]{imgs/svd_overhead.pdf}
+        \caption{}
+        \label{fig:svd_overhead}
+   \end{subfigure}
+    \hfill
+    \caption{(a) For a sample from PG-19 \citep{rae2019compressive, gao2020pile} fed into Llama-3.1-8B, the pre-RoPE keys are the most low-rank, as indicated by the sharpest decay in singular values. (b) Average similarities, defined in \cref{sec:lr_compression}, between rank-$256$ truncated SVD projections of pre-RoPE keys from PG-19 sequences using Llama-3.1-8B. Similarity is measured between a length 16K ``Context'' and either a 16K+2K continuation on ``Context'' (``Extended context'') or a new length 16K sequence (``Inter-context''). Pre-RoPE keys within sequences exhibit similar low-rank subspaces, while those between sequences show different patterns. (c) The relative overhead of singular value decomposition (SVD)  decreases as sequence length scales for the pre-filling stage.}
+    \label{fig:observation}
+\end{figure}
+
+\underline{\textit{Low-rank Keys and Offloaded Values for Storage}}: In long-context LLM inference, the quadratic scaling of attention computation with sequence length makes the linear cost of low-rank decomposition during pre-filling negligible, as illustrated in \cref{fig:svd_overhead}\footnote{In practical scenarios, the key cache can be offloaded to the CPU to perform SVD asynchronously or precomputed and stored as part of the prefix cache \citep{juravsky2024hydragen}.}. To reduce memory footprint, we retain the low-rank pre-RoPE key cache on the GPU and offload the value cache to the CPU since the value cache does not exhibit low-rank properties, minimizing memory footprint without sacrificing accuracy. During decoding with sparse attention, we employ CUDA multi-streams to overlap the recovery of the selected key cache with the fetching of the corresponding value cache. This approach conceals key cache reconstruction and reduces data fetching overhead by $2\times$ compared to the naive offloading strategy, thereby decreasing the latency of sparse attention during decoding. 
+
+\underline{\textit{Accurate KV Selection for Fast Decoding}}: To further reduce decoding latency in sparse attention, we propose an accurate KV selection method that maintains accuracy with minimal sparse budgets (1.56\%). Our analysis reveals that most post-RoPE keys exhibit high cosine similarity with adjacent tokens, enabling chunk-level approximations for selecting important tokens. A minimal number of outlier chunks (0.3\%), which are more challenging to approximate  (\cref{fig:OB2}), are stored as static cache on the GPU to preserve accuracy. As shown in \cref{fig:shadowkv}, our method outperforms the naive sparse attention approach \citep{tang2024quest} and achieves higher sparsity, accelerating decoding.
+
+Building on these insights, we present \Sys in \cref{sec:shadowkv}, depicted in \cref{fig:shadowkv}, a high-throughput system for long-context LLM inference. Specifically, during pre-filling, we offload the value cache to the CPU, retaining only the low-rank pre-RoPE keys, along with compressed landmarks of the key cache and detected outliers for larger batch sizes. During decoding, landmarks are used to select chunk indices for key cache recovery and value cache fetching. We perform accurate sparse attention computation with selected KV pairs and static outliers to achieve high throughput.
+
+ \begin{figure}[t]
+    \centering
+    \includegraphics[width=\linewidth]{imgs/shadowkv.pdf}
+    \caption{\textbf{Left:} \Sys enhances long-context LLM inference throughput by offloading the value cache to the CPU while maintaining a low-rank key cache, landmarks, and outliers on the GPU. During decoding, it employs landmarks for efficient sparse attention, reducing computation and data movement. \textbf{Right:} \Sys effectively utilizes a limited KV budget to achieve high accuracy, theoretically reaching over 7 TB/s equivalent bandwidth on an A100, and empirically boosts generation throughput by 3.04$\times$ for Llama-3.1-8B with on a batch of 122K contexts.}
+    \label{fig:shadowkv}
+\end{figure}
+
+Empirically, we conduct extensive experiments and ablation studies to demonstrate the effectiveness and efficiency of \Sys. In \cref{sec:acc}, we evaluate across various long-context LLMs, such as Llama-3-8B-1M \citep{gradllama}, Llama-3.1-8B \citep{meta_llama_3_1}, GLM-4-9B-1M \citep{glm2024chatglm}, Yi-9B-200K \citep{ai2024yi}, Phi-3-Mini-128K \citep{abdin2024phi} and Qwen2-7B-128K \citep{yang2024qwen2} using benchmarks including RULER \citep{hsieh2024ruler},  LongBench \citep{bai2023longbench}, and Needle In A Haystack \citep{niah} with contexts up to 1M.
+
+In \cref{sec:eff}, we demonstrate that \Sys can support 6$\times$ larger batch sizes and boost throughput by 3.04$\times$ compared to small batches on an A100 using Llama-3.1-8B, with each sample having a context length of 122K. We also present results across different models and context lengths, increasing throughput up to 2.97$\times$ for Llama-3-8B-1M, 2.56$\times$ for GLM-4-9B-1M, and 2.66$\times$ for Yi-9B-200K, even surpassing infinite batch size  under the assumption of infinite GPU memory.\section{Related Works}
+\paragraph{Token Eviction.} To reduce memory footprint, eviction-based strategies keep a fixed size of KV cache to store the critical token KV pairs and discard unnecessary tokens. StreamingLLM \citep{xiao2023efficient} addresses the limitations of window attention by retaining attention sinks and recent KV pairs. H$_2$O \citep{zhang2024h2o} introduces a low-cost eviction policy, updating the KV cache based on cumulative attention scores. LESS \citep{dong2024get} accumulates evicted token information by a constant-sized low-rank cache, which allows partial access to previously evicted information, along with tokens maintained by a sparse policy. SnapKV \citep{li2024snapkv} uses the local window of prompts to select important tokens for future generations. However, they suffer from performance degradation and information loss since the evicted tokens will never be recovered.
+\paragraph{Dynamic Sparse Attention.} This line of work retains all KV cache but performs dynamic sparse attention within selected KV pairs to reduce inference latency. SparQ \citep{ribar2023sparq} uses the norm of the query to decide an important subset of the key cache's channels to calculate a metric to select relevant tokens. Quest \citep{tang2024quest} segments tokens into pages and selects pages by approximating the highest attention within each page. Loki \citep{singhania2024loki} performs principal component analysis on the key cache using a calibration dataset, selecting tokens based on attention scores computed in low-dimensional space. TriForce \citep{sun2024triforce} combines sparse attention with speculative decoding \citep{leviathan2023fast} for lossless acceleration. InfiniGen \citep{lee-osdi24} offloads all KV cache to the CPU and prefetches essential entries during decoding.
+\paragraph{Quantization.} Several methods have been introduced to optimize KV cache quantization \citep{hooper2024kvquant, yue2024wkvquant, xiao2023smoothquant}, reducing memory consumption while retaining accuracy. KIVI \citep{liu2024kivi} applies different quantization strategies for keys and values, quantizing the keys per-channel and the values per-token to 2-bit. Palu \citep{chang2024palu} decomposes KV weight matrices offline, caching low-rank KV projections to achieve a higher compression rate. Quantization methods reduce the KV cache bit width, which is orthogonal to our approach.
+\section{Observations}
+\label{sec:observation}
+We present two key insights of long-context LLMs that inspire \Sys's design, as follows.
+\begin{figure}[t]
+    \centering
+    \begin{subfigure}[b]{0.32\textwidth}
+        \includegraphics[width=\linewidth]{imgs/OB1_2.pdf}
+        \caption{}
+        \label{fig:OB1_2}
+    \end{subfigure}
+    \hfill
+    \begin{subfigure}[b]{0.32\textwidth}
+        \includegraphics[width=\linewidth]{imgs/OB2.pdf}
+        \caption{}
+        \label{fig:OB2}
+   \end{subfigure}
+       \begin{subfigure}[b]{0.32\textwidth}
+        \includegraphics[width=\linewidth]{imgs/hitrate.pdf}
+        \caption{}
+        \label{fig:hitrate}
+   \end{subfigure}
+    \caption{(a) Accuracy on the needle retrieval task across various ranks shows that the pre-RoPE key cache can be compressed by over 6 times without a drop in accuracy.  (b) The number of notable outlier chunks is small, taking only 0.2-0.3\%. (c) The KV cache has a high hit rate, reducing computations and data movements by over 60\% for each decoding step.}
+    \label{fig:observation}
+\end{figure}
+
+\subsection{Low-Rank Keys and Offloaded Values for Storage}
+\label{sec:lr_compression}
+To reduce memory footprint, the low-rank nature of the KV cache has been explored by recent studies \citep{deepseekv2, xu2024think, chang2024palu}. However, these methods focus on data-independent decomposition, either requiring training or achieving limited compression rates.
+
+\paragraph{Observation.} In our study, by conducting SVD on the model weights $W_k$, $W_v$, the input $X$, the pre-/post-RoPE key cache, and the value cache of Llama-3.1-8B, we visualize the relative singular value distributions in \cref{fig:singular_combined} together with the accuracy in \cref{fig:OB1_2}. As we observed, pre-RoPE keys have the lowest rank and can be compressed by 6$\times$ without performance degradation. 
+
+We also identify striking dynamic and static behaviors in low-rank keys between and within sequences, inspired by a related investigation in FFN layers \citep{dong2024prompt}. Analogous to cosine similarity, we define $\mathcal{D}(\boldsymbol{H}_1, \boldsymbol{H}_2) = \langle \boldsymbol{H}_1, \boldsymbol{H}_2 \rangle /r$ to be the similarity metric between low-rank subspaces of two rank-$r$ projection matrices, $\boldsymbol{H}_1$ and $\boldsymbol{H}_2$, where $\langle \cdot, \cdot \rangle$ is the Frobenius inner product\footnote{Since $\boldsymbol{H}_1$ and $\boldsymbol{H}_2$ are projection matrices, their squared Frobenius norms are the sum of their singular values which consist of $r$ 1's and $d-r$ 0's, i.e., $\|\boldsymbol{H}_1 \|^2_F = r$. Thus, by Cauchy-Schwarz, $|\mathcal{D}(\boldsymbol{H}_1, \boldsymbol{H}_2)| \leq 1$. Additionally, $\mathcal{D}(\boldsymbol{H}_1, \boldsymbol{H}_2) \geq 0$ by the cyclic property of trace and positive semidefiniteness of projection matrices. Together, this shows $\mathcal{D}(\boldsymbol{H}_1, \boldsymbol{H}_2) \in [0,1]$, maximized or minimized when the projection matrices project onto identical or orthogonal subspaces, respectively.}. In our case with truncated SVDs of pre-RoPE keys, let $\boldsymbol{K}_1, \boldsymbol{K}_2 \in \mathbb{R}^{n \times d}$ have rank-$r$ truncated SVDs, $\boldsymbol{\Phi}_1 \boldsymbol{\Sigma}_1 \boldsymbol{\Psi}^\top_1$ and $\boldsymbol{\Phi}_2 \boldsymbol{\Sigma}_2 \boldsymbol{\Psi}^\top_2$, respectively, where $\boldsymbol{\Phi}_1 \in \mathbb{R}^{n \times r}, \boldsymbol{\Sigma}_1 \in \mathbb{R}^{r \times r}, \boldsymbol{\Psi}_1 \in \mathbb{R}^{d \times r}$, and similarly for $\boldsymbol{\Phi}_2$, $\boldsymbol{\Sigma}_2$, and $\boldsymbol{\Psi}_2$. Then, $\mathcal{D}(\boldsymbol{\Psi}_1 \boldsymbol{\Psi}_1^\top, \boldsymbol{\Psi}_2 \boldsymbol{\Psi}_2^\top)$ can measure the similarity between the low-rank subspaces of the two right singular matrices. Depicted in \cref{fig:similarity}, pre-RoPE keys between sequences do not strongly share similar low-rank subspaces, but extensions of the same sequence do.
+
+\paragraph{Insights.} Our observation of the low-rank nature in the pre-RoPE keys indicates that storing the low-rank projections is sufficient for each sequence. By keeping the low-rank key cache on the GPU and offloading the value cache to the CPU since it is not low-rank, we can largely reduce the memory footprint. During decoding, selected KV pairs can be reconstructed on-the-fly for computation.
+
+\subsection{Accurate KV Selection for Fast Decoding}
+To further reduce the latency overhead in sparse attention, including fetching the selected value cache from the CPU and reconstructing the corresponding key cache, an accurate KV selection method is needed to minimize the sparse KV cache budget while maintaining the accuracy.
+
+\paragraph{Observation.} We found most post-RoPE key cache exhibits spatial locality, with high cosine similarity to adjacent tokens, except for a few outliers. To quantify this, we conducted inference experiments on 128K contexts. We divided the post-RoPE keys into chunks of eight tokens and visualized the minimum cosine similarity between the chunk's mean and its key cache, as shown in \cref{fig:OB2}. The results indicate that, apart from a few outliers, there is generally high cosine similarity, suggesting the mean values can serve as landmarks to approximate attention well within normal chunks.
+
+\paragraph{Analysis.} This finding suggests that for the majority of chunks, we can maintain the mean value as compressed landmarks to select minimal important KV pairs (1.56\%) accurately during decoding. Outlier chunks, which may contain dense or critical information and are difficult to approximate, are retained to ensure accuracy. Given their relatively small number (0.2--0.3\%), storing them on the GPU is feasible without affecting memory capacity. Furthermore, as shown in \cref{fig:hitrate}, considering the temporal locality of the KV cache, a cache policy \citep{zhang2024pqcache} can be leveraged to further reduce the latency overhead by 60\% during decoding with optimized kernels \citep{nvidia2020cuda}.
+
+\section{\Sys}
+\label{sec:shadowkv}
+In this section, we introduce \Sys, a high-throughput long-context LLM inference system. We first elaborate our algorithm in \cref{algo}, covering both the pre-filling and decoding phases. Subsequently, in \cref{anal}, we discuss the concept of theoretical equivalent bandwidth to illustrate the benefits of our approach.
+
+\begin{figure}[t]
+\begin{minipage}{0.57\linewidth}
+\vspace{3pt}
+\begin{algorithm}[H]
+\caption{\Sys Pre-filling}
+\label{alg:prefill}
+\begin{algorithmic}
+\State \textbf{Input:} $\boldsymbol{K},\boldsymbol{K}^{\text{RoPE}}, \boldsymbol{V} \in \mathbb{R}^{b\times h_{kv} \times s\times d}$, SVD rank $r$, chunk size $c$, number of outlier chunks $o$
+
+\State {\color{commentcolor}{\textit{$\triangleright$ Store low-rank projection of pre-RoPE key cache}}}
+\State $\boldsymbol{A} \in \mathbb{R}^{b\times s \times r}$, $\boldsymbol{B} \in \mathbb{R}^{b \times h_{kv} \times r \times d} \leftarrow \text{SVD}(\boldsymbol{K})$
+
+\State {\color{commentcolor}{\textit{$\triangleright$ Segment post-RoPE key cache into chunks and compute the mean of each chunk}}}
+\State $\boldsymbol{C} \in \mathbb{R}^{b\times h_{kv} \times s/c \times d} \leftarrow \text{Reduce}(\boldsymbol{K^{\text{RoPE}}})$
+
+\State {\color{commentcolor}{\textit{$\triangleright$ Compute cosine similarity within each chunk}}}
+\State $\boldsymbol{S} \in \mathbb{R}^{b\times h_{kv} \times s/c \times c} \leftarrow \text{CosineSimilarity}(\boldsymbol{C}, \boldsymbol{K^{\text{RoPE}}})$
+
+\State {\color{commentcolor}{\textit{$\triangleright$ Find lowest cosine similarity as outliers}}}
+\State $\boldsymbol{I}\in \mathbb{R}^{b\times h_{kv} \times o} \leftarrow \text{ArgTopK}(-\text{Min}(\boldsymbol{S}, \text{dim}=-1), o)$
+
+\State $\boldsymbol{K}^{\text{outlier}}, \boldsymbol{V}^{\text{outlier}} \leftarrow \text{Gather} (\boldsymbol{K^{\text{RoPE}}}, \boldsymbol{V}, \boldsymbol{I})$
+
+\State {\color{commentcolor}{\textit{$\triangleright$ Offload the rest of values to the CPU and store the non-outlier chunks' mean as landmarks}}}
+\State $\boldsymbol{V}^{\text{CPU}} \leftarrow \boldsymbol{V} \setminus \boldsymbol{V}^{\text{outlier}}$, $\boldsymbol{L} \leftarrow \boldsymbol{C} \setminus \text{Gather} (\boldsymbol{C}, \boldsymbol{I})$ 
+
+\end{algorithmic}
+\end{algorithm}
+\end{minipage}
+\hfill
+\begin{minipage}[c]{0.41\linewidth}
+\centering
+\includegraphics[width=0.8\textwidth]{imgs/prefill.pdf}
+\caption{\Sys pre-filling.}
+\label{fig:prefill}
+\end{minipage}
+\end{figure}
+
+\subsection{Algorithm}
+\label{algo}
+The algorithm of \Sys is divided into two main phases: pre-filling and decoding. The pre-filling phase involves low-rank decomposition of the post-RoPE key cache, offloading the value cache, and constructing landmarks to facilitate subsequent high-throughput decoding. The decoding phase includes accurate KV selection and efficient sparse KV cache reconstruction.
+
+\paragraph{Pre-filling.} During the pre-filling phase, we optimize GPU memory usage by performing low-rank compression on the key cache of each layer and offloading values to the CPU. Specifically, as demonstrated in \cref{alg:prefill} and \cref{fig:prefill}, we apply SVD on the pre-RoPE key cache and store only the low-rank representations for each layer. Post-RoPE key cache is segmented into chunks, with the mean of each chunk computed as landmarks. By computing the cosine similarity within these chunks, we identify poorly approximated tokens as outliers. This small set of outliers is gathered and stored on the GPU as the static cache, while the remaining key cache is maintained as compact landmarks, with the corresponding values offloaded to the CPU memory.
+
+\paragraph{High-throughput Decoding.} For incoming queries, we first compute the approximate attention scores using the landmarks. As detailed in \cref{alg:dec}, by identifying the top-k scoring chunk indices, the corresponding values are retrieved from the CPU, and the key cache is simultaneously reconstructed from low-rank projections, effectively concealing the construction of the key cache. Based on the insight that the KV cache has temporal locality, we build cache-aware CUDA kernels, reducing computation and value fetching by 60\%. As shown in \cref{fig:decoding}, we conduct an index scan to detect the missed chunks and only rebuild the necessary KV pairs on-the-fly.
+
+\begin{figure}[t]
+\begin{minipage}{0.57\linewidth}
+\begin{algorithm}[H]
+\caption{\Sys Decoding}
+\label{alg:dec}
+\begin{algorithmic}
+\State \textbf{Input:} $\boldsymbol{A}$, $\boldsymbol{B}$, $\boldsymbol{L}$, $\boldsymbol{V}^{\text{CPU}}$, $\boldsymbol{Q} \in \mathbb{R}^{b\times h_{q} \times s_q \times d}$, $\boldsymbol{K}^{\text{outlier}}$, $ \boldsymbol{V}^{\text{outlier}}$, $\boldsymbol{K}, \boldsymbol{V} \in \mathbb{R}^{b\times h_{kv} \times s_q \times d}$, number of chunks $n_c$, number of selected chunk budget $k$
+
+\State {\color{commentcolor}{\textit{$\triangleright$ Compute chunk attention score}}}
+\State $\boldsymbol{P} \in \mathbb{R}^{b\times h_{q} \times s_q \times n_c}  \leftarrow \text{MatMul}(\boldsymbol{Q}, \boldsymbol{L^\top})$
+
+\State $\boldsymbol{S} \in \mathbb{R}^{b\times h_{q} \times s_q \times n_c}  \leftarrow \text{Softmax}(\boldsymbol{P} / \sqrt{d})$
+
+\State $\boldsymbol{S}_{1} \in \mathbb{R}^{b\times h_{q} \times n_c}  \leftarrow \text{sum}(\boldsymbol{S}, \text{dim}=-2) $
+\State $\boldsymbol{S}_{2} \in \mathbb{R}^{b\times h_{kv} \times n_c}  \leftarrow \text{max}_{\text{kv\_group}}(\boldsymbol{S}_{1}) $
+
+\State {\color{commentcolor}{\textit{$\triangleright$ Select top-k chunks for each KV head}}}
+\State $\boldsymbol{I}\in \mathbb{R}^{b\times h_{kv} \times k} \leftarrow \text{ArgTopK}(\boldsymbol{S}_{2}, k)$
+
+\SetKwBlock{DoParallel}{In parallel:}{end}
+\State {\color{commentcolor}{\textit{$\triangleright$ Gather values from CPU}}}
+\State $\boldsymbol{V}^{\text{sparse}} \leftarrow \text{Gather}(\boldsymbol{V}^{\text{CPU}}, \boldsymbol{I})$
+\State $\boldsymbol{V} \leftarrow [\boldsymbol{V}^{\text{outlier}}; \boldsymbol{V}^{\text{sparse}} ;\boldsymbol{V}]$
+\State {\color{commentcolor}{\textit{$\triangleright$ Recover keys from low-rank projection}}}
+\State $\boldsymbol{K}^{\text{sparse}} \leftarrow \text{MatMul}(\text{Gather}(\boldsymbol{A}, \boldsymbol{I}),\boldsymbol{B})$
+\State $\boldsymbol{K} \leftarrow [\boldsymbol{K}^{\text{outlier}} ;\text{RoPE}(\boldsymbol{K}^{\text{sparse}}); \boldsymbol{K}]$
+\end{algorithmic}
+\end{algorithm}
+\end{minipage}
+\hfill
+\begin{minipage}{0.4\linewidth}
+\centering
+\includegraphics[width=0.7\textwidth]{imgs/decode.pdf}
+\caption{\Sys decoding phase.}
+\label{fig:decoding}
+\end{minipage}
+\end{figure}
+
+Based on our observations in \cref{sec:lr_compression}, future pre-RoPE keys within a sequence reside in a shared low-rank subspace with the context. As a result, an extension of our algorithm would be to store generated tokens as low-rank states using the same projections obtained from pre-filling to reduce the memory usage for future generations\footnote{If $\boldsymbol{\Psi} \in \mathbb{R}^{d \times r}$ is the right singular matrix calculated from the SVD of pre-RoPE context keys $\boldsymbol{K} \in \mathbb{R}^{s \times d}$, new pre-RoPE keys $\boldsymbol{K}' \in \mathbb{R}^{s_q \times d}$ can be stored as $\boldsymbol{K}' \boldsymbol{\Psi}$ and projected back up with $\boldsymbol{\Psi}^\top$ when needed.}. For simplicity, we exclude it from the implementation.
+
+\subsection{Theoretical Equivalent Bandwidth}
+\label{anal}
+The benefit of \Sys in terms of increasing throughput can be analyzed through the concept of equivalent bandwidth. Consider each K or V vector as being $M$ bytes in size, with a sequence length of $S$, a chunk size of $C$, a selected chunk budget of $K$, $O$ outliers, and hit rate $\alpha$. During KV selection, \Sys loads approximately $M \times S/C$ bytes using the GPU memory bandwidth $B_\text{GPU}$. For value cache fetching, it loads $M \times K \times C$ bytes using the PCIe bandwidth $B_\text{PCIe}$ \citep{sheng2023flexgen}. Since value movement and key cache reconstruction can be overlapped, we do not need to count key cache reconstruction here. Following this, \Sys performs standard attention computation for the top-k chunks and predefined outliers, requiring $2M \times (K+O) \times C$ bytes. The equivalent bandwidth of \Sys can be defined as:
+
+\begin{equation*}
+    B_\text{equivalent} = \frac{2SB_\text{GPU}}{S/C + 2(K+O)C+ (1-\alpha) KCB_\text{GPU}/B_\text{PCIe}}
+\end{equation*}
+
+For example, assuming C=8, S=128K, K=256, O=48, $B_\text{PCIe}$=31.5 GB/s, and $B_\text{GPU}$=2 TB/s for A100, the equivalent bandwidth of \Sys is calculated as 7.2 TB/s, which is 3.6$\times$ higher than A100 memory bandwidth. This result indicates that \Sys theoretically achieves a high equivalent bandwidth to accelerate attention computation. System implementation is detailed in \cref{app:sys}.
+\begin{table}[h]
+\centering
+\caption{Performance of different models and different methods on RULER \citep{hsieh2024ruler} evaluated at length of 128K. \Sys outperforms other methods with a 1.56\% sparse budget. }
+\setlength{\tabcolsep}{3.5pt} % 调整列间距
+\small
+\begin{tabular}{l|rrrrrrrrrr|r}
+\toprule
+Methods &  N-S1 & N-S2 & N-MK1&N-MK2&N-MQ&N-MV&QA-1&QA-2&VT&FWE &Avg.\\ \midrule
+	\textit{Llama-3-8B-1M} & 100.00&100.00&98.96&98.96&98.96&95.57&75.00&48.96&78.54&71.85 & 86.68\\
+         Loki & 18.75 & 1.04 & 2.08 & 0.00 & 1.56 & 0.78 & 4.17 & 13.54 & 26.04 & 25.35 & 9.33\\
+         Loki (V only) & 41.67 & 6.25 & 37.50 & 1.04 & 8.07 & 30.73 & 10.42 & 19.79 & 51.67 & 37.50& 24.46 \\
+	Quest & \textbf{100.00} & \textbf{100.00}& \textbf{98.96} & 77.08 & 97.65 & 93.49 & 60.42 & 50.00 & 77.08 & 65.63 & 82.03  \\
+    Quest (V only) & \textbf{100.00} & \textbf{100.00} &\textbf{98.96} & 85.42 & \textbf{97.92} & 95.49 & 70.83 & 46.88 & 78.75 & 65.63&83.99\\
+	\rowcolor{cyan!10}
+	\Sys  & \textbf{100.00} & \textbf{100.00} & 97.92&\textbf{98.96}&96.88&\textbf{95.83}&\textbf{72.92}&\textbf{52.08}&\textbf{81.67}&\textbf{72.57}&\textbf{86.88}\\
+	\midrule
+        \textit{GLM-4-9B-1M}&100.00 & 100.00 & 94.79&87.50&99.74&93.75&67.71&55.21&97.29&72.22&86.82 \\
+         Loki & 71.88 & 27.08 & 22.92 & 2.08 & 9.90 & 11.46 & 28.13 & 27.08 & 31.04 & 54.17& 28.57\\
+         Loki (V only) & 96.88 & 55.21 & 56.25 & 18.75 & 51.04 & 50.52 & 45.83 & 39.58 & 72.71 & 59.72 & 54.65\\
+	Quest &  \textbf{100.00} & 95.83 & 90.62 & 54.17 & 94.01 & 76.30 & 55.21 & 52.08 & 95.83 & 64.58 & 77.86 \\
+        Quest (V only) &  \textbf{100.00} & 96.88 & 93.75 & 72.92 & 95.83 & 83.07 & 56.25 & 53.13 & 96.88 & 65.97 & 81.47\\
+	\rowcolor{cyan!10}
+	\Sys  & \textbf{100.00}&\textbf{100.00}&\textbf{95.83}&\textbf{83.33}&\textbf{98.70}&\textbf{87.76}&\textbf{69.79}&\textbf{55.21}&\textbf{97.50}&\textbf{68.06}&\textbf{85.62}\\
+
+\midrule
+\textit{Llama-3.1-8B} & 100.00 & 100.00 & 98.96 & 91.67 & 98.96 & 95.31 & 82.29 & 47.92 & 68.96 & 71.18 &85.53\\
+         Loki & 68.75 & 32.29 & 32.29 & 20.83 & 42.71 & 28.65 & 41.67 & 33.33 & 24.79 & 29.86&35.52\\
+         Loki (V only) & 95.83 & 36.46 & 57.29 & 62.50 & 77.86 & 70.83 & 69.79 & 39.58 & 35.21 & 37.50&58.29\\
+	Quest &  \textbf{100.00} & 98.96 & 97.92 & 34.38 & 93.49 & 88.54 & 70.83 & 44.79 & 65.63 & \textbf{68.40} & 76.29  \\
+        Quest (V only) & \textbf{100.00} & 98.96 & 98.96 & 56.25 & 95.83 & 90.63 & 76.04 & 46.88 & 66.25 & 67.36&79.72\\
+	\rowcolor{cyan!10}
+	\Sys  & \textbf{100.00} & \textbf{100.00} & \textbf{100.00} & \textbf{83.33} & \textbf{97.92} & \textbf{92.19} & \textbf{81.25} & \textbf{48.96} & \textbf{67.08} & 64.93 &\textbf{83.57}\\
+
+     \midrule
+        \textit{Yi-9B-200K}& 100.00& 100.00 & 86.46&62.50&64.58&32.55&44.79&39.58&36.87&89.93 & 65.73\\
+         Loki & 34.38 & 2.08& 2.08 & 0.00 & 0.00 & 0.52 & 22.92 & 21.88 & 0.00 & 25.00& 10.89\\
+         Loki (V only) & 59.38 & 11.46 & 18.75 & 5.21 & 4.43 & 2.08 & 22.92 & 31.25 & 0.00 & 35.07 & 19.06\\
+	Quest &  \textbf{100.00} & 98.96 & 79.17 & 26.04 & 56.51& 31.77 & 32.29 & 31.25 & 51.04 & 71.88 &57.89\\
+         Quest (V only) &\textbf{100.00} & \textbf{100.00} & 80.21 & 45.83 & 59.37 & \textbf{31.90} & 36.45 & 34.37 & 53.54 & 71.88 & 61.36\\
+	\rowcolor{cyan!10}
+	\Sys  & \textbf{100.00} & \textbf{100.00} & \textbf{82.29} & \textbf{67.71} & \textbf{63.28} & 31.51 & \textbf{43.75}&3\textbf{8.54} & \textbf{56.04}&\textbf{72.22}&\textbf{65.53}\\
+
+  \bottomrule
+\end{tabular}
+\label{tab:ruler}
+\end{table}
+
+\section{Empirical Evaluation}
+\label{sec:evaluation}
+In this section, we showcase the effectiveness and efficiency of \Sys. Specifically,
+
+\begin{itemize}
+	\item In \cref{sec:acc}, we show that \Sys can reduce the GPU memory footprint of the KV cache by over $6\times$ without accuracy degradation on a wide range of models and evaluation benchmarks.
+	\item In \cref{sec:eff}, we demonstrate \Sys can support up to $6\times$ larger batch sizes and increase the inference throughput by up to $3.04\times$ without compromising model quality.
+	\item In \cref{sec:ab}, we present extensive ablation studies that validate the effectiveness of each component of \Sys in optimizing GPU memory usage and enhancing performance.
+\end{itemize}
+
+All details (hyperparameters, datasets, etc.), along with additional experiments, are in \cref{app:exp_detail}.
+
+\subsection{Accuracy Evaluation}
+\label{sec:acc}
+We demonstrate that \Sys can reduce the GPU memory usage of the KV cache by $6\times$ while maintaining accuracy on a range of long-context tasks with a minimal sparse KV cache budget.
+
+\paragraph{Setup.} We choose four widely used long-context models for our evaluation: Llama-3-8B-1M \citep{gradllama}, GLM-4-9B-1M \citep{glm2024chatglm}, Llama-3.1-8B \citep{meta_llama_3_1}, and Yi-9B-200K \citep{ai2024yi}. We evaluate our approach on three challenging long-context benchmarks: RULER \citep{hsieh2024ruler}, LongBench \citep{bai2023longbench}, and Needle In A Haystack \citep{niah}, covering QA, multi-hop, reasoning, summarization, code completion. Needle In A Haystack is also tested on Phi-3-Mini-128K \citep{abdin2024phi} and Qwen2-7B-128K \citep{yang2024qwen2}. We set the chunk size to 8, the rank to 160, and the number of outliers to 48 for \Sys.
+
+\paragraph{Baselines.} We include two dynamic sparse attention methods as baselines: Quest \citep{tang2024quest} and Loki \citep{singhania2024loki}. For all methods, we retain exact pre-filling and perform dynamic sparse attention during decoding, where the computation cost is set to 1/16 of full attention for selecting sparse KV pairs. We include two variants for each baseline: one where all the KV cache is offloaded, and another where only the value cache is offloaded. The former has similar latency to \Sys but a smaller sparse budget since \Sys only needs to fetch the value cache from the CPU. The latter aligns with the same sparse KV cache budget but significantly increases GPU memory usage. The latter one is marked as ``V only'' in the table.
+
+\begin{table}[t]
+\centering
+\caption{Performance of various methods on different models with LongBench \citep{bai2023longbench} samples exceeding 4K tokens. \Sys outperforms other methods and maintains the accuracy.}
+\setlength{\tabcolsep}{1.2pt} % 调整列间距
+\small % 缩小整个表格的字体
+\begin{tabular}{l|rrrrrrrrr|r}
+\toprule
+Methods &  NarratQA & MultiFQA & HotpotQA & MuSiQue & DuRead & GovRep & SAMSum &PassRetr & LCC & Avg.\\ \midrule
+\textit{Llama-3-8B-1M} & 18.98 & 41.84 & 36.79 & 21.47 & 31.93 & 34.18 & 35.96 & 81.50 & 56.07 & 39.86\\
+Loki & 2.26 & 10.19 & 5.48 & 3.16 & 12.17 & 28.97 & 7.84 & 40.52 & 31.44 & 15.78\\
+Loki (V only) & 3.20 & 21.01 & 12.41 & 3.86 & 17.07 & 31.24 & 16.23 & 52.57 & 38.10&21.74 \\
+Quest & \textbf{20.13} & 36.63 & 35.00 & 18.14 & 24.55 & 27.11&35.63&79.00&53.64&36.65\\
+Quest (V only) &17.26&39.51&36.78&18.71 &26.41&29.49&35.80&79.50&60.05&38.17\\
+\rowcolor{cyan!10}
+\Sys & 17.17 & \textbf{39.73} & \textbf{38.29} & \textbf{21.08} & \textbf{31.77} & \textbf{31.62} & \textbf{35.87} & \textbf{80.00} & \textbf{63.93} &\textbf{39.94}\\
+\midrule
+
+\textit{GLM-4-9B-1M} & 25.44 & 51.09 & 58.67 & 39.61 & 32.04 & 29.97 & 40.31 & 99.00 & 58.02&48.24\\
+Loki &  5.82 & 30.60&22.73 & 9.20 & 30.09 & 30.35 & 22.70& 98.92 &40.77 &32.35\\
+Loki (V only) & 10.89 & 44.97 & 45.44 & 23.51 & 32.07 & \textbf{30.56} & 35.34 & \textbf{99.50} &50.27 & 41.39\\
+Quest &23.81 & 44.53 & 56.41 & 35.49 & 23.54 & 21.73 & 37.39 & 87.00 &43.80 &41.52\\
+Quest (V only) & 26.00 & 46.32 & 57.54 & 36.42 & 24.58 & 24.52&37.71 & 93.50&46.52&43.68\\
+\rowcolor{cyan!10}
+\Sys & \textbf{26.50} & \textbf{51.31} & \textbf{59.09} & \textbf{38.87} & \textbf{32.92} & 28.54 & \textbf{38.70} & 96.50 & \textbf{58.55}&\textbf{47.89}\\
+
+\midrule
+\textit{Llama-3.1-8B}  & 31.56 & 55.10 & 57.65 & 29.46 & 35.26 & 34.45 & 29.84 & 100.00 & 67.31 &48.96 \\
+Loki&2.31 & 18.89 & 10.64 & 5.47 & 19.30 & 31.16 & 15.91 & 94.88 & 44.60 & 27.02 \\
+Loki (V only) & 3.93 & 38.59 & 22.85 & 12.96 & 27.43 & 32.22 & 26.43 & 98.25 &56.11 &35.42\\
+Quest &29.70 & 49.04 & 53.96 & 27.18 & 27.16 & 30.43 & 29.85 & 98.50 & 57.35 & 44.80\\
+Quest (V only) & 30.02 & 53.97 & 56.39 & 27.06 & 29.06 & 31.65 &30.23 & 99.00 &63.89&46.81\\
+\rowcolor{cyan!10}
+\Sys & \textbf{30.93} & \textbf{55.20} &\textbf{57.32} & \textbf{29.13} & \textbf{31.85} & \textbf{32.79} & \textbf{30.40} & \textbf{99.50} & \textbf{66.03}& \textbf{48.13}\\
+
+\midrule
+
+\textit{Yi-9B-200K}  & 13.88 & 30.02 & 52.46 & 28.20 & 22.29 & 30.25 & 19.08 & 67.00 & 73.50 & 37.41\\
+Loki & 1.63 & 2.73& 16.21 & 4.87 & 4.75 & 2.13& 4.95& 0.00 & 38.72 &8.44\\
+Loki (V only) & 1.96 & 10.39 & 21.31 & 7.36 & 6.78 & 9.15 & 10.02 & 4.00 & 58.75 & 14.41\\
+Quest &10.57 & 25.83 & 46.06 & 23.04 & 17.09 & 17.11 & 20.59 & 50.50 & 67.70 & 30.94\\
+Quest (V only) & \textbf{14.56} & 25.73 & 48.73& 24.73 & 18.44 & 20.83 & 20.08 & 57.50 & 71.13 & 33.53\\
+\rowcolor{cyan!10}
+\Sys & 12.44 & \textbf{30.82} &\textbf{52.43} & \textbf{27.73} & \textbf{20.79} & \textbf{29.83} & \textbf{20.73} & \textbf{64.00} & \textbf{72.89}&\textbf{36.85}\\
+
+\bottomrule
+\end{tabular}
+\label{tab:longbench}
+\end{table}
+
+\paragraph{RULER.} As shown in \cref{tab:ruler}, \Sys demonstrates excellent performance on 128K contexts. With a fixed sparse budget of 1.56\%, Loki and Quest experience performance degradation. In contrast, \Sys is more robust and even outperforms original full attention on certain tasks, such as variable tracking. For complex tasks like multi-document QA or multi-key needle retrieval, other methods suffer from significant performance degradation while \Sys does not.
+
+\paragraph{LongBench.} On LongBench, we evaluate our method with a range of realistic scenarios, including single-/multi-document question-answering, document summarization, code completion, information retrieval, etc. We only test on samples longer than 4K and set the sparse KV cache budget to 256 for this benchmark since it has shorter inputs compared to RULER. As shown in \cref{tab:longbench}, \Sys outperforms other methods consistently and maintains the performance.
+
+\begin{wrapfigure}[8]{r}{0.35\textwidth}
+    \centering
+	\raisebox{-55pt}[\dimexpr\height-5\baselineskip\relax]{%
+	        \includegraphics[width=0.35\textwidth]{imgs/needle_Llama-3-8B-Instruct-1M_ours_16K_1000K.pdf}%
+	    }%
+    \caption{Needle In A Haystack.}
+    \label{fig:needle}
+\end{wrapfigure}
+
+\paragraph{Needle In A Haystack.} On the Needle In A Haystack dataset, as shown in \cref{fig:needle}, \Sys shows the ability to process information at different positions across various context windows, ranging from 16K to 1M tokens. More experiments on a range of models can be found in \cref{appen:niah}.
+
+\paragraph{Integrate with Efficient Pre-filling Methods.} We also combined \Sys with a state-of-the-art efficient pre-filling method MInference \citep{jiang2024minference}. As shown in \cref{tab:minference}, following the setting of MInference, we tested it on RULER with contexts scaling from 8K to 256K. This demonstrates that our method is compatible with pre-filling acceleration techniques. For some certain context length settings, we even see a slight performance improvement.
+
+\begin{table}[h]
+\centering
+\caption{Performance of different methods on RULER \citep{hsieh2024ruler} using MInference \citep{jiang2024minference} in the pre-filling stage. \Sys is compatible with MInference.}
+\begin{tabular}{l|cccccc|c}
+\toprule
+Methods & 8K& 16K& 32K & 64K & 128K& 256K& Avg.\\ \midrule
+	Llama-3-8B-1M w/ MInference &89.92&88.02&82.81&\textbf{78.45}&78.12&\textbf{74.57}&81.98 \\
+	\Sys  w/ MInference  &\textbf{90.47}&\textbf{88.12}&\textbf{83.28}&77.71&\textbf{78.32}& 74.31&\textbf{82.04} \\
+	
+  \bottomrule
+\end{tabular}
+\label{tab:minference}
+\end{table}
+
+\begin{wrapfigure}[10]{r}{0pt}
+    \centering
+	\raisebox{-45pt}[\dimexpr\height-5\baselineskip\relax]{%
+	        \includegraphics[scale=0.36]{imgs/multiniah.pdf}%
+	    }%
+    \caption{Multi-turn NIAH.}
+    \label{fig:multi-turn}
+\end{wrapfigure}
+\paragraph{Multi-turn Conversation Capability.} As the input context length scales, pre-filling becomes quite costly due to the quadratic growing computation time for attention, which means multi-turn conversation capability is important. To simulate multi-turn conversations, we challenged \Sys with a multi-turn needle retrieval task (Multi-turn NIAH). We also test two eviction-based methods in \cref{fig:multi-turn}, including SnapKV \citep{li2024snapkv} and StreamingLLM \citep{xiao2023efficient}. The performance of SnapKV drops significantly from the second round due to the required context information being different from the first round. Since SnapKV inevitably evicted tokens based on the first-turn conversation, it cannot successfully retrieve related information for future queries. In contrast, \Sys can maintain accuracy in the multi-turn conversation setting.
+
+\subsection{Efficiency Evaluation}
+\label{sec:eff}
+To demonstrate the efficiency of \Sys, we deploy it into real-world large batch serving scenarios. By measuring the throughput during decoding across different models on A100, we show that \Sys can support up to $6\times$ larger batch sizes and boost throughput by up to 3.04$\times$.
+
+\paragraph{Baselines.} The baseline selects the largest batch size that can fit entirely on the GPU with full attention. We also include results for the same batch size of \Sys and the infinite batch size, assuming infinite GPU memory capabilities\footnote{For the equivalent \Sys batch size, we evaluate a single Transformer block with FlashAttention and then project the number to the entire model. For the infinite batch size, we leverage A100's theoretical memory bandwidth (2 TB/s) for attention computations.}. We set the sparse budget to 1.56\% for \Sys.
+
+\paragraph{Results.} As shown in \cref{tab:e2e}, \Sys demonstrates significant throughput improvements for various models on an A100, surpassing even those with infinite GPU memory. Notably, \Sys supports batch sizes up to $6\times$ larger and enhances throughput by up to $3.04\times$ compared to full attention, even surpassing infinite batch size assuming infinite GPU memory. While the gains for GLM-4-9B-1M and Yi-9B-200K are slightly lower, the improvements still reach up to $2.56\times$ and $2.66\times$ respectively, highlighting \Sys's adaptability even with fewer KV heads.
+
+\begin{table}[h]
+\centering
+\caption{Generation throughput (tokens/s) on an A100. The gray text in brackets denotes batch size.}
+\setlength{\tabcolsep}{5.1pt} % 调整列间距
+\begin{tabular}{lrrrc|r}
+\toprule
+Model &  Context & Full Attention & \Sys & Gain & Full Attention (Inf)\\ 
+	\midrule
+	Llama-3-8B-1M  & 60K & 160.62 \color{gray}{(8)} & \textbf{455.14 \color{gray}{(48)}} & 2.83$\times$ & 168.72 \color{gray}{(48)} \color{black}{/} 273.07 \color{gray}{(Inf)} \\
+			(8 KV heads)	  & 122K &  80.77 \color{gray}{(4)} & \textbf{239.51 \color{gray}{(24)}} & 2.97$\times$ & 83.05 \color{gray}{(24)} \color{black}{/} 134.30 \color{gray}{(Inf)}\\
+				  & 244K & 40.37 \color{gray}{(2)}  & \textbf{119.01 \color{gray}{(12)}} & 2.95$\times$ & 52.00 \color{gray}{(12)} \color{black}{/} 67.15 \color{gray}{(Inf)}\\
+	\midrule
+	Llama-3.1-8B & 60K & 160.93 \color{gray}{(8)} & \textbf{472.77 \color{gray}{(48)}} & 2.94$\times$&168.72 \color{gray}{(48)} \color{black}{/} 273.07 \color{gray}{(Inf)}\\
+			(8 KV heads)	& 122K & 80.78 \color{gray}{(4)} & \textbf{245.90 \color{gray}{(24)}} & 3.04$\times$ & 83.05 \color{gray}{(24)} \color{black}{/} 134.30 \color{gray}{(Inf)}\\
+	\midrule
+	GLM-4-9B-1M & 60K & 241.05 \color{gray}{(12)}  & \textbf{615.89 \color{gray}{(50)}} & 2.56$\times$& 266.24 \color{gray}{(50)} \color{black}{/}  436.91 \color{gray}{(Inf)}\\
+		(4 KV heads)		& 122K &122.67 \color{gray}{(6)} & \textbf{293.40 \color{gray}{(25)}} & 2.39$\times$ & 158.83 \color{gray}{(25)}  \color{black}{/} 214.87 \color{gray}{(Inf)}\\
+				& 244K & 61.13 \color{gray}{(3)} & \textbf{136.51 \color{gray}{(12)}}& 2.23$\times$ & 78.84 \color{gray}{(12)} \color{black}{/} 107.44 \color{gray}{(Inf)}\\
+	\midrule
+	Yi-9B-200K & 60K & 204.81 \color{gray}{(10)} & \textbf{544.36 \color{gray}{(42)}} & 2.66$\times$ & 271.21 \color{gray}{(42)} \color{black}{/}  364.09 \color{gray}{(Inf)}\\
+		(4 KV heads)		 & 122K & 101.44 \color{gray}{(5)} & \textbf{260.03 \color{gray}{(21)}} & 2.56$\times$ & 133.53 \color{gray}{(21)}  \color{black}{/} 179.06 \color{gray}{(Inf)}\\
+				& 244K &46.74 \color{gray}{(2)} & \textbf{118.55 \color{gray}{(10)}} & 2.54$\times$ & 65.79 \color{gray}{(10)} \color{black}{/} 89.53 \color{gray}{(Inf)}\\
+  \bottomrule
+\end{tabular}
+\label{tab:e2e}
+\end{table}
+
+\subsection{Ablation Results}
+\label{sec:ab}
+We present extensive ablation studies of \Sys, focusing on three key points:  (1) sparse KV cache budget variations, (2) chunk size selections, and (3) pre-RoPE key cache rank choices.
+
+\begin{figure}[t]
+    \centering
+    \includegraphics[width=\linewidth]{imgs/ablation_budget.pdf}
+    \caption{Comparison results between the models with full cache, our \Sys, and Quest.}
+    \label{fig:ablation_budget}
+\end{figure}
+
+\begin{figure}[t]
+    \centering
+   \begin{subfigure}[b]{0.32\textwidth}
+        \includegraphics[width=\linewidth]{imgs/chunk_acc.pdf}
+        \caption{}
+        \label{fig:chunk_acc}
+   \end{subfigure}
+   \hfill
+    \begin{subfigure}[b]{0.32\textwidth}
+        \includegraphics[width=\linewidth]{imgs/chunk_hitrate.pdf}
+        \caption{}
+        \label{fig:chunk_hitrate}
+    \end{subfigure}
+    \hfill
+    \begin{subfigure}[b]{0.32\textwidth}
+        \includegraphics[width=\linewidth]{imgs/rank.pdf}
+        \caption{}
+        \label{fig:ablation_rank}
+   \end{subfigure}
+    \caption{(a) Impact of chunk size on batch size and accuracy. (b) Minimal effect of chunk size on hit rate. (c) Accuracy trends across different ranks with Llama-3-8B-1M on different tasks.}
+    \label{fig:observation}
+\end{figure}
+
+\paragraph{Sparse KV Cache Budget.} We examine \Sys's performance across various tasks with different sparse budgets, as illustrated in \cref{fig:ablation_budget}. \Sys consistently surpasses Quest under the same sparse budgets and achieves higher throughput. On most tasks, it maintains accuracy with just a 1.56\% sparse budget compared to full attention and even improves slightly on some tasks.
+
+\paragraph{Chunk Size.} As shown in \cref{fig:chunk_acc}, increasing the chunk size allows for larger batch sizes. However, accuracy declines when the chunk size exceeds eight. Meanwhile, the chunk size choice has minimal impact on the chunk hit rate, which remains around 60\%, as illustrated in \cref{fig:chunk_hitrate}.
+
+\paragraph{Rank of Pre-RoPE Keys.} We assess \Sys's performance across various tasks using different ranks for pre-RoPE keys. As illustrated in \cref{fig:ablation_rank}, accuracy increases with the rank up to approximately 160, after which it stabilizes near full-rank performance. Interestingly, the trends vary across tasks, and in some cases, low-rank approximations achieve better performance.
+
+\section{Conclusion}
+We present \Sys, a high-throughput inference system for long-context LLM inference. \Sys optimizes GPU memory usage through the low-rank key cache and offloaded value cache, allowing for larger batch sizes. It reduces decoding overhead by accurate sparse attention, boosting throughput while maintaining accuracy. Our empirical experiments demonstrate \Sys can support up to $6\times$ larger batch sizes and enhance throughput by up to $3.04\times$ on an A100 across various long-context models, including Llama-3.1-8B, Llama-3-8B-1M, GLM-4-9B-1M, and Yi-9B-200K. \Sys holds great promise for improving long-context LLM inference.
+
+\newpage
+
+\end{document}

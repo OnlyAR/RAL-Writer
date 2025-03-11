@@ -1,0 +1,433 @@
+\title{Align your Latents: High-Resolution Video Synthesis with Latent Diffusion Models}
+
+\begin{document}
+
+\title{\vspace{-2.7em} Align your Latents: \\ High-Resolution Video Synthesis with Latent Diffusion Models}
+
+\author{
+Andreas Blattmann\textsuperscript{1\;\,*,\dag}
+\quad\quad
+Robin Rombach\textsuperscript{1\;\,*,\dag}
+\quad\quad
+Huan Ling\textsuperscript{2,3,4\;\,*}
+\quad\quad
+Tim Dockhorn\textsuperscript{2,3,5\;\,*,\dag}
+\vspace{0.15cm}
+\\
+Seung Wook Kim\textsuperscript{2,3,4}
+\quad\quad
+Sanja Fidler\textsuperscript{2,3,4}
+\quad\quad
+Karsten Kreis\textsuperscript{2}
+\vspace{0.25cm}
+\\
+{\small\textsuperscript{1}LMU Munich \quad \textsuperscript{2}NVIDIA \quad \textsuperscript{3}Vector Institute \quad \textsuperscript{4}University of Toronto \quad \textsuperscript{5}University of Waterloo \vspace{0pt}}
+\vspace{0.15cm}
+\\
+\small \textit{Project page:} \url{https://research.nvidia.com/labs/toronto-ai/VideoLDM/}
+}
+
+\twocolumn[{
+    \renewcommand\twocolumn[1][]{#1}
+    \maketitle
+    \begin{center}
+    \vspace{-15pt}
+        \centering
+        \includegraphics[width=\linewidth]{figures/teaser_fig_10.pdf}
+    \vspace{-0.7cm}
+    \captionof{figure}{
+        \small \textbf{Video LDM samples}. \emph{Top:} Text-to-Video generation. \emph{Bottom:} $512\times 1024$ resolution real driving scene video generation.
+    }
+    \label{fig:teaser}
+
+    \end{center}
+}]
+
+\begin{figure*}[t!]
+  \begin{minipage}[c]{0.69\textwidth}
+  \vspace{-7mm}
+    \includegraphics[width=1.0\textwidth]{figures/pipeline_fig.pdf}
+  \end{minipage}\hfill
+  \begin{minipage}[c]{0.31\textwidth}
+  \vspace{-1mm}
+    \caption{\small \textbf{Temporal Video Fine-Tuning.} We turn pre-trained image diffusion models into temporally consistent video generators. Initially, different samples of a batch synthesized by the model are independent. After temporal video fine-tuning, the samples are temporally aligned and form coherent videos. The stochastic generation process before and after fine-tuning is visualised for a diffusion model of a one-dim. toy distribution. For clarity, the figure corresponds to alignment in pixel space. In practice, we perform alignment in LDM's latent space and obtain videos after applying LDM's decoder (see \Cref{fig:ldm_figure}). We also video fine-tune diffusion model upsamplers in pixel or latent space (\Cref{sec:method_upsampler}).}
+    \label{fig:pipeline}
+  \end{minipage}
+  \vspace{-7mm}
+\end{figure*}\begin{abstract}
+\vspace{-0.2cm}
+Latent Diffusion Models (LDMs) enable high-quality image synthesis while avoiding excessive compute demands by training a diffusion model in a compressed lower-dimensional latent space. Here, we apply the LDM paradigm to high-resolution video generation, a particularly resource-intensive task. 
+We first pre-train an LDM on images only; then, we turn the image generator into a video generator by introducing a temporal dimension to the latent space diffusion model and fine-tuning on encoded image sequences, i.e., videos. Similarly, we temporally align diffusion model upsamplers, turning them into temporally consistent video super resolution models. 
+We focus on two relevant real-world applications: Simulation of in-the-wild driving data and creative content creation with text-to-video modeling. In particular, we validate our \textbf{Video LDM} on real driving videos 
+of resolution $512\times1024$, achieving state-of-the-art performance. %
+Furthermore, our approach can easily leverage off-the-shelf pre-trained image LDMs, as we only need to train a temporal alignment model in that case.  Doing so, we turn the publicly available, state-of-the-art text-to-image LDM Stable Diffusion into an efficient and expressive text-to-video model with resolution up to $1280\times2048$.
+We show that the temporal layers trained in this way generalize to different fine-tuned text-to-image LDMs. Utilizing this property, we show the first results for personalized text-to-video generation, opening exciting directions for future content creation.
+{\let\thefootnote\relax\footnote{{\textsuperscript{*}Equal contribution.}}}
+{\let\thefootnote\relax\footnote{{\textsuperscript{\dag}Andreas, Robin and Tim did the work during internships at NVIDIA.}}}
+\end{abstract}
+
+\vspace{-3mm}
+\section{Introduction}\label{sec:intro}
+\vspace{-1mm}
+
+ 
+Generative models of images have received unprecedented attention, owing to recent breakthroughs in the underlying modeling methodology. The most powerful models today are built on generative adversarial networks~\cite{goodfellow2014generative,karras2019style,karras2020analyzing,karras2021aliasfree,sauer2021styleganxl}, autoregressive transformers~\cite{esser2020taming,ramesh2021dalle,yu2022parti}, and most recently diffusion models~\cite{sohl2015deep,ho2020ddpm,song2020score,nichol2021improved,dhariwal2021diffusion,ho2021cascaded,nichol2021glide,rombach2021highresolution,ramesh2022dalle2,saharia2022imagen}.
+Diffusion models (DMs) in particular have desirable advantages; they offer a robust and scalable training objective and are typically less parameter intensive than their transformer-based counterparts. 
+However, while the image domain has seen great progress, \emph{video} modeling has lagged behind---mainly due to the significant computational cost associated with training on video data, and the lack of large-scale, general, and publicly available video datasets. While there is a rich literature on video synthesis~\cite{babaeizadeh2018stochastic,svg,lee2018savp,hvrnn,lsvg,Weissenborn2020Scaling,yan2021videogpt,hong2022cogvideo,wu2021godiva,wu2022nuwa,ge2022longvideo,Gupta_2022_CVPR,scene_dyn,yu2022generating,tian2021a, villegas17mcnet,Luc2020TransformationbasedAV,TGAN2020,brooks2022generating,Skorokhodov_2022_CVPR,kahembwe2020lower,hong2022cogvideo,mittal2017sync,Pan2017ToCW,marwah2017attentive,li2017video,gupta2018imagine}, most works, including previous video DMs~\cite{yang2022video,ho2022video,hoeppe2022diffusion,voleti2022mcvd,harvey2022flexible}, only generate relatively low-resolution, often short, videos.
+Here, we apply video models to real-world problems and generate high-resolution, long videos. 
+Specifically, we focus on two relevant real-world video generation problems: (i) video synthesis of high-resolution real-word driving data, which has great potential as a simulation engine in the context of autonomous driving, and (ii) text-guided video synthesis for creative content generation; see \cref{fig:teaser}.
+
+To this end, we build on latent diffusion models (LDMs), which can reduce the heavy computational burden when training on high-resolution images~\cite{rombach2021highresolution}. 
+We propose \emph{Video LDMs} and extend LDMs to high-resolution \emph{video} generation, a particularly compute-intensive task. In contrast to previous work on DMs for video generation~\cite{yang2022video,ho2022video,hoeppe2022diffusion,voleti2022mcvd,harvey2022flexible}, we first pre-train our Video LDMs on images only (or use available pre-trained image LDMs), thereby allowing us to leverage large-scale image datasets. 
+We then transform the LDM image generator into a video generator by introducing a temporal dimension into the latent space DM and training only these temporal layers on encoded image sequences, \ie, videos (\Cref{fig:pipeline}), while fixing the pre-trained spatial layers.
+We similarly fine-tune LDM's decoder to achieve temporal consistency in pixel space (\Cref{fig:ldm_figure}).
+To further enhance the spatial resolution, we also temporally align pixel-space and latent DM upsamplers~\cite{ho2021cascaded}, which are widely used for image super resolution~\cite{saharia2021image,li2022srdiff,saharia2022imagen,rombach2021highresolution}, turning them into temporally consistent video super resolution models.
+Building on LDMs, our method can generate globally coherent and long videos in a computationally and memory efficient manner. For synthesis at very high resolutions, the video upsampler only needs to operate locally, keeping training and computational requirements low.
+We ablate our method and test on $512\times1024$ real driving scene videos, achieving state-of-the-art video quality, and synthesize videos of several minutes length. 
+We also video fine-tune a powerful, publicly available text-to-image LDM, \textit{Stable Diffusion}~\cite{rombach2021highresolution}, and turn it into an efficient and powerful text-to-video generator with resolution up to $1280\times2048$. 
+Since we only need to train the temporal alignment layers in that case, we can use a relatively small training set of captioned videos. 
+By transferring the trained temporal layers to differently fine-tuned text-to-image LDMs, we demonstrate personalized text-to-video generation for the first time.
+We hope our work opens new avenues for efficient digital content creation and autonomous driving simulation.
+
+\looseness=-1
+
+\textbf{Contributions.} \textit{(i)} We present an efficient approach for training high-resolution, long-term consistent video generation models based on LDMs. Our key insight is to leverage pre-trained image DMs and turn them into video generators by inserting temporal layers that learn to align images in a temporally consistent manner (\Cref{fig:pipeline,fig:ldm_figure}). \textit{(ii)} We further temporally fine-tune super resolution DMs, which are ubiquitous in the literature. \textit{(iii)} We achieve state-of-the-art high-resolution video synthesis performance on real driving scene videos, and we can generate multiple minute long videos. \textit{(iv)} We transform the publicly available \emph{Stable Diffusion} text-to-image LDM into a powerful and expressive text-to-video LDM, and \textit{(v)} show that the learned temporal layers can be combined with different image model checkpoints (\eg, \emph{DreamBooth}~\cite{ruiz2022dreambooth}).
+
+\vspace{-2mm}
+\section{Background}\label{sec:background}
+\vspace{-1mm}
+\begin{figure}[t!]
+  \vspace{-0.2cm}
+    \includegraphics[width=0.49\textwidth]{figures/ldm_figure.pdf}
+    \caption{\small \textit{Top:} During temporal decoder fine-tuning, we process video sequences with a frozen encoder, which processes frames independently, and enforce temporally coherent reconstructions across frames. We additionally employ a video-aware discriminator. \textit{Bottom:} in LDMs, a diffusion model is trained in latent space. It synthesizes latent features, which are then transformed through the decoder into images. Note that the bottom visualization is for individual frames; see \Cref{fig:pipeline} for the video fine-tuning framework that generates temporally consistent frame sequences.} 
+    \label{fig:ldm_figure}
+  \vspace{-4mm}
+\end{figure}DMs~\cite{sohl2015deep,ho2020ddpm,song2020score} learn to model a data distribution $p_{\text{data}}(\rvx)$ via \emph{iterative denoising} and are trained with \textit{denoising score matching}~\cite{hyvarinen2005scorematching,lyu2009scorematching,vincent2011,sohl2015deep,song2019generative,ho2020ddpm,song2020score}: Given samples $\rvx \sim p_{\text{data}}$, \emph{diffused} inputs $\rvx_\tau = \alpha_\tau \rvx + \sigma_\tau \rvepsilon, \; \rvepsilon \sim \gN(\mathbf{0}, \mI)$ are constructed; $\alpha_{\tau}$ and $\sigma_\tau$ define a \emph{noise schedule}, parameterized via 
+a diffusion-time $\tau$, such that the logarithmic signal-to-noise ratio $\lambda_\tau = \log(\alpha_{\tau}^2/\sigma_\tau^2)$ monotonically decreases. A denoiser model $\rvf_\theta$ (parameterized with learnable parameters $\theta$) receives the diffused $\rvx_\tau$ as input and is
+optimized minimizing the denoising score matching objective
+\begin{align}
+\E_{\rvx \sim p_{\text{data}}, \tau \sim p_{\tau}, \rvepsilon \sim \gN(\mathbf{0}, \mI)} \left[\Vert \rvy - \rvf_\theta(\rvx_\tau; \rvc, \tau) \Vert_2^2 \right],
+\label{eq:diffusionobjective}
+\end{align}
+where $\rvc$ is optional conditioning information, such as a text prompt, and the target vector $\rvy$ is either the random noise $\rvepsilon$ or $\rvv = \alpha_\tau \rvepsilon - \sigma_\tau \rvx$.
+The latter objective (often referred to as \emph{$\rvv$-prediction}) has been introduced in the context of progressive distillation~\cite{salimans2022progressive} and empirically often yields faster convergence of the model (here, we use both objectives). Furthermore,
+$p_\tau$ is a uniform distribution over the diffusion time $\tau$. The forward diffusion as well as the reverse generation process in diffusion models can be described via stochastic differential equations in a continuous-time framework~\cite{song2020score} (see~\Cref{fig:pipeline,fig:ldm_figure}), but in practice a fixed discretization can be used~\cite{ho2020ddpm}.
+The maximum diffusion time is generally chosen such that the input data is entirely perturbed into Gaussian random noise and an iterative generative denoising process that employs the learned denoiser $\rvf_\theta$ can be initialized from such Gaussian noise to synthesize novel data.
+Here, we use $p_\tau\sim\mathcal{U}\{0,1000\}$ and rely on a \emph{variance-preserving} noise schedule~\cite{song2020score}, for which $\sigma_\tau^2 = 1 - \alpha_\tau^2$ (see \Cref{app:arch,app:exp_details} for details). 
+
+\textbf{Latent Diffusion Models (LDMs)}~\cite{rombach2021highresolution} improve in computational and memory efficiency over pixel-space DMs by first training a compression model to transform input images $\rvx{\sim}p_{\text{data}}$ into a spatially lower-dimensional latent space of reduced complexity, from which the original data can be reconstructed at high fidelity.
+In practice, this approach is implemented with a regularized autoencoder, which reconstructs inputs $\rvx$ via an encoder module $\gE$ and a decoder $\gD$, such that the reconstruction $\hat{\rvx}{=}\gD(\gE(\rvx)){\approx}\rvx$ (\Cref{fig:ldm_figure}). To ensure photorealistic reconstructions, an adversarial objective can be added to the autoencoder training~\cite{rombach2021highresolution}, which is implemented using a patch-based discriminator~\cite{isola2017image}. 
+A DM can then be trained in the compressed latent space and $\rvx$ in \Cref{eq:diffusionobjective} is replaced by its latent representation $\rvz{=}\gE(\rvx)$. This latent space DM can be typically smaller in terms of parameter count and memory consumption compared to corresponding pixel-space DMs of similar performance.
+
+\vspace{-1.5mm}
+\section{Latent Video Diffusion Models}\label{sec:video_ldm}
+Here we describe how we \emph{video fine-tune} pre-trained image LDMs (and DM upsamplers) for high-resolution video synthesis. We assume access to a dataset $p_{\text{data}}$ of videos, such that $\rvx \in \R^{T \times 3 \times \tilde{H} \times \tilde{W}}, \; \rvx \sim p_{\text{data}}$ is a sequence of $T$ RGB frames, with height and width $\tilde{H}$ and $\tilde{W}$.
+\begin{figure}[t!]
+  \vspace{-0.3cm}
+    \includegraphics[width=0.49\textwidth]{figures/video_merge_block2.pdf}
+    \caption{\small \textit{Left:} We turn a pre-trained LDM into a video generator by inserting \emph{temporal} layers that learn to align frames into temporally consistent sequences. During optimization, the image backbone $\theta$ remains fixed and only the parameters $\phi$ of the temporal layers $l_\phi^i$ are trained, \cf \Cref{eq:videoobjective}. \textit{Right:}
+During training, the base model $\theta$ interprets the input sequence of length $T$ as a batch of images. For the temporal layers $\l_\phi^i$, these batches are reshaped into video format. Their output $\rvz'$ is combined with the spatial output $\rvz$, using a learned merge parameter $\alpha$.
+During inference, skipping the temporal layers ($\alpha_\phi^i{=}1$)  yields the original image model.
+    For illustration purposes, only a single U-Net Block is shown.
+    $B$ denotes batch size, $T$ sequence length, $C$ input channels and $H$ and $W$ the spatial dimensions of the input. $\rvc_S$ is optional context frame conditioning, when training prediction models (\Cref{sec:prediction}).
+    } 
+    \label{fig:architecture}
+
+   \vspace{-5.5mm}
+\end{figure}\subsection{Turning Latent Image into Video Generators}
+\label{sec:turning}
+Our key insight for efficiently training a video generation model is to re-use a pre-trained, fixed image generation model; an LDM parameterized by parameters $\theta$. Formally, let us denote the neural network layers that comprise the image LDM and process inputs over the pixel dimensions as \emph{spatial} layers $l_\theta^i$, with layer index $i$.
+However, although such a model is able to synthesize individual frames at high quality, using it directly to render a video of $T$ consecutive frames will fail, as the model has no temporal awareness. 
+We thus introduce additional \emph{temporal} neural network layers $l_\phi^i$, which are interleaved with the existing \emph{spatial} layers $l_\theta^i$ and learn to align individual frames in a temporally consistent manner. These $L$ additional temporal layers $\{l_\phi^i\}_{i=1}^L$ define the \emph{video-aware} temporal backbone of our model, and the full model $\rvf_{\theta, \phi}$ is thus the combination of the spatial and temporal layers; see~\Cref{fig:architecture} for a visualization.
+
+We start from a frame-wise encoded input video $\mathcal{E}(\rvx)=\rvz \in \R^{T \times C \times H \times W}$, 
+where $C$ is the number of latent channels and $H$ and $W$ are the spatial latent dimensions.
+The spatial layers interpret the video as a batch of independent images (by shifting the temporal axis into the batch dimension), and for each \emph{temporal mixing layer} $l_\phi^i$, we reshape back to video dimensions as follows (using \texttt{einops}~\cite{rogozhnikov2022einops} notation):
+\begin{align*}
+\rvz' &\leftarrow \texttt{rearrange}(\rvz, \; \texttt{(b t) c h w} \rightarrow \texttt{b c t h w}) \\
+\rvz' &\leftarrow l_\phi^i(\rvz', \rvc) \\
+\rvz' &\leftarrow \texttt{rearrange}(\rvz', \; \texttt{b c t h w} \rightarrow \texttt{(b t) c h w}) ,
+\end{align*}
+where we added the batch dimension $\texttt{b}$ for clarity. %
+In other words, the spatial layers treat all $B{\cdot}T$ encoded video frames independently in the batch dimension $\texttt{b}$, while the temporal layers $l_\phi^i(\rvz', \rvc)$ process entire videos in a new temporal dimension $\texttt{t}$. Furthermore, $\rvc$ is (optional) conditioning information such as a text prompt.
+After each temporal layer, the output $\rvz'$ is combined with $\rvz$ as
+$\alpha_\phi^i \rvz + (1 - \alpha_\phi^i) \rvz'$; 
+$\alpha_\phi^i\in[0,1]$ denotes a (learnable) parameter (also \Cref{app:convolutional_ldm}).
+
+In practice, we implement two different kinds of temporal mixing layers: (i) temporal attention and (ii) residual blocks based on 3D convolutions, \cf \Cref{fig:architecture}. We use sinusoidal embeddings~\cite{vaswani2017attention,ho2020ddpm} to provide the model with a positional encoding for time. 
+
+Our video-aware temporal backbone is then trained using the same noise schedule as the underlying image model, and, importantly, we fix the spatial layers $l_\theta^i$ and \emph{only} optimize the temporal layers $l_\phi^i$ via
+{\small\begin{align}
+\argmin_{\phi} \E_{\rvx\sim p_{\text{data}}, \tau \sim p_{\tau}, \rvepsilon \sim \gN(\mathbf{0}, \mI)} \left[\Vert \rvy - \rvf_{\theta, \phi}(\rvz_\tau; \rvc, \tau) \Vert_2^2 \right],
+\label{eq:videoobjective}
+\end{align}}
+where $\rvz_\tau$ denotes diffused encodings $\rvz=\mathcal{E}(\rvx)$.
+This way, we retain the native image generation capabilities by simply skipping the temporal blocks, \eg by setting $\alpha_\phi^i = 1$ for each layer. A crucial advantage of our strategy is that huge image datasets can be used to pre-train the spatial layers, while the video data, which is often less widely available, can be utilized for focused training of the temporal layers.
+
+\subsubsection{Temporal Autoencoder Finetuning}
+\label{sec:dec_finetuna}
+\begin{figure}[t!]
+  \vspace{-0.4cm}
+    \includegraphics[width=0.49\textwidth]{figures/stack_figure3.pdf}
+    \caption{\small \textbf{Video LDM Stack.} We first generate sparse key frames. Then we temporally interpolate in two steps with the same interpolation model to achieve high frame rates. These operations are all based on latent diffusion models (LDMs) that share the same image backbone. Finally, the latent video is decoded to pixel space and optionally a video upsampler diffusion model is applied.} 
+    \label{fig:stack_figure}
+  \vspace{-4mm}
+\end{figure}Our video models build on pre-trained image LDMs. While this increases efficiency, the autoencoder of the LDM is trained on images only, causing flickering artifacts when encoding and decoding a temporally coherent sequence of images. %
+To counteract this, we introduce additional temporal layers for the autoencoder's decoder, which we finetune on video data with a (patch-wise) temporal discriminator built from 3D convolutions, \cf ~\Cref{fig:ldm_figure}. Note that the encoder remains unchanged from image training such that the image DM that operates in latent space on encoded video frames can be re-used.
+As demonstrated by computing reconstruction FVD~\cite{unterthiner2018towards} scores in~\Cref{tab:av_upsampler}, this step is critical for achieving good results.
+
+\begin{figure*}[t!]
+  \vspace{-0.8cm}
+    \includegraphics[width=\textwidth]{figures/txt2video6.pdf}
+    \vspace{-8mm}
+    \caption{\small $1280\times 2048$ resolution samples from our Stable Diffusion-based text-to-video LDM, including video fine-tuned upsampler. Prompts: ``An astronaut flying in space, 4k, high resolution''  and ``Milk dripping into a cup of coffee, high definition, 4k''.} \vspace{-0.5em}
+    \label{fig:text2image_samples}
+  \vspace{-4mm}
+\end{figure*}\subsection{Prediction Models for Long-Term Generation}
+\label{sec:prediction}
+Although the approach described in \Cref{sec:turning} is efficient for generating short video sequences, it reaches its limits when it comes to synthesizing very long videos. Therefore, we also train models as \emph{prediction models} given a number of (first) $S$ context frames. We implement this by introducing a temporal binary mask $\rvm_S$ 
+which masks the $T-S$ frames the model has to predict, where $T$ is the total sequence length as in \Cref{sec:turning}. We feed this mask and the masked encoded video frames into the model for conditioning.
+Specifically, the frames are encoded with LDM's image encoder $\gE$, multiplied by the mask, and then fed (channel-wise concatenated with the masks) into the temporal layers $l_\phi^i$ after being processed with a learned downsampling operation, see~\Cref{fig:architecture}. Let $\rvc_S = (\rvm_S \circ \rvz, \rvm_S)$ denote the concatenated spatial conditioning of masks and masked (encoded) images. Then, the objective from \Cref{eq:videoobjective} reads
+\begin{align}
+\E_{\rvx \sim p_{\text{data}}, \rvm_S\sim p_S, \tau \sim p_{\tau}, \rvepsilon} \left[\Vert \rvy - \rvf_{\theta, \phi}(\rvz_\tau; \rvc_S, \rvc, \tau) \Vert_2^2 \right],
+\label{eq:predictionobjective}
+\end{align}
+where $p_S$ represents the (categorical) mask sampling distribution.
+In practice, we learn prediction models that condition either on 0, 1 or 2 context frames, allowing for classifier-free guidance as discussed below.
+
+During inference, for generating long videos, we can apply the sampling process iteratively, re-using the latest predictions as new context. The first initial sequence is generated by synthesizing a single context frame from the base image model and generating a sequence based on that; afterwards, we condition on two context frames to encode movement (details in Appendix). 
+To stabilize this process, we found it beneficial to use \emph{classifier-free diffusion guidance}~\cite{ho2021classifierfree}, where we guide the model during sampling via
+{\small\begin{equation}
+\rvf_{\theta, \phi}'(\rvz_\tau; \rvc_S) = \rvf_{\theta, \phi}(\rvz_\tau) + s \cdot \left(\rvf_{\theta, \phi}(\rvz_\tau; \rvc_S) - \rvf_{\theta, \phi}(\rvz_\tau) \right)
+\end{equation}}
+where $s{\geq}1$ denotes the guidance scale and we dropped the explicit conditioning on $\tau$ and other information $\rvc$ for readability. 
+We refer to this guidance as \emph{context guidance}.
+
+\subsection{Temporal Interpolation for High Frame Rates}
+High-resolution video is characterized not only by high spatial resolution, but also by high temporal resolution, \ie, a high frame rate. 
+To achieve this, we divide the synthesis process for high-resolution video into two parts: The first is the process described in \Cref{sec:turning} and \Cref{sec:prediction}, which can generate \emph{key frames} with large semantic changes, but (due to memory constraints) only at a relatively low frame rate. 
+For the second part, we introduce an additional model whose task is to interpolate between given key frames. 
+To implement this, we use the masking-conditioning mechanism introduced in \Cref{sec:prediction}. However, unlike the prediction task, we now mask the frames to be interpolated---otherwise, the mechanism remains the same, \ie, the image model is refined into a video interpolation model. In our experiments, we predict three frames between two given key frames, thereby training a $T \rightarrow 4T$ interpolation model. To achieve even larger frame rates, we train the model simultaneously in the $T \rightarrow 4T$ and $4T \rightarrow 16T$ regimes (using videos with different fps), specified by binary conditioning. 
+
+Our training approach for prediction and interpolation models is inspired by recent works~\cite{voleti2022mcvd,harvey2022flexible,hoeppe2022diffusion} that use similar masking techniques (also see \Cref{sec:related_extended}).
+
+\begin{figure*}[t!]
+  \vspace{-0.8cm}
+    \includegraphics[width=\textwidth]{figures/driving_main_fig2.pdf}
+    \vspace{-7mm}
+    \caption{\small $512\times1024$ resolution video modeling of real-world driving scenes with our Video LDM and video upsampler. \emph{Top:} (Night time) \textbf{Driving Video Generation}. \emph{Middle:} \textbf{Multimodal Driving Scenario Prediction}: We simulate two different scenarios given the same initial frame (red). \emph{Bottom:} \textbf{Specific Driving Scenario Simulation}: We synthesize a scenario based on a manually designed, initial scene generated with a bounding box-conditioned Image LDM (yellow). More examples in the \Cref{app:extended_driving}.  \vspace{-0.5em}}
+    \label{fig:av_samples}
+  \vspace{-4mm}
+\end{figure*}\subsection{Temporal Fine-tuning of SR Models} \label{sec:method_upsampler}
+Although the LDM mechanism already provides a good native resolution we aim to push this towards the megapixel range. We take inspiration from cascaded DMs~\cite{ho2021cascaded} and use a DM to further scale up the Video LDM outputs by $4\times$.
+For our driving video synthesis experiments, we use a pixel-space DM~\cite{ho2021cascaded} (\Cref{sec:driving_exp}) and scale to $512\times1024$; for our text-to-video models, we use an LDM upsampler~\cite{rombach2021highresolution} (\Cref{sec:text-to-video}) and scale to $1280\times2048$.
+We use noise augmentation with noise level conditioning~\cite{ho2021cascaded,saharia2022imagen} and train the super resolution (SR) model $\rvg_{\theta, \phi}$ (on images or latents) via
+{\small\begin{align}
+\E_{\rvx \sim p_{\text{data}}, (\tau,\tau_{\gamma}) \sim p_{\tau}, \rvepsilon \sim \gN(\mathbf{0}, \mI)} \left[\Vert \rvy - \rvg_{\theta, \phi}(\rvx_\tau; \rvc_{\tau_{\gamma}}, \tau_{\gamma}, \tau) \Vert_2^2 \right]
+\label{eq:upscaleobjective}
+\end{align}}
+where $\rvc_{\tau_{\gamma}} = \alpha_{\tau_\gamma} \rvx + \sigma_{\tau_\gamma} \rvepsilon, \; \rvepsilon \sim \gN(\mathbf{0}, \mI)$, denotes a noisy low-resolution image given to the model via concatenation, and $\tau_\gamma$ the amount of noise added to the low-resolution image following the noise schedule $\alpha_\tau$, $\sigma_\tau$.
+
+Since upsampling video frames independently would result in poor temporal consistency, we also
+make this SR model video-aware. We follow the mechanism introduced in~\Cref{sec:turning} with spatial layers $l_\theta^i$ and temporal layers $l_\phi^i$ and similarly video fine-tune the upscaler, conditioning on a low-resolution sequence of length $T$ and concatenating low-resolution video images frame-by-frame. 
+Since the upscaler operates locally, we conduct all upscaler training efficiently on patches only and later apply the model convolutionally.
+
+Overall, we believe that the combination of an LDM with an upsampler DM is ideal for efficient high-resolution video synthesis. On the one hand, the main LDM component of our Video LDM leverages a computationally efficient, compressed latent space to perform all video modeling. This allows us to use large batch sizes and jointly encode more video frames, which benefits long-term video modeling, without excessive memory demands, as all video predictions and interpolations are carried out in latent space. On the other hand, the upsampler can be trained in an efficient patch-wise manner, therefore similarly saving computational resources and reducing memory consumption, and it also does not need to capture long-term temporal correlations due to the low-resolution conditioning. Therefore, no prediction and interpolation framework is required for this component. A model overview, bringing together all components from \Cref{sec:turning} to \Cref{sec:method_upsampler}, is depicted in~\Cref{fig:stack_figure}.
+
+\textit{A discussion of related work can be found in \Cref{sec:related_extended}.}
+
+\vspace{-1mm}
+\section{Experiments}\label{sec:experiments}
+\vspace{-1mm}
+\textbf{Datasets.} Since we focus on driving scene video generation as well as text-to-video, we use two corresponding datasets/models: \textit{(i)} An in-house dataset of real driving scene (RDS) videos. The dataset consists of 683,060 videos of 8 seconds each at resolution $512\times1024$ ($H\times W$) and frame rate up to 30 fps. Furthermore, the videos have binary night/day labels, annotations for the number of cars in a scene (``crowdedness''), and a subset of the data also has car bounding boxes. \textit{(ii)} We use the  WebVid-10M~\cite{bain21frozen} dataset to turn the publicly available \textit{Stable Diffusion} Image LDM~\cite{rombach2021highresolution} into a Video LDM. WebVid-10M consists of 10.7M video-caption pairs with a total of 52K video hours. We resize the videos into resolution $320\times512$. 
+\textit{(iii)} Moreover, in \Cref{app:mountain_bike}, we show experiments on the Mountain Biking dataset by Brooks et al.~\cite{brooks2022generating}. %
+
+\textbf{Evaluation Metrics.} To evaluate our models, we use frame-wise Fr\'echet Inception Distance (FID)~\cite{heusel2017gans} as well as Fr\'echet Video Distance (FVD)~\cite{unterthiner2018towards}. Since FVD can be unreliable (discussed, for instance, by Brooks et al.~\cite{brooks2022generating}), we additionally perform human evaluation. For our text-to-video experiments, we also evaluate CLIP similarity (CLIPSIM)~\cite{wu2021godiva} and (video) inception score (IS) (\Cref{app:quant_eval}).
+
+\textbf{Model Architectures and Sampling.} Our Image LDMs are based on Rombach et al.~\cite{rombach2021highresolution}. They use convolutional encoders and decoders, and their latent space DM architecture build on the U-Net by Dhariwal et al.\cite{dhariwal2021diffusion}. Our pixel-space upsampler DMs use the same Image DM backbone~\cite{dhariwal2021diffusion}. DM sampling is performed using DDIM~\cite{song2021denoising} in all experiments.\looseness=-1
+
+Further architecture, training, evaluation, sampling and dataset details can be found in the Appendix.
+
+\subsection{High-Resolution Driving Video Synthesis} \label{sec:driving_exp}
+We train our Video LDM pipeline, including a $4\times$ pixel-space video upsampler, on the real driving scene (RDS) data. We condition on day/night labels and crowdedness, and randomly drop these labels during training to allow for classifier-free guidance and unconditional synthesis (we do not condition on bounding boxes here). Following the proposed training strategy above, we first train the image backbone LDM (spatial layers) on video frames independently, before we then train the temporal layers on videos. We also train Long Video GAN (LVG)~\cite{brooks2022generating}, the previous state-of-the-art in long-term high-resolution video synthesis, on the RDS data to serve as main baseline. \Cref{tab:av_main} (left) shows our main results for the Video LDM at $128\times256$ resolution, without upsampler. We show both performance of our model with and without conditioning on crowdedness and day/night. Our Video LDM generally outperforms LVG and adding conditioning further reduces FVD. \Cref{tab:av_user_study} shows our human evaluation: Our samples are generally preferred over LVG in terms of realism, and samples from our conditional model are also preferred over unconditional samples.\looseness=-1
+
+Next, we compare our video fine-tuned pixel-space upsampler with independent frame-wise image upsampling (\Cref{tab:av_upsampler}), using $128\times256$ 30 fps ground truth videos for conditioning. We find that temporal alignment of the upsampler is crucial for high performance. FVD degrades significantly, if the video frames are upsampled independently, indicating loss of temporal consistency. As expected, FID is essentially unaffected, because the individual frames are still of high quality when upsampled independently.
+
+In~\Cref{fig:teaser} (bottom) and \Cref{fig:av_samples} (top), we show conditional samples from the combined Video LDM and video upsampler model. We observe high-quality videos. Moreover, using our prediction approach, we find that we can generate very long, temporally coherent high-resolution driving videos of multiple minutes. We validated this for up to 5 minutes; see Appendix and supplementary video for results.
+
+\begin{table}
+    \vspace{-0.1cm}
+    \centering
+    \caption{\emph{Left:} Comparison with LVG on RDS; \emph{Right:}~Ablations.\vspace{-1em}}
+    \label{tab:av_main}
+    \resizebox{.48\linewidth}{!}{%
+    \begin{tabular}{l c c}
+        \toprule
+        \textbf{Method} & FVD & FID \\
+        \midrule
+        LVG~\cite{brooks2022generating} & 478 & 53.5 \\
+        \emph{Ours} & 389 & \textbf{31.6} \\
+        \emph{Ours} (cond.) & \textbf{356} & 51.9 \\
+        \bottomrule
+    \end{tabular}
+    }
+    \hfill
+    \resizebox{.48\linewidth}{!}{%
+    \begin{tabular}{l c c}
+        \toprule
+        \textbf{Method} & FVD & FID \\
+        \midrule
+        Pixel-baseline & 639,56 & 59.70 \\
+        End-to-end LDM & 1155.10 & 71.26 \\
+        Attention-only & 704.41 & 50.01\\
+        \midrule
+        \emph{Ours} & 534.17 & \textbf{48.26} \\
+        \emph{Ours} (context-guided) & \textbf{508.82} & 54.16 \\
+        \bottomrule
+    \end{tabular}
+    }
+    \vspace{-0.3em}
+\end{table}
+
+\begin{table}
+    \centering
+        \caption{User study on Driving Video Synthesis on RDS. \vspace{-1em}}
+    \label{tab:av_user_study}
+    
+    \resizebox{ \linewidth}{!}{%
+    \begin{tabular}{l  c c c}
+        \toprule
+        \textbf{Method} &   Pref. A &  Pref. B & Equal  \\
+        \midrule
+        \emph{Ours} (cond.) v.s \emph{Ours} (uncond.) & \textbf{49.33} & 42.67 &8.0  \\
+
+        \emph{Ours} (uncond.) v.s LVG   & \textbf{54.02} & 40.23 & 5.74 \\
+        \emph{Ours} (cond.) v.s LVG   & \textbf{62.03} & 31.65 & 6.33 \\
+        \bottomrule
+        \vspace{-1.5em}
+    \end{tabular}
+    }
+\end{table}
+
+\vspace{-1em}
+
+\begin{table}[]
+    \centering
+    \caption{\emph{Left:} Evaluating temporal fine-tuning for diffusion upsamplers on RDS data; \emph{Right:} Video fine-tuning of the first stage decoder network leads to significantly improved consistency.~\vspace{-1.em}}
+    \label{tab:av_upsampler}
+    \hfill
+    \resizebox{.53\linewidth}{!}{%
+    \begin{tabular}{l c c}
+        \toprule
+        \textbf{Method} & FVD & FID \\
+        \midrule
+        \emph{Ours} Image Upsampler & 165.98 & \textbf{19.71}  \\
+        \emph{Ours} Video Upsampler & \textbf{45.39} & 19.85 \\
+        \bottomrule
+    \end{tabular}
+}
+    \hfill
+    \resizebox{.45\linewidth}{!}{%
+    \begin{tabular}{l c c }
+        \toprule
+         \textbf{Decoder} & \footnotesize\emph{image-only}  & \footnotesize\emph{finetuned} \\
+        \midrule
+        FVD & 390.88 & \textbf{32.94} \\
+        FID & \textbf{7.61} & 9.17 \\
+        \bottomrule
+    \end{tabular}
+    }
+    \vspace{-1.3em}
+\end{table}\begin{figure*}[t!]
+  \vspace{-0.8cm}
+    \includegraphics[width=\textwidth]{figures/dreambooth_fig3.pdf}
+    \vspace{-8.5mm}
+    \caption{\small \emph{Left:} DreamBooth Training Images. \emph{Top row:} Video generated by our Video LDM with DreamBooth Image LDM backbone. \emph{Bottom row:} Video generated without DreamBooth Image backbone. We see that the DreamBooth model preserves subject identity well. \vspace{-0.5em}}
+    \label{fig:dreambooth}
+  \vspace{-2.5mm}
+\end{figure*}\subsubsection{Ablation Studies}\label{sec:ablations}
+To show the efficacy of our design choices (\Cref{sec:video_ldm}), we compare a smaller version of our Video LDM with various baselines on the RDS dataset and present the results in~\Cref{tab:av_main} (right) (for evaluation details, see \Cref{app:quant_eval}). First, using the exact same architecture as for our Video LDM, we apply our temporal finetuning strategy to a pre-trained pixel-space image diffusion model, which is clearly outperformed by ours. Further, we train an End-to-End LDM, whose entire set of parameters $\{\theta, \phi\}$ is learned on RDS videos without image pre-training of $\theta$, leading to heavy degradations both in FID and FVD, when compared with our Video LDM. Another important architectural choice is the introduction of 3D convolutional temporal layers, since they allow us to feed the context frames $\boldsymbol{c}_{S}$ to the network spatially. This model achieves both lower FVD and FID scores than an attention-only temporal model, which uses the same set of spatial layers $\theta$ and has the same number of trainable parameters. Finally, we see that we can further lower FVD scores by applying \emph{context guidance} while sacrificing a bit of visual quality indicated by increased FID scores.
+
+Moreover, we provide an analysis on the effects of video fine-tuning the decoder of the compression model (\cf~\Cref{sec:dec_finetuna}) which encompasses the LDM framework~\cite{rombach2021highresolution}. We apply our fine-tuning strategy to decoders of these compression models on the RDS
+dataset and compare both the obtained FVD/FID scores of reconstructed videos/image frames with those of their non-video-finetuned counterparts. 
+Video fine-tuning leads to improvements by orders of magnitudes, as can be seen in Table~\ref{tab:av_upsampler}.
+
+\vspace{-2mm}
+\subsubsection{Driving Scenario Simulation}\label{sec:driving_simulation}
+\vspace{-1mm}
+A high-resolution video generator trained on in-the-wild driving scenes can potentially serve as a powerful simulation engine. We qualitatively explore this in~\Cref{fig:av_samples}. Given an initial frame, our video model can generate several different plausible future predictions. Furthermore, we also trained a separate, bounding box-conditioned image LDM on our data (only for image synthesis). A user can now manually create a scene composition of interest by specifying the bounding boxes of different cars, generate a corresponding image, and then use this image as initialization for our Video LDM, which can then predict different scenarios in a multimodal fashion (bottom in~\Cref{fig:av_samples}). 
+
+\subsection{Text-to-Video with Stable Diffusion}\label{sec:text-to-video}
+\vspace{-1mm}
+Instead of first training our own Image LDM backbone, our Video LDM approach can also leverage existing Image LDMs and turn them into video generators. To demonstrate this, we turn the publicly available text-to-image LDM \emph{Stable Diffusion} into a text-to-video generator. Specifically, using the WebVid-10M text-captioned video dataset, we train a temporally aligned version of Stable Diffusion for text-conditioned video synthesis. We briefly fine-tune Stable Diffusion's spatial layers on frames from WebVid, and then insert the temporal alignment layers and train them (at resolution $320\times512$). We also add text-conditioning in those alignment layers. Moreover, we further video fine-tune the publicly available latent \emph{Stable Diffusion upsampler}, which enables $4\times$ upscaling and allows us to generate videos at resolution $1280\times 2048$. We generate videos consisting of 113 frames, which we can render, for instance, into clips of 4.7 seconds length at 24 fps or into clips of 3.8 seconds length at 30 fps.
+Samples from the trained models are shown in~\Cref{fig:teaser,fig:text2image_samples}. While WebVid-10M consists of photo-quality real-life videos, we are able to generate highly expressive and artistic videos beyond the video training data. This demonstrates that the general image generation capabilities of the Image LDM backbone readily translate to video generation, even though the video dataset we trained on is much smaller and limited in diversity and style. The Video LDM effectively combines the styles and expressions from the image model with the movements and temporal consistency learnt from the WebVid videos.
+
+We evaluate zero-shot text-to-video generation on UCF-101~\cite{soomro2012ucf101} and MSR-VTT~\cite{xu2016msr-vtt} (Tabs.~\ref{tab:ucf} \&~\ref{tab:msrvtt}).
+Evaluation details in \Cref{app:quant_eval}.
+We significantly outperform all baselines except Make-A-Video~\cite{singer2022make}, which we still surpass in IS on UCF-101. However, Make-A-Video is concurrent work, focuses entirely on text-to-video and trains with more video data than we do. We use only WebVid-10M; Make-A-Video also uses HD-VILA-100M~\cite{xue2022hdvila}.
+
+\begin{table}[t]
+    \centering
+        \caption{\small UCF-101 text-to-video generation.\vspace{-1em}}
+    \label{tab:ucf}
+    
+    \resizebox{ 0.77\linewidth}{!}{%
+    \begin{tabular}{l  c c c}
+        \toprule
+        \textbf{Method} &  Zero-Shot & IS ($\uparrow$) & FVD ($\downarrow$)  \\
+        \midrule
+        CogVideo (Chinese)~\cite{hong2022cogvideo} & Yes  & 23.55 & 751.34 \\
+        CogVideo (English)~\cite{hong2022cogvideo} & Yes  & 25.27 & 701.59 \\
+        MagicVideo~\cite{zhou2022magicvideo} & Yes  & - & 699.00 \\
+        Make-A-Video~\cite{singer2022make} & Yes  & 33.00 & 367.23 \\
+        \midrule
+        Video LDM \emph{(Ours)} & Yes & 33.45 & 550.61 \\
+        \bottomrule
+        \vspace{-2.2em}
+    \end{tabular}
+    }
+\end{table}\begin{table}[t]
+    \centering
+        \caption{\small MSR-VTT text-to-video generation performance.\vspace{-1em}}
+    \label{tab:msrvtt}
+    
+    \resizebox{ 0.77\linewidth}{!}{%
+    \begin{tabular}{l  c c}
+        \toprule
+        \textbf{Method} &  Zero-Shot & CLIPSIM ($\uparrow$)  \\
+        \midrule
+        GODIVA~\cite{wu2021godiva} & No  & 0.2402 \\
+        N\"{U}WA~\cite{wu2022nuwa} & No & 0.2439 \\
+        CogVideo (Chinese)~\cite{hong2022cogvideo} & Yes  & 0.2614 \\
+        CogVideo (English)~\cite{hong2022cogvideo} & Yes  & 0.2631 \\
+        Make-A-Video~\cite{singer2022make} & Yes  & 0.3049\\
+        \midrule
+        Video LDM \emph{(Ours)} & Yes & 0.2929 \\
+        \bottomrule
+        \vspace{-2.9em}
+    \end{tabular}
+    }
+\end{table}
+In \Cref{app:convolutional_ldm}, we show how we can apply our model ``convolutional in time'' and ``convolutional in space'', enabling longer and spatially-extended generation without upsampler and prediction models. More video samples shown in \Cref{app:extended_text2video}. Experiment details in \Cref{app:exp_details_text_to_video}.
+
+\vspace{-3mm}
+\subsubsection{Personalized Text-to-Video with Dreambooth} \label{sec:dreambooth}
+\vspace{-1mm}
+Since we have separate spatial and temporal layers in our Video LDM, the question arises whether the temporal layers trained on one Image LDM backbone transfer to other model checkpoints (\eg fine-tuned). 
+We test this for personalized text-to-video generation: Using DreamBooth~\cite{ruiz2022dreambooth}, we fine-tune our Stable Diffusion spatial backbone on small sets of images of certain objects, tying their identity to a rare text token (``\emph{sks}''). We then insert the temporal layers from the previously video-tuned Stable Diffusion (without DreamBooth) into the new DreamBooth version of the original Stable Diffusion model and generate videos using the token tied to the training images for DreamBooth (see Fig.~\ref{fig:dreambooth} and examples in \Cref{app:more_dreambooth}). We find that we can generate personalized coherent videos that correctly capture the identity of the Dreambooth training images. This validates that our temporal layers generalize to other Image LDMs. To the best of our knowledge, we are the first to demonstrate personalized text-to-video generation.\looseness=-1
+
+\textit{Additional results and experiments in \Cref{app:additional_results}.}
+
+\vspace{-1.7mm}
+\section{Conclusions}\label{sec:conclusions}
+ \vspace{-1.7mm}
+We presented \textit{Video Latent Diffusion Models} for efficient high-resolution video generation. Our key design choice is to build on pre-trained image diffusion models and to turn them into video generators by temporally video fine-tuning them with temporal alignment layers. To maintain computational efficiency, we leverage LDMs, optionally combined with a super resolution DM, which we also temporally align. Our Video LDM can synthesize high-resolution and temporally coherent driving scene videos of many minutes. We also turn the publicly available \textit{Stable Diffusion} text-to-image LDM into an efficient text-to-video LDM and show that the learned temporal layers transfer to different model checkpoints. We leverage this for personalized text-to-video generation. We hope that our work can benefit simulators in the context of autonomous driving research and 
+help democratize high quality video content creation (see \Cref{app:impact} for broader impact and limitations).
+
+{\small
+\addcontentsline{toc}{section}{References}
+}
+
+\newpage
+
+\end{document}

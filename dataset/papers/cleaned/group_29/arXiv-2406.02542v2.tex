@@ -1,0 +1,716 @@
+\title{Loki: Low-rank Keys for Efficient Sparse Attention}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+Inference on large language models (LLMs) can be expensive in terms of the
+compute and memory costs involved, especially when long sequence lengths are
+used. In particular, the self-attention mechanism used in LLM inference
+contributes significantly to these costs, which has sparked an interest in
+approximating the self-attention computation to reduce such costs. In this
+work, we propose to approximate self-attention by focusing on the
+dimensionality of {\em key} vectors computed in the attention block. Our
+analysis reveals that key vectors lie in a significantly lower-dimensional
+space, consistently across several datasets and models. Exploiting this
+observation, we propose \emph{\method}, a novel sparse attention method that
+ranks and selects tokens in the KV-cache based on attention scores computed in
+low-dimensional space. Our evaluations show that \method is able to speed up
+the attention computation due to reduced data movement (load/store) and compute
+costs while maintaining the efficacy of the models better than other popular
+approximation methods.
+\end{abstract}
+
+\section{Introduction}
+\label{sec:intro}
+As large language models (LLMs) grow in size, deploying them for efficient
+inference presents substantial challenges, largely due to computation and
+memory access bottlenecks in the self-attention block~\citep{transformer},
+especially when handling long sequences. These challenges stem from the
+autoregressive nature of attention, which generates the output one token at a
+time. At each step, the entire preceding state, stored in the key-value (KV)
+cache, must be fetched from memory, which can sometimes exceed the size of the
+model parameters itself~\citep{woosuk2023vllm}. This frequent KV-cache access
+from GPU DRAM to registers becomes costly, as it scales quadratically with the
+output sequence length. In addition, matrix multiplications in the
+attention layers also have a quadratic scaling cost with sequence length,
+compounding the overall computational burden.
+
+Several strategies~\citep{zhang2023hH2O, ribar2023sparq, liu2023scissorhands}
+have been proposed to address this challenge by reducing the computational
+complexity and/or memory demands associated with the self-attention mechanism.
+One promising category of approaches focuses on approximating attention,
+employing techniques such as quantization or using a subset of the tokens in
+the KV-cache~\citep{ge2024model} (sparse attention).
+
+In contrast to other sparse attention approaches that either permanently prune
+tokens from the key-value cache~\citep{zhang2023hH2O} or impose a fixed
+sparsity pattern~\citep{xiao2023efficient}, our proposed method dynamically
+selects key tokens at each generation step based on approximate attention
+scores and avoids deletions.  This approach is inspired by a critical
+observation: across a range of LLMs and datasets, key tensors consistently
+occupy a significantly lower-dimensional space than the full attention head
+dimension. For instance, in Figure~\ref{fig:overview} (left), we show that
+across various LLMs~\citep{dubey2024llama3herdmodels, jiang2024mixtral}, 90\%
+of the variance explained by PCA is captured at an effective key vector rank of
+around 80, despite the key tensor dimension being much larger (128).
+
+Based on this observation, we introduce \method, a sparse attention method that
+leverages the low-dimensional structure of key vectors to reduce data movement
+and computation costs without significantly impacting model quality. First, we
+apply PCA to keys generated from a calibration dataset, storing all principal
+components but using only the top $d$ (25-50\%) to compute approximate
+attention scores during inference. This dimensionality reduction, informed by
+our previous observation that key vectors have low effective rank, allows us to
+efficiently identify the top-$k$ (12.5-25\%) most relevant tokens using the
+approximate scores. For these selected keys, we then revert to the full
+dimensionality to compute the final attention scores, ensuring both efficiency
+and accuracy. Figure~\ref{fig:overview} (right) illustrates our approach.
+
+Our theoretical complexity analysis demonstrates that \method can provide
+significant speedups in the attention step. However, actually realizing these
+gains requires an efficient implementation of our method to minimize data
+movement in the additional operations introduced on top of the original self
+attention algorithm. Thus, we implement optimized sparse matrix multiplication kernels
+for \method~in Triton, leading to a speedup of up to 45\% over the 
+standard HuggingFace Transformer's~\citep{wolf-etal-2020-transformers} attention 
+implementation (\emph{vanilla} attention) for Llama2-13B.
+For this setting, the average degradation in model
+accuracy (measured across 6 different benchmarks and 8 different models) is
+only 6.8\%.
+
+Our contributions can be summarized as follows:
+\vspace{-0.1in}
+\begin{itemize}
+    \item Detailed analysis showing the intrinsic low-dimensionality of keys in
+self-attention, its variation across layers for different models, and
+consistency across different datasets.
+    \item \method: a sparse attention method that exploits the aforementioned
+low dimensionality of keys to make the attention computation faster without sacrificing
+model quality.
+    \item Optimized kernels for efficient implementation of \method~in PyTorch.
+    \item Evaluation of
+\method\footnote{\url{https://github.com/hpcgroup/loki}}~on multiple LLMs and
+downstream tasks, showing that it can achieve significant speedups with minimal
+degradation in model quality.
+\end{itemize} 
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[height=1.75in]{figs/dimensionality/global_postrotary_variances.pdf}
+  \hfill
+  \includegraphics[height=1.75in]{figs/PCA-TopK-Method-Final.pdf}
+  \caption{Rank at which 90\% of the variance is explained, averaged across all
+layers and heads for different models. Full rank is represented by the black
+dashed line (left). Overview of \method (right).}
+  \label{fig:overview}
+\end{figure}
+
+\section{Background and Related Work}
+\label{sec:bg}
+The attention mechanism~\citep{transformer} is at the core of the transformer
+architecture. Consider a single attention query head with head dimension
+$D$, processing an input token sequence of length $S$. During auto-regressive
+generation, the output of the attention head is calculated as:
+\begin{equation}
+    \label{eq:attention}
+    \boldsymbol{y} = \mathrm{softmax}\Bigl(\dfrac{\q\K^\top}{\sqrt{D}}\Bigr) \cdot \boldsymbol{V}
+\end{equation}
+where $\q \in \mathbb{R}^{1\times D}$ is the query, and $\K \in \mathbb{R}^{S
+\times D}$ and $\V \in \mathbb{R}^{S \times D}$ are the key and value caches
+respectively. Additionally, newer transformer models add Rotary Position
+Embeddings (RoPE)~\citep{su2023roformer} to the keys and query, before
+computing the attention scores.  Since every query attends to all past keys,
+the mechanism has a quadratic complexity $\bigO(S^2)$ in number of input $+$
+generated tokens.
+
+\subsection{Related Work}
+
+Numerous studies have explored the low-rank structures in transformers for
+various purposes. Linformer~\citep{wang2020linformer} demonstrated that the
+attention score matrix is low-rank and proposed alternative low-rank attention
+formulations during training for linear computational complexity.
+LoRA~\citep{lora} showed that parameter updates to a transformer model during
+fine-tuning reside in a low-dimensional subspace. To the best of our knowledge,
+our work is the first to study the intrinsic low dimensionality of the
+attention keys themselves and demonstrate the generalizability of this
+low-dimensional structure across different models (for natural language data).
+
+Sparse-transformers~\citep{child2019generating} was one of the first works to
+introduce a sparse-attention method employing strided sparsity patterns in the
+attention mechanism. Reformer~\citep{kitaev2020reformer} used locally-sensitive
+hashing to compute attention scores in a sparse manner.
+Performer~\citep{choromanski2022rethinking} used positive orthogonal random
+features to approximate the attention mechanism. Unlike these methods, which
+require training or fine-tuning, our approach operates entirely post-training
+without any fine-tuning.
+
+Another category of sparse attention methods employ token eviction policies to
+permanently delete tokens from the KV-cache based on some heuristic.
+StreamingLLM~\citep{xiao2023efficient} uses initial tokens and a rolling
+KV-cache for processing infinite-length sequences. Zhang et
+al.~\citep{zhang2023hH2O} retain only "Heavy Hitters" tokens in the KV-cache
+based on accumulated attention scores. Scissorhands~\citep{liu2023scissorhands}
+prioritizes important tokens based on the "Persistence of Importance
+Hypothesis". Ge et al.~\citep{ge2023model} propose an adaptive eviction policy
+for each transformer layer. These methods are effective in reducing the memory
+and compute footprint of the attention but suffer from permanent loss of
+information leading to a non-trivial degradation in model quality. Our method
+does not involve any permanent loss of information with the trade-off of not
+reducing the memory footprint. Quantization-based approximate
+approaches~\citep{jacob2017quantization, nagel2021white} are complementary to
+our work and can be applied in tandem.
+
+SparQ Attention~\citep{ribar2023sparq} is a recent work that inspires our
+approach. They use high-magnitude query dimensions and corresponding key
+dimensions for approximate attention scoring, followed by computing the full
+attention scores for the top-$k$ keys. However, their method requires costly
+non-contiguous column indexing of the key vectors. Further, they store two
+copies of the past keys for efficiency, increasing memory use by 50\%. In
+contrast, \method~avoids the extra memory and leverages the natural ordering of
+principal components, allowing for a more efficient slicing operation.
+
+A concurrent work, InfiniGen~\citep{lee2024infinigen}, accelerates attention by
+pre-fetching top-$k$ keys from CPU to GPU memory, using SVD-based low-rank
+approximation of the attention scores. While their low-rank approximation is
+similar to ~\method, our work provides deeper analysis of the intrinsic
+low-rank structure of attention keys and focuses on speeding up attention
+computation without CPU offloading. Importantly, their results affirm the
+benefits of the low-dimensional nature of attention keys applied in other
+contexts.
+
+\section{Dimensionality Analysis of Attention Keys}
+\label{sec:dimanalysis}
+As noted in Section~\ref{sec:intro}, \method, our proposed method for
+sparse self-attention, is based on the observation that key tensors
+consistently reside in a lower-dimensional space than the full attention head
+dimension suggests. Here, we present empirical evidence supporting this claim
+by performing PCA on the keys generated in several language models and
+datasets. 
+
+\subsection{Models and Datasets Used}
+
+To investigate the dimensionality of attention keys, we run 11
+transformer-based models: Llama-2 7B/13B/70B~\citep{touvron2023llama}, Llama-3
+8B/70B~\citep{dubey2024llama3herdmodels},
+TinyLlama-1.1B~\citep{zhang2024tinyllama},
+Pythia-6.9B~\citep{biderman2023pythia}, Mistral-7B~\citep{jiang2023mistral},
+Mixtral-8x7B/8x22B~\citep{jiang2024mixtral}, and
+Phi3-Mini-4K~\citep{microsoft2024phi3} on three popular English language
+datasets: WikiText-2~\citep{wikitext-103} (Validation Split),
+C4~\citep{raffel2023exploring} (Custom Split), and
+BookCorpus~\citep{zhu2015aligning} (Custom Split).  Custom splits are used for
+datasets where the validation split is not available.  We run perplexity
+evaluation on these datasets and save the generated attention keys, before and
+after the application of rotary embeddings~\citep{su2023roformer}, referred to
+as \emph{pre-rotary} and \emph{post-rotary} keys, respectively throughout the
+paper. We then perform PCA on all the keys generated for each layer and head
+individually. 
+
+The metric we use in our analysis is the rank at which $v$\% of the variance is
+explained by the principal components. We calculate this metric for each layer
+and head of the models as follows:
+\begin{equation}
+    Rank_{l,h}@v = \min \left\{ d \in \mathbb{Z}^+ : \sum_{j=1}^{d} \lambda_{l,h}^j \geq v/100 \right\}
+\end{equation}
+where, $\lambda_{l,h}^j$ is the $j^{th}$ normalized eigenvalue of the
+covariance matrix of the keys for layer, $l$ and head, $h$. We
+average this metric ranks across all heads of layer, $l$ and refer to
+it as $Rank_{l}@v$.
+
+\subsection{Findings and Discussion}
+
+Figure \ref{fig:overview} (left) shows the average $Rank_{l}@90$ across all
+layers for models with full key dimensionality of 128. We can see that the
+average rank is significantly lower than the full dimensionality of the keys
+for all models. Diving deeper, we present a layer-wise analysis for a few
+models: Llama2-7B, Llama3-70B, Mixtral-8x7B, and Phi3-Mini-4K in
+Figure~\ref{fig:rank90}. The results for the other models are similar and can
+be found in Appendix \ref{appendix_dimanalysis}. 
+
+\begin{figure}[h]
+  \centering
+    \includegraphics[width=0.98\textwidth]{figs/dimensionality/Main_avg_ranks_at_90.pdf}
+
+    \caption{Rank at which 90\% of the variance is explained for pre-rotary and
+    post-rotary keys produced by each layer averaged across all heads
+    ($Rank_{l}@90$) for different models. We observe that all models exhibit
+    significantly low rank (full dimensionality is 128 or 96 represented by the black dashed line) consistently across all
+    datasets.} \label{fig:rank90}
+\end{figure}
+
+We observe that the dimensionality of the keys (both pre-rotary and
+post-rotary) is significantly lower than the full dimensionality of the keys
+across all calibration datasets. Furthermore, the $Rank_{l}@90$ for a
+particular layer is consistent across datasets, for all combinations of models
+and datasets. This indicates that the lower-dimensional structure of the keys
+is consistent when calculated using different calibration datasets. Another
+trend we observe is that the initial layers of most models have a very low
+rank, as compared to the later layers, and this trend is particularly prominent
+for the pre-rotary keys. Lastly, we also observe that for most models, the
+average of $Rank_{l}@90$ across all layers is lower for pre-rotary keys as
+compared to post-rotary keys, indicating that the rotary embeddings increase
+the dimensionality of the keys.  Further analysis on the variation of the rank
+across different heads within a layer and across different layers within a
+model can be found in Appendix \ref{appendix_dimanalysis}.
+
+These results indicate the existence of the following properties: (1) The keys
+produced by the attention layers of transformer models lie in a significantly
+lower-dimensional space. (2) The lower-dimensional structure of the keys is
+consistent across different calibration datasets. (3) Rotary embeddings increase
+the dimensionality of the keys for most models. We now use the first two
+properties to propose \method, an efficient sparse-attention method. 
+
+\section{\method: Low-Dimensional Key Representations}
+\label{sec:loki}
+We now describe our proposed algorithm for sparse attention -- \method.
+\method leverages low dimensional projections of the keys in the KV-cache to
+efficiently and accurately select the top-$k$ (12.5-25\%) most relevant tokens
+for self attention.  Before discussing our approach, let us first look at some
+theoretical properties of attention in the PCA-transformed space of the key
+tensors. 
+
+\subsection{Properties of Attention in the PCA-transformed Space}
+\label{subsec:properties}
+
+We begin by proving two lemmas that provide the rationale for our approach to
+compute attention in the PCA-transformed space. 
+
+\begin{lemma}
+  Let $D$ be the dimension of an attention head and $\bP \in \mathbb{R}^{D \times D}$ be the PCA projection matrix
+  of key tensors calibrated offline on a dataset. Assuming we are generating the $S^{\mathit{th}}$ token in the sequence,
+   let $\q_S \in \mathbb{R}^{1 \times D}$ be the query vector for the $S^{th}$ token,
+  $\K_{:S} \in \mathbb{R}^{S \times D}$ be the key vectors, including the past
+  $(S-1)$ keys and the current key. Then, the attention scores computed using
+  the PCA-transformed query and keys are equivalent to the attention
+  scores computed using the original query and keys.
+  \label{lemma:projection}
+\end{lemma}
+\vspace{-0.2in}
+\begin{proof}
+  Let $\qhat_S = \q_S\bP$ and $\Khat_{:S} = \K_{:S}\bP$ be the PCA
+  transformed query and key vectors. 
+  Focusing on the dot product term in the attention computation (Equation \ref{eq:attention}), we have:
+  \begin{align*}
+    \q_S\K_{:S}^{T} &= \q_S(\Khat_{:S}\bP^{T})^{T} \text{ [inverting the PCA transform]}\\
+    &= \q_S((\bP^{T})^{T}\Khat_{:S}^{T}) = (\q_S\bP)\Khat_{:S}^{T} = \qhat_{S}\Khat_{:S}^{T}
+  \end{align*}
+It is important to note here that Lemma \ref{lemma:projection} holds for 
+any orthogonal $\bP$.
+  \end{proof}
+
+\begin{lemma}
+  Let $\Khat_{:S,:d} \in \mathbb{R}^{S\times d}$ ($d < D$) be the reduced dimension key vectors 
+  obtained by projecting the key vectors onto the first $d$ principal components of $\bP$ . 
+  Then, the attention scores computed using $\Khat_{:S,:d}$ are a good approximation of the
+  the actual attention scores.
+  \label{lemma:reconstruction}
+\end{lemma}
+\vspace{-0.2in}
+\begin{proof}
+  Let $\textbf{R}_{:d} \in \mathbb{R}^{d \times D}$ be an orthogonal transformation 
+  that transforms the keys into the reduced dimension space as $\bL_{:S,:d} = \K_{:S}\textbf{R}_{:d}$. 
+  Our objective is to minimize the following expression:
+  \begin{align}
+    \min_{\bR_{:d}}||\q_S\K_{:S}^{T} - \q_{S}(\bL_{:S,:d}\bR_{:d}^{T})^{T}||_2^2
+  \end{align}
+  Using Cauchy-Schwarz inequality, we have:
+  \begin{align}
+    ||\q_S\K_{:S}^{T} - \q_S(\bL_{:S,:d}\bR_{:d}^{T})^{T}||_2^2 &\leq ||\q_S||_2^2||\K_{:S}^{T} - (\bL_{:S,:d}\bR_{:d}^{T})^{T}||_2^2
+  \end{align}
+  We change our objective to minimize the upper bound in the RHS instead of the original objective. 
+  We know that PCA minimizes the reconstruction error (2nd term in the RHS) among all 
+  the orthogonal transformations. Thus, it follows that the optimal value of $\bR^{*}_{:d} = \bP_{:d}$, and 
+  $\bL^{*}_{:S,:d}=\Khat_{:S,:d}$
+\end{proof}
+
+Since we minimize an upper bound when proving Lemma \ref{lemma:reconstruction},
+it is possible that some other transformation might give a better approximation
+to the dot product. Thus, in our experiments, we use PCA transforms computed on
+both the pre-rotary and post-rotary keys as candidate transformations.
+
+Based on these lemmas and the inherent low-dimensional nature of key tensors in
+attention, we now introduce the workings of the \method~algorithm. 
+
+\subsection{PCA-based Top-K Algorithm}
+
+Loki implements a PCA-based Top-K Attention approach. Previous works have shown
+that attention scores for a query are highly concentrated on a small subset of
+keys~\citep{xiao2024efficient, sun2024massive}.  This observation has motivated
+several methods that compute attention using only the top-$k$ most relevant
+keys. However, these previous works either compute the exact attention scores
+and then select the top-$k$ keys~\citep{topkattention} or compute non-exact
+scores but have significantly higher memory
+requirements~\citep{ribar2023sparq}.  \method~alleviates these issues by
+computing approximate attention scores (for ranking the keys) in the reduced
+lower-dimensional space, without any significant increase in memory
+requirements. Algorithm \ref{alg:topkpca} shows our \method~method. Line 5 of
+the algorithm computes the approximate attention scores using $d$ principal
+dimensions of the query and key vectors. Lines 6-7 select the top-$k$ keys
+based on the approximate attention scores. Line 8 computes the exact attention
+scores using the selected top-$k$ keys, directly in the transformed space
+(Lemma \ref{lemma:projection}).
+
+\begin{algorithm}[h]
+  \caption{\method: PCA-based Top-K Attention}
+  \label{alg:topkpca}
+  \begin{algorithmic}[1]
+  \Require At the $S^{th}$ step - Input: $\x_S \in
+  \mathbb{R}^{1 \times D}$, KV-cache: $\Khat_{:S-1}, \V_{:S-1} \in \mathbb{R}^{(S - 1)
+  \times D}$, Projection Matrix: $\bP \in \mathbb{R}^{D \times D}$, Configuration parameters (reduced dimensionality, top-$k$): $d$, $k$ 
+  \Function {\method-Attention}{$\x_S, \Khat_{:S-1}, \V_{:S-1}, \bP, d, k$} 
+  \State $\q_S, \bk_S, \bv_S \gets computeQKV(\x_S)$ 
+  \State $\qhat_S \gets \q_S\bP$, $\bkhat_S \gets \bk_S\bP$ 
+  \State $\Khat_{:S} \gets concat(\Khat_{:S-1}, \bkhat_S)$, $\V_{:S} \gets concat(\V_{:S-1}, \bv_S)$ 
+  \State $\ba_{approx} \gets \qhat_{S,:d}(\Khat_{:S,:d})^{T}$ 
+  \State $indices \gets topk(\ba_{approx}, k)$ 
+  \State $\Khat_{:S}^{\prime} \gets \Khat_{:S}[indices]$, $\V_{:S}^{\prime} \gets \V_{:S}[indices]$
+  \State $\ba_{exact} \gets softmax(\frac{\qhat_S\Khat_{:S}^{T}}{\sqrt{D}})$ 
+  \State \Return $\ba_{exact}\V_{:S}^{\prime}$
+  \EndFunction
+  \end{algorithmic}
+\end{algorithm}
+
+\vspace{0.08in}
+\noindent \textbf{Compute and Memory Analysis:} For vanilla attention, the
+complexity of computing $\q_S\K_{:S}^{T}$ is $\bigO(DS)$ and the complexity of
+multiplying the values with the attention scores is $\bigO(DS)$. For \method,
+the complexity of calculating the approximate attention scores (Line 5) is
+$\bigO(dS)$. The complexity of selecting the top-$k$ keys (Lines 6-7) is
+approximately $\bigO(Slog(S) + k)$ (sorting followed by selection). The
+complexity of calculating the exact attention scores and multiplying with the
+values (Line 8-9) is $\bigO(2Dk)$. Additionally, the complexity of projections
+into the PCA space (Line 3) is $\bigO(2D^2)$. Assuming the complexity of
+selecting the top-$k$ keys is small compared to the other operations, the
+overall complexity of the algorithm is $\bigO(dS + 2Dk + 2D^2)$. Then, we have:
+\begin{align} speedup = \frac{2DS}{dS + 2Dk + 2D^2}  = \frac{1}{d/2D + k/S +
+D/S} \approx \frac{1}{d_f/2 + k_f} \hspace{1em}(\text{given }D << S)
+\end{align} where, $d_{f} = d/D$ and $k_{f} = k/S$. The memory requirement of
+the KV-cache is the same as the original attention, with a small overhead of
+storing the PCA transformation matrix.
+
+\subsection{Implementation in Triton} \label{sec:kernel}
+
+Performing \method~efficiently involves complex indexing operations within the
+KV-cache (lines 5 and 7 of Algorithm~\ref{alg:topkpca}).  Standard PyTorch
+operations create temporary, dense copies of the KV-cache data in memory,
+leading to slowdowns due to expensive memory access. To alleviate this issue,
+we develop optimized kernels in Triton~\citep{triton:openai} for the three
+matrix multiplication operations in \method.  Our kernels can directly access
+relevant subsets of the KV-cache (both feature and sequence dimensions) and
+perform computations within GPU registers. This eliminates the need for
+creating dense copies, significantly improving performance. Our approach builds
+on SparQ~\citep{ribar2023sparq}, which introduced similar kernels for top-$k$
+attention calculations. However, we identified and addressed inefficiencies in
+the SparQ kernels, which resulted in speedups of nearly $2-3\times$ in certain
+scenarios.  (see Appendix~\ref{append:comp_pcatopk}).
+
+\section{Experimental Setup}
+\label{sec:setup}
+We evaluate \method on the basis of 
+perplexity using the WikiText-2~\citep{wikitext-103} dataset (test split), and on the basis of downstream task performance for  
+short contexts using the LM-harness
+benchmark~\citep{eval-harness} and long contexts
+using LongBench~\citep{bai2023longbench}. For the short-context evaluation, we
+choose the same tasks and associated metrics as the HuggingFace OpenLLM
+leaderboard~\citep{open-llm-leaderboard}. For the LongBench tasks, we evaluate
+on all the English language tasks. 
+
+We compare our method against three methods -- full attention without any
+approximations, the exact TopK approach which computes the exact attention
+scores and then uses the top-$k$ tokens to compute the final output, and
+H$_2$O~\citep{zhang2023hH2O}, a popular token-eviction method. For these
+comparisons, we show the results with a budget size of $k_f$ = 0.25 and 0.125.
+For our method, we additionally use $d_f$ = 0.25 and 0.125. This configuration
+of our represents a 2.6x theoretical speedup. Table \ref{ref:budget} provides
+an overview of the methods compared and the associated budget terms. H$_2$O's
+budget was split equally between the heavy hitter and recent tokens, as per the
+author's recommendations. For H$_2$O, we were unable to run the GSM8K task as
+the the author's ML benchmarking code was too memory intensive to run for that
+task. For the aforementioned experiments, we generate PCA transforms using the
+WikiText-103 dataset. For the LongBench tasks, we compare our method with the
+full attention baseline as we were unable to run H$_2$O due to memory
+constraints. 
+
+For the generalizability study, we compare the results of our method with PCA
+transforms from different calibration datasets:
+WikiText-103~\citep{wikitext-103}, C4~\citep{raffel2023exploring}, and
+BookCorpus~\citep{zhu2015aligning}. Additionally, we also benchmark our triton
+based implementation of \method~by running an attention microbenchmark on a
+Llama2-13B-like setup (same hidden size and number of heads) for various prompt
+and generation lengths, and demonstrate speedups over vanilla attention.
+
+\begin{table}[t]
+  \small
+  \centering
+  \caption{Explanation of key-budget and dimensionality (Dim.) for different approaches, along with the expected speedup and memory savings.}
+  \begin{adjustbox}{width=\linewidth}
+  \begin{tabular}{lccp{7cm}cc}
+      \toprule
+      Method & Budget & Dim. & Description & Speedup & Memory Savings \\
+      \midrule
+      Exact Top-K & $k_f$ & Full & $k_f$ fraction of keys selected using exact attention scores & No & No \\
+      H$_2$O & $k_f$ & Full & $k_f$ fraction of keys \& values selected using H$_2$O policy& $\frac{1}{k_f}$ & $\frac{1}{k_f}$ \\
+      \method~& $k_f$ & $d_f$ & $k_f$ fraction of keys \&values selected using attention scores computed 
+      with $d_f$ fraction of full dimensionality & $\frac{1}{(d_f/2) + k_f}$ & No \\
+      \bottomrule
+  \end{tabular}
+  \end{adjustbox}
+  \label{ref:budget}
+\end{table}
+
+All experiments are run on NVIDIA A100 GPUs with 40 and 80 GB of memory on the
+Perlmutter~\citep{perlmutter} supercomputer. For larger models, we use
+AxoNN~\citep{singh:ipdps2022,singh:arxiv2024} to shard the model across
+multiple GPUs.
+
+\section{Results}
+\label{sec:results}
+We now present the comparisons of \method with full attention and other sparse
+attention methods, including a comparison of the computation times.
+
+\subsection{Comparison with Full Attention}
+
+Let us begin our discussion with Figure \ref{fig:all_model_eval}, showing the
+perplexity (left) and short-context downstream task evaluation (right) results
+for \method~on different models.
+We focus on the Llama2-7B model, comparing pre-rotary (light green/purple)
+and post-rotary (dark green/purple) PCA transforms for different $k_f$ and
+$d_f$ values. For Llama2-7B, we see that the performance of both candidate
+transforms is similar. This trend is consistent across all the models except
+for Llama3-8B/70B and Mistral-7B, where the post-rotary PCA transform performs
+significantly worse than the pre-rotary one. For Llama3-8B, perplexity jumps
+from about 5 for the full attention to over 10, a significant decline not seen
+with the pre-rotary transform. Mistral-7B shows a similar pattern. This is a
+surprising observation since attention scores are calculated from post-rotary
+keys in the original attention mechanism. A possible explanation is that 
+post-rotary PCA captures token distributions tied to specific positions in 
+the calibration dataset, while pre-rotary PCA may generalize better by using 
+less positional information. Nevertheless, at least one of the PCA
+transformations performs well for every model. For subsequent results, we only
+show the better-performing transformation for each model. 
+
+\begin{figure}[h]
+  \centering
+    \includegraphics[width=\textwidth]{figs/results/perplexity_tasks_pca_topk.pdf}
+    \caption{Evaluation of \method~on perplexity (left plot) and short-context tasks (right plot) for different models. 
+    Task accuracy is an average across all short-context tasks mentioned in \ref{sec:setup}.}
+    \label{fig:all_model_eval}
+\end{figure}
+
+Figure \ref{fig:long_context_eval} shows the performance of \method~on the
+LongBench tasks for the Llama2-7B-Chat model. We see that for all tasks, either
+one of the two candidate transforms performs similarly to full attention. For
+Summarization, Few Shot Learning, Synthetic, and Code Completion task
+categories, the best performing \method~configuration is at par or better than
+the full attention model. For the Single-Doc QA and Multi-Doc QA task
+categories, ~\method~performs slightly worse than the full attention model,
+with the biggest drop in performance observed for HotpotQA of around 3\%.
+Comparing different $(k_f, d_f)$ settings, we see that using $k_f$ = 0.25 and
+$d_f$ = 0.25 (green), is better than using $k_f$ = 0.125 and $d_f$ = 0.5
+(purple) for all models and tasks (short-context and long-context). These two
+settings balance speed and performance well, with the first being superior for
+accuracy.
+
+\begin{figure}[h]
+  \centering
+    \includegraphics[width=\linewidth]{figs/rebuttal/longbench/English_ALL.pdf}
+    \caption{Evaluation of \method~on LongBench tasks for the Llama2-7B-Chat model.}
+    \label{fig:long_context_eval}
+\end{figure}
+
+\subsection{Comparison with Other Sparse Attention Methods}
+\label{subsec:comparison_other_sparse}
+
+Next, we compare the performance of \method~with other methods, using $k_f$
+= 0.25 for all methods and $d_f$ = 0.25 for ours. Table \ref{tab:perplexity}
+shows the perplexity results for Llama2-7B/13B, Llama3-8B, and Mistral-7B.
+\method's perplexity drop is within 0.1 of full attention across all models, a
+threshold considered acceptable for attention mechanism
+approximations~\citep{Yao2023ZeroQuantV2EP}. In contrast, H$_2$O's perplexity
+drop nears 0.2 for all models.  Figure \ref{fig:tasks_baseline_eval} confirms
+this trend on short-context evaluation. \method~performs similar to full
+attention for all models, except Llama3-8B, where the performance is notably
+worse, but still better than H$_2$O.  Importantly, on the challenging MMLU
+task, \method~degrades less than H$_2$O.
+
+\begin{table}[h]
+  \centering
+  \caption{Perplexity evaluation of \method and other approaches for different models (lower is better).}
+  \begin{adjustbox}{width=\textwidth, center}
+  \begin{tabular}{@{}lccccccc@{}}
+      \toprule
+      Method & $k_f$ & $d_f$ & Speedup & Llama2-7B & Llama2-13B & Llama3-8B & Mistral-7B \\
+      \toprule
+      Full Attention & - & - & No & 5.1101 & 4.5680 & 5.5696 & 4.9140 \\
+      Exact-TopK & 0.25 & - & No & 5.1809 & 4.5926 & 5.5716 & 4.9171 \\
+      \midrule
+      H$_2$O & 0.25 & - & Yes & 5.2810 & 4.7009 & 5.7056 & 5.0805 \\
+      \method~& 0.25 & 0.25 & Yes & \textbf{5.2017} & \textbf{4.6102} & \textbf{5.6648} & \textbf{4.9233} \\
+      \bottomrule
+  \end{tabular}
+  \end{adjustbox}
+  \label{tab:perplexity}
+\end{table}
+
+\begin{figure}[h]
+  \centering
+    \includegraphics[width=\textwidth]{figs/results/baselines_pca_topk.pdf}
+    \caption{Downstream task performance for \method~and other approaches for different models (higher is better).
+     GSM8K is excluded, as we were unable to run H$_2$O for this task.}
+    \label{fig:tasks_baseline_eval}
+\end{figure}
+
+It is important to note here that \method~is designed to be compatible with other
+sparse attention methods. For instance, token-eviction methods like H$_2$O delete tokens to
+save KV-cache memory, whereas \method~reduces memory bandwidth by selecting the
+top-$k$ tokens without deletion, making them orthogonal. A combined approach
+could involve using H$_2$O to delete tokens, then applying \method~to select
+top-$k$ tokens from the remaining cache. Similarly, \method~is theoretically
+orthogonal to quantization methods.
+
+Comparing \method~with Exact-TopK, we find similar performance for
+Llama2-7B/13B and Mistral-7B. Exact-TopK represents the upper performance bound
+for \method~if it could perfectly select the top-$k$ tokens. To understand why
+\method~works well, we examined the top-$k$ agreement between ~\method's
+reduced dimensional attention scores and exact attention scores. Figure
+\ref{fig:topkagreement} shows the Jaccard similarity between the top-$k$ tokens
+selected by both methods across all layers and heads for Llama2-7B. For the
+settings: ($k_f = 0.25$, $d_f = 0.25$) and ($k_f = 0.125$, $d_f = 0.5$),
+evaluated in Figure \ref{fig:all_model_eval}, the Jaccard similarity is around
+0.9, validating that the \method~is able to select the top-$k$ tokens with high
+accuracy.
+
+\begin{figure}[h]
+  \centering
+  \includegraphics[height=1.35in]{figs/topkagreement/jaccard_per_r.pdf}
+  \hspace{0.1in}
+  \includegraphics[height=1.35in]{figs/results/best_dataset_generalise.pdf}
+  \includegraphics[height=1.35in]{figs/results/breakdown.pdf}
+  \caption{Top-$k$ agreement between \method~and Exact-TopK methods for Llama2-7B (left plot). 
+  Performance of \method~using transformations derived from different calibration datasets (middle plots).
+  Benchmarking vanilla attention and \method~for Llama2-13B using huggingface transformers with 
+  cache append times (right plot, prompt length = 3072, generation length = 512).
+  }
+  \label{fig:topkagreement}
+\end{figure}
+
+\subsection{Generalizability}
+
+We now turn our attention to the generalizability of the PCA transformations
+used in our method. Figure \ref{fig:topkagreement} (middle) shows the
+performance of \method~using PCA transformations derived from different
+calibration datasets ($k_f = 0.25, d_f = 0.25$).  We see that the performance
+of \method~is consistent across different calibration datasets, indicating that
+the PCA transformations used in our method are generalizable. This is an
+important observation as it shows that the PCA keys can be generated using a
+variety of calibration datasets and still achieve good performance. 
+
+\subsection{Computational Efficiency}
+
+We now turn our attention to the computational efficiency of \method. Analyzing
+Llama2-13B with Hugging Face Transformers exposed an interesting bottleneck
+(Figure~\ref{fig:topkagreement}, rightmost). Regardless of the attention type
+(vanilla or \method), more than 80\% of the time is consumed within the Hugging
+Face framework for appending key-value pairs of the latest token to the
+KV-cache. This shared bottleneck minimizes the overall performance improvement
+of our optimizations. We hypothesize that using a more advanced inference
+system like vLLM~\cite{woosuk2023vllm} could significantly reduce this append
+time, but leave that exploration for future work. To isolate the impact of our
+optimizations, the plots in Figure~\ref{fig:compute} focus solely on the
+attention computation time, excluding the KV-cache append time.
+
+\begin{figure}[h]
+  \includegraphics[height=1.75in]{figs/results/all_gen_breakdown_without_cache_update_2048_3072_vanilla.pdf}
+  \includegraphics[height=1.75in]{figs/rebuttal/longbench/longbench_configuration.pdf}
+  \caption{Time per layer for vanilla attention (V) and \method (\mbox{L-A:
+${k_f=0.25,d_f=0.25}$}; \mbox{L-B: ${k_f=0.125,d_f=0.25}$}) for Llama2-13B
+using huggingface transformers (left two plots). LongBench average accuracy for
+different \method configurations, alongside micro-benchmark attention times (right plot, all
+layers, prompt length = 3500 \& generation length = 512). We choose the prompt
+length to match LongBench’s configuration for this model and generation length
+to match the maximum in any LongBench task. For both figures, we use a batch
+size of 16 and report the average time over 10 trials (std.~dev.~in measured times
+was less than 0.05 percent of the mean).}
+  \label{fig:compute}
+\end{figure}
+
+In the left plot of Figure~\ref{fig:compute}, we see that \method~speeds up the
+total attention compute time (excluding KV-cache appends) compared to vanilla
+attention across various prompt and generation lengths. For a prompt length of
+3072 and generation length of 512, \method~achieves nearly a 45\% speedup,
+despite the fact that it incurs an extra matrix multiplication operation.  The
+breakdowns also show that the top-$k$ operation is nearly as expensive as the
+smaller matrix multiplications, which is a significant bottleneck. Replacing
+PyTorch’s top-$k$ with a custom kernel could improve this. For the shorter
+prompt length of 2048 we observe a speedup of around 40\% (generation length =
+512), slightly lower than the speedup at 3072. This trend is expected as larger
+prompts result in a bigger KV-cache, amplifying the impact of our
+optimizations.
+
+Figure~\ref{fig:compute} (Right) shows the accuracy vs. attention time
+trade-off across various $k_f, d_f$ settings of \method, with accuracy measured
+on LongBench and attention times from our microbenchmark. The previously
+evaluated settings, $k_f = 0.25, d_f = 0.25$ and $k_f = 0.125, d_f = 0.5$,
+provide a good balance between performance and accuracy, with $k_f = 0.25, d_f
+= 0.25$ favoring accuracy slightly and $k_f = 0.125, d_f = 0.5$ favoring
+performance.
+
+\section{Conclusion}
+\label{sec:conclusion}
+In conclusion, we introduced \method, an algorithm for efficient sparse
+attention that does not compromise the model quality while reducing the
+computational complexity of self attention. We made a crucial observation that
+key vectors in attention lie in a low-dimensional space, across different
+models and datasets.
+Leveraging this insight, \method uses attention scores computed in a
+lower-dimensional space to rank and select the top-$k$ most relevant tokens
+from the KV-cache. It then uses the full dimensionality only for the selected
+tokens to compute the final attention. Our theoretical analysis shows that
+\method can provide significant speedups in the attention step. To implement
+this efficiently, we develop optimized kernels for the various sparse matrix
+multiplications in our approach. Our empirical evaluation shows that \method
+performs better than popular approximation methods on a variety of models and
+tasks, with respect to preserving model quality. Finally, we show that \method
+can provide speedups of up to 45\% over the vanilla attention empirically,
+making it a promising approach to address the computational challenges in
+transformer inference.
+
+\vspace{0.08in}
+\noindent \textbf{Limitations and Future Work:} 
+\method~does not focus on reducing memory usage of the KV-cache currently. As
+mentioned previously in \ref{subsec:comparison_other_sparse}, it can potentially
+be combined with other sparse attention method for improved
+memory-performance-accuracy trade-offs. Another direction involves storing the
+KV-cache in CPU memory and transferring only the top-$k$ keys and values to the
+GPU~\citep{lee2024infinigen}.
+
+While \method~outperforms vanilla attention in our benchmarks, practical
+deployment would require integration with efficient attention kernels like
+FlashAttention~\citep{dao2022flashattention}. As seen in our compute
+benchmarking, the top-$k$ selection operation could introduce a bottleneck
+towards achieving this.  Investigating this bottleneck and integrating
+\method~with optimized attention kernels is left for future work.
+
+Our finding of the keys’ low intrinsic dimensionality suggests promising
+research directions. The variation of this dimensionality across heads and
+layers could further be explored. We briefly experimented with a variable $d_f$
+policy per layer (see Appendix \ref{app:variable_d}), but did not observe
+significant significant improvements. A more sophisticated policy could be
+explored in future work.
+
+\begin{ack}
+This research used resources of the National Energy Research Scientific
+Computing Center (NERSC), a Department of Energy Office of Science User
+Facility using NERSC award DDR-ERCAP0029894. Soheil Feizi was supported in
+part by the following grants: NSF CAREER AWARD 1942230, ONR YIP award
+N00014-22-1-2271, ARO’s Early Career Program Award 310902-00001, Army Grant
+No.~W911NF2120076, NSF award CCF2212458, NSF award 2229885, an Amazon Research
+Award and an award from Capital One.
+
+\end{ack}
+
+\clearpage
+
+\end{document}
