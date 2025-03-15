@@ -9,6 +9,8 @@ This repository contains the code and data for the paper ["Lost-in-the-Middle in
 - Maintaining coherent narrative flow in extended outputs
 - Adapting writing style to match user specifications
 
+![RAL-Writer](./assets/model.png)
+
 **LongInOutBench** is our newly proposed benchmark for evaluating LLM performance on **long input-long output tasks**, using the challenging "multi-document summarization" task as its core evaluation paradigm.
 
 ## ✨ Key Features
