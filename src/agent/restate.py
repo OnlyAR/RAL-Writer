@@ -42,7 +42,16 @@ class RestateAgent(BaseAgent):
         return RestateAgent._exp_func(doc_id / length, a, b)
 
     def write(self, instruction: str, model: str, task_id=None, log: bool = False) -> ChatCompletion:
-        keys = instruction.split("<keys>")[1].split("</keys>")[0].strip()
+        if "<keys>" in instruction and "</keys>" in instruction:
+            keys = instruction.split("<keys>")[1].split("</keys>")[0].strip()
+        else:
+            keys = """
+Ensure clarity and logical flow between paragraphs.
+Maintain factual accuracy with verifiable references.
+Use professional terminology appropriate for the target audience.
+Avoid redundancy while achieving comprehensive coverage.
+Adhere to objective tone and grammatical precision.
+"""
         if task_id is None:
             task_id = f"a_{self._a}-b_{self._b}-k_{self._top_k}-" + datetime.now().strftime("%Y%m%d-%H%M%S")
 
@@ -82,7 +91,8 @@ class RestateAgent(BaseAgent):
         completions = []
 
         if self._tqdm:
-            loop = tqdm(enumerate(steps_embeddings_pairs), total=len(steps_embeddings_pairs), desc="Writing", leave=False)
+            loop = tqdm(enumerate(steps_embeddings_pairs), total=len(steps_embeddings_pairs), desc="Writing",
+                        leave=False)
         else:
             loop = enumerate(steps_embeddings_pairs)
 
@@ -90,7 +100,8 @@ class RestateAgent(BaseAgent):
             step = step_pair[0]
             step_embedding = step_pair[1]
 
-            doc_items = [{"id": doc_idx, "embedding": doc_pair[1]} for doc_idx, doc_pair in enumerate(docs_embeddings_pairs)]
+            doc_items = [{"id": doc_idx, "embedding": doc_pair[1]} for doc_idx, doc_pair in
+                         enumerate(docs_embeddings_pairs)]
             for doc_item in doc_items:
                 doc_item["score"] = self._similarity_score(doc_item["embedding"], step_embedding) - \
                                     self._position_score(doc_item["id"], len(doc_items), self._a, self._b)
@@ -111,14 +122,17 @@ class RestateAgent(BaseAgent):
                 picked_docs = [docs_embeddings_pairs[doc_id][0] for doc_id in picked_doc_ids]
 
                 if idx == 0 or k < self._top_k:
-                    prompt = build_prompt(template="write_begin_with_restate", instruction=instruction, plan=plan, step=step,
+                    prompt = build_prompt(template="write_begin_with_restate", instruction=instruction, plan=plan,
+                                          step=step,
                                           restatement="\n\n---\n\n".join(picked_docs))
                 else:
-                    prompt = build_prompt(template="write_step_with_restate", instruction=instruction, plan=plan, step=step, written=written,
+                    prompt = build_prompt(template="write_step_with_restate", instruction=instruction, plan=plan,
+                                          step=step, written=written,
                                           restatement="\n\n---\n\n".join(picked_docs), keys=keys)
                 if len(encoder.encode(prompt, disallowed_special=())) < 110000:
                     break
-                print(f"Prompt length: {len(encoder.encode(prompt, disallowed_special=()))} > 110000 when k={k}, try to reduce k.")
+                print(
+                    f"Prompt length: {len(encoder.encode(prompt, disallowed_special=()))} > 110000 when k={k}, try to reduce k.")
 
             completion = engine.generate(prompt=prompt, model=model, stream=False)
             completions.append(completion)

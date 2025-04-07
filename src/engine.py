@@ -3,6 +3,7 @@
 # @Author :       Jun
 # @date:          2024/12/10
 # @Description :  Chatbot engine
+import os
 from typing import Union, List
 
 import numpy as np
@@ -41,7 +42,11 @@ def compose_chat_completion(
     return result
 
 
-def get_embeddings(texts: List[str], model: str = "bge-base-en-v1.5") -> List[np.ndarray]:
+def get_embeddings(texts: List[str]) -> List[np.ndarray]:
+    if os.getenv("EMBEDDING_MODEL"):
+        model = os.getenv("EMBEDDING_MODEL")
+    else:
+        model = "bge-base-en-v1.5"
     embeddings = client.embeddings.create(input=texts, model=model).data
     embeddings = [np.array(embedding.embedding) for embedding in embeddings]
     return embeddings
