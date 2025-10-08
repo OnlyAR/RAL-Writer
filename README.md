@@ -2,7 +2,7 @@
 
 ## 📖 Introduction
 
-This repository contains the code and data for the paper ["Lost-in-the-Middle in Long-Text Generation: Synthetic Dataset, Evaluation Framework, and Mitigation"](https://arxiv.org/pdf/2503.06868).
+This repository contains the code and data for the paper **"Lost-in-the-Middle in Long-Text Generation: Synthetic Dataset, Evaluation Framework, and Mitigation"**.
 
 **RAL-Writer** is a specialized LLM agent designed to produce **high-quality, logically structured long-form articles (10k+ tokens)** while effectively processing and referencing multiple source documents. Unlike standard text generators, RAL-Writer demonstrates exceptional capability in:
 - Analyzing and synthesizing information from **large reference collections**
@@ -11,7 +11,7 @@ This repository contains the code and data for the paper ["Lost-in-the-Middle in
 
 ![RAL-Writer](./assets/model.png)
 
-**LongInOutBench** is our newly proposed benchmark for evaluating LLM performance on **long input-long output tasks**, using the challenging "multi-document summarization" task as its core evaluation paradigm.
+`dataset` is our newly proposed benchmark for evaluating LLM performance on **long input-long output tasks**, using the challenging "multi-document summarization" task as its core evaluation paradigm.
 
 ## ✨ Key Features
 
@@ -21,7 +21,7 @@ This repository contains the code and data for the paper ["Lost-in-the-Middle in
 - **Adaptive Generation**: Maintains coherence in 10k+ token outputs
 - **Style Control**: Supports various writing tones and formats
 
-### LongInOutBench
+### Dataset
 - Standardized evaluation for long-context LLMs
 - Quantitative metrics for:
   - Reference utilization accuracy
@@ -95,20 +95,4 @@ python experiments/quality_score.py
 
 ```shell
 python experiments/length_score.py
-```
-
-## 📚 Citation
-
-If you find this repository helpful in your research or work, please consider citing the following paper:
-
-```text
-@misc{zhang2025lostinthemiddlelongtextgenerationsynthetic,
-      title={Lost-in-the-Middle in Long-Text Generation: Synthetic Dataset, Evaluation Framework, and Mitigation}, 
-      author={Junhao Zhang and Richong Zhang and Fanshuang Kong and Ziyang Miao and Yanhan Ye and Yaowei Zheng},
-      year={2025},
-      eprint={2503.06868},
-      archivePrefix={arXiv},
-      primaryClass={cs.CL},
-      url={https://arxiv.org/abs/2503.06868}, 
-}
 ```
