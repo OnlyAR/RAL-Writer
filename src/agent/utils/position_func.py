@@ -1,6 +1,5 @@
 # -*- coding: utf-8 -*-
 # @File Name:     position_func
-# @Author :       Jun
 # @Date:          2025/1/23
 
 import numpy as np

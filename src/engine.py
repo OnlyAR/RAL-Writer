@@ -1,6 +1,5 @@
 # -*- coding: utf-8 -*-
 # @File Name:     engine
-# @Author :       Jun
 # @date:          2024/12/10
 # @Description :  Chatbot engine
 import os

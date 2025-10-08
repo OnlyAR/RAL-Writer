@@ -1,6 +1,5 @@
 # -*- coding: utf-8 -*-
 # @File Name:     single
-# @Author :       Jun
 # @Date:          2025/1/23
 # @Description :
 from datetime import datetime

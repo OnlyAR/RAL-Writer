@@ -1,6 +1,5 @@
 # -*- coding: utf-8 -*-
 # @File Name:     naive
-# @Author :       Jun
 # @Date:          2025/1/16
 from datetime import datetime
 
@@ -47,7 +46,9 @@ class ConcatAgent(BaseAgent):
             if idx == 0:
                 prompt = build_prompt(template="write_begin", instruction=instruction, plan=plan, step=step)
             else:
-                prompt = build_prompt(template="write_step", instruction=instruction, plan=plan, step=step, text=written)
+                prompt = build_prompt(
+                    template="write_step", instruction=instruction, plan=plan, step=step, text=written
+                )
 
             completion = generate(prompt=prompt, model=model, stream=False)
             completions.append(completion)

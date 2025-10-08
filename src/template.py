@@ -1,6 +1,5 @@
 # -*- coding: utf-8 -*-
 # @File Name:     template
-# @Author :       Jun
 # @date:          2024/12/10
 # @Description :  build prompt from template
 import re

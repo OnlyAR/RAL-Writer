@@ -1,6 +1,5 @@
 # -*- coding: utf-8 -*-
 # @File Name:     naive
-# @Author :       Jun
 # @Date:          2025/1/16
 # @Description :
 from datetime import datetime
@@ -91,8 +90,9 @@ Adhere to objective tone and grammatical precision.
         completions = []
 
         if self._tqdm:
-            loop = tqdm(enumerate(steps_embeddings_pairs), total=len(steps_embeddings_pairs), desc="Writing",
-                        leave=False)
+            loop = tqdm(
+                enumerate(steps_embeddings_pairs), total=len(steps_embeddings_pairs), desc="Writing", leave=False
+            )
         else:
             loop = enumerate(steps_embeddings_pairs)
 
@@ -100,11 +100,13 @@ Adhere to objective tone and grammatical precision.
             step = step_pair[0]
             step_embedding = step_pair[1]
 
-            doc_items = [{"id": doc_idx, "embedding": doc_pair[1]} for doc_idx, doc_pair in
-                         enumerate(docs_embeddings_pairs)]
+            doc_items = [
+                {"id": doc_idx, "embedding": doc_pair[1]} for doc_idx, doc_pair in enumerate(docs_embeddings_pairs)
+            ]
             for doc_item in doc_items:
-                doc_item["score"] = self._similarity_score(doc_item["embedding"], step_embedding) - \
-                                    self._position_score(doc_item["id"], len(doc_items), self._a, self._b)
+                doc_item["score"] = self._similarity_score(
+                    doc_item["embedding"], step_embedding
+                ) - self._position_score(doc_item["id"], len(doc_items), self._a, self._b)
 
             doc_items = sorted(doc_items, key=lambda x: x["score"], reverse=True)
 
@@ -122,17 +124,28 @@ Adhere to objective tone and grammatical precision.
                 picked_docs = [docs_embeddings_pairs[doc_id][0] for doc_id in picked_doc_ids]
 
                 if idx == 0 or k < self._top_k:
-                    prompt = build_prompt(template="write_begin_with_restate", instruction=instruction, plan=plan,
-                                          step=step,
-                                          restatement="\n\n---\n\n".join(picked_docs))
+                    prompt = build_prompt(
+                        template="write_begin_with_restate",
+                        instruction=instruction,
+                        plan=plan,
+                        step=step,
+                        restatement="\n\n---\n\n".join(picked_docs),
+                    )
                 else:
-                    prompt = build_prompt(template="write_step_with_restate", instruction=instruction, plan=plan,
-                                          step=step, written=written,
-                                          restatement="\n\n---\n\n".join(picked_docs), keys=keys)
+                    prompt = build_prompt(
+                        template="write_step_with_restate",
+                        instruction=instruction,
+                        plan=plan,
+                        step=step,
+                        written=written,
+                        restatement="\n\n---\n\n".join(picked_docs),
+                        keys=keys,
+                    )
                 if len(encoder.encode(prompt, disallowed_special=())) < 110000:
                     break
                 print(
-                    f"Prompt length: {len(encoder.encode(prompt, disallowed_special=()))} > 110000 when k={k}, try to reduce k.")
+                    f"Prompt length: {len(encoder.encode(prompt, disallowed_special=()))} > 110000 when k={k}, try to reduce k."
+                )
 
             completion = engine.generate(prompt=prompt, model=model, stream=False)
             completions.append(completion)

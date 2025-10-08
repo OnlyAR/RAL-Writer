@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 # @File Name:     base
-# @Author :       Jun
 # @Date:          2025/1/23
+
 
 class BaseAgent:
     def __init__(self, tqdm: bool = False):

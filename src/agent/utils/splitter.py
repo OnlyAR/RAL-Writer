@@ -1,6 +1,5 @@
 # -*- coding: utf-8 -*-
 # @File Name:     splitter
-# @Author :       Jun
 # @Date:          2025/1/23
 from typing import List, Optional
 
@@ -13,9 +12,13 @@ class TextSplitter:
     https://github.com/langchain-ai/langchain/blob/v0.1.5/libs/langchain/langchain/text_splitter.py
     """
 
-    def __init__(self, chunk_size: int, chunk_overlap: int,
-                 separators: Optional[List[str]] = None,
-                 length_func=lambda t: len(nltk.word_tokenize(t))):
+    def __init__(
+        self,
+        chunk_size: int,
+        chunk_overlap: int,
+        separators: Optional[List[str]] = None,
+        length_func=lambda t: len(nltk.word_tokenize(t)),
+    ):
         self._separators = ["\n\n", "\n", ". ", ", ", " ", ""] + ([] if separators is None else separators)
         self._chunk_size = chunk_size
         self._chunk_overlap = chunk_overlap
